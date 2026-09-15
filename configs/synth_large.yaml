@@ -1,0 +1,23 @@
+# Ghassan 1 preview — Large-scale synthetic data generation
+# Generates up to 200K synthetic conversations to augment the dataset.
+# Run: build/bin/data_pipeline synth --config configs/synth_large.yaml
+
+synth:
+  seed: 1234
+  num_conversations: 200000
+  min_turns: 2
+  max_turns: 14
+  p_arabic_script: 0.62
+  p_latin_script: 0.28
+  p_msa: 0.10
+  p_french_switch: 0.12
+  p_followup: 0.45
+  p_correction: 0.08
+  p_misunderstand: 0.06
+  include_system: true
+  p_system: 0.35
+  max_template_uses: 400
+  max_attempts_multiplier: 60
+  output_path: artifacts/synth/synthetic_darija.jsonl
+  shards_output: artifacts/shards/sft_train_darija.gbin
+  tokenizer_path: artifacts/tokenizer/darija32k.gtok

@@ -1,0 +1,58 @@
+# Ghassan v1 Ultra 1B — Billion-scale synthetic data generation
+# Target: ~1B tokens total when combined with JSON + SFT shards.
+#
+# Math (measured on darija.gtok, seq_len 1024):
+#   1 conversation ~= 300-450 tokens (avg ~380 with system prompt + 2-14 turns)
+#   1,500,000 convs x 380 ~= 570M tokens synthetic
+#   + JSON/CSV corpora (~200-400M after dedup + arabizi doubling)
+#   + SFT chat (200k convs ~= 80M)
+#   => ~1.0B tokens total across artifacts/shards_1b + shards_1b_sft
+#
+# Run (needs ~30GB disk free, run once, reuse shards for all epochs):
+#   build/bin/data_pipeline synth --config configs/synth_billion.yaml
+#   bash kaggle/build_billion_data.sh
+#
+# NOTE: do NOT generate 1.5M in one process on Kaggle (OOM/timeout).
+# The build script splits into 15 x 100k batches with different seeds.
+
+synth:
+  seed: 1234
+  num_conversations: 700000    # capped: synthetic must stay <30% of 1B (was 1.5M=57% -> collapse)
+  min_turns: 2
+  max_turns: 14
+  p_arabic_script: 0.55
+  p_latin_script: 0.30
+  p_msa: 0.15
+  p_french_switch: 0.15
+  p_followup: 0.50
+  p_correction: 0.10
+  p_misunderstand: 0.08
+  include_system: true
+  p_system: 0.35
+  # Anti-collapse: each template max 500 uses (was 20000 -> model memorizes
+  # templates instead of Darija). Needs large template pool; pipeline fails fast
+  # if pool too small instead of silently repeating.
+  max_template_uses: 500
+  max_attempts_multiplier: 40
+  output_path: artifacts/synth/synthetic_1b.jsonl
+  shards_output: artifacts/shards_1b/sft_train_darija.gbin
+  tokenizer_path: artifacts/tokenizer/darija32k.gtok
+
+# SFT split for stage 2 (smaller, higher quality)
+sft_synth:
+  seed: 9999
+  num_conversations: 150000   # smaller + higher quality (was 200k)
+  min_turns: 2
+  max_turns: 10
+  p_arabic_script: 0.50
+  p_latin_script: 0.35
+  p_msa: 0.15
+  p_french_switch: 0.12
+  p_followup: 0.45
+  p_correction: 0.08
+  p_misunderstand: 0.06
+  include_system: true
+  p_system: 0.40
+  max_template_uses: 300      # strict: SFT quality > quantity
+  max_attempts_multiplier: 60
+  output_path: artifacts/synth/synthetic_1b_sft.jsonl

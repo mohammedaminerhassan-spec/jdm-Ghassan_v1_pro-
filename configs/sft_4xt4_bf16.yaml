@@ -1,0 +1,75 @@
+# Ghassan v1 Flash - 4x T4 Training Config (FP16 tensor cores + DDP)
+# T4 = Turing sm_75: FP16 tensor cores YES, BF16 tensor cores NO.
+# So: fp32 masters + gemm_fp16=true + loss scaling (NOT bf16).
+# Effective batch: 4 GPUs * 2 batch * 1024 seq * 16 accum = 131072 tokens/step
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+
+tokenizer:
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: sft
+  device: cuda
+  precision: fp32              # fp32 masters; T4 has no BF16 tensor cores
+  gemm_fp16: true              # T4 FP16 tensor cores for large GEMMs
+  batch_size: 2                # Per-GPU micro-batch
+  seq_len: 1024
+  grad_accum: 16               # 16 micro-batches = effective batch 32 per GPU
+  max_steps: 0
+  epochs: 3
+  # Lion x0.1: 1.0e-4 => effective 1.0e-5 SFT.
+  learning_rate: 1.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  optimizer: lion              # Lion saves ~50% optimizer memory
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.99                # lion default (explicit value wins over auto)
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 100
+  eval_batches: 10
+  save_every: 500
+  data_dir: artifacts/shards_sft
+  checkpoint_dir: artifacts/checkpoints/flash_sft_4xT4
+  resume: auto
+  pretrained_checkpoint: artifacts/checkpoints/flash/last.ckpt
+  allow_no_pretrained: false  # P0 guard: fail loudly without pretrained (was true)
+  freeze_embeddings: false
+  activation_checkpointing: true
+  ckpt_segments: 2
+  ddp: true                    # Enable multi-GPU DDP
+
+data:
+  data_dir: artifacts/shards_sft
+  train_prefix: train_
+  val_prefix: val_
+  mix:
+    darija_instructions: 0.45
+    darija_chat: 0.30
+    arabizi_chat: 0.15
+    code_switch_chat: 0.10

@@ -1,0 +1,54 @@
+# Ghassan AI — T4-only build artifacts (never commit)
+build/
+out/
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# Compiled objects / libs / exes
+*.obj
+*.o
+*.lib
+*.a
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Training artifacts (large, local/Kaggle only)
+artifacts/
+*.ckpt
+*.gai
+*.gguf
+*.gbin
+*.gtok
+*.jsonl
+!evaluation/datasets/**/*.jsonl
+
+# Kaggle / local temp
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
+tmp/
+temp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+*.swp
+*~
+
+# Python / misc
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,108 @@
+# Ghassan v1 T4-1B — flagship 1B MoE for 4x Tesla T4 (sm_75).
+# FIX 2026-09: moe_top_k 5->2. top-5/8 = 70% dense (715M active) defeats MoE
+# sparsity, doubles activation memory (N*K*E) and OOMs T4. top-2/8 is the
+# standard sparse regime (~408M active, 40%) and fits 16GB with Lion.
+# Verified parameter math (tied lm_head, hd = 1024/16 = 64):
+#   tok_emb  : 32000 x 1024                       = 32,768,000
+#   per layer: attn 2,621,440 + moe 35,397,632 + norms 2,048 + qknorm 128
+#            = 38,021,248
+#     attn: wq 1,048,576 + wk 262,144 + wv 262,144 + wo 1,048,576
+#     moe : router 8,192
+#           + routed 3 x 8 x 1280 x 1024          = 31,457,280
+#           + shared 3 x 1280 x 1024              = 3,932,160
+#     qk-norm: 2 x 64                             = 128
+#   26 layers: 26 x 38,021,248                    = 988,552,448
+#   final_norm:                                   = 1,024
+#   TOTAL                                         = 1,021,321,472 (~1.02B)
+# Active per token (top-2 of 8 + shared + full attention):
+#   2,621,440 + 8,192 + 2 x 3,932,160 + 3,932,160 + 2,048 + 128
+#   = 14,428,288 / layer x 26 = 375,135,488 + 32,769,024
+#   = 407,904,512 (~408M active, 40% conditional compute)
+#
+# T4 MEMORY (fp32 master, Lion, K=2, seq 512): 4.09 + 4.09 + 4.09 = 12.26GB
+#   + MoE backward caches ~0.45GB + logits+dlogits 128MB + eval ~0.25GB
+#   + slack 1.5GB (ctx/ws/frag) + NCCL 0.32GB (DDP) => ~14.7GB / 16GB.
+#   optimizer MUST be lion (AdamW = +4GB -> OOM). batch_size MUST be 1.
+#   seq_len 512 (not 1024): halves activations/logits/attn-tmp so 1B fits T4.
+#   Scale with grad_accum (128) and 4x DDP: 262k tokens/step effective.
+#
+# T4 PRECISION: Turing has FP16 tensor cores (no BF16 cores), so
+#   precision=fp32 + gemm_fp16=true is the fast path. BF16 now auto-falls
+#   back on T4 (see Trainer BF16 guard). GAI_TF32=0 disables TF32.
+
+model:
+  vocab_size: 32000          # multilingual: Latin + Arabic + Arabizi + math
+  hidden_size: 1024
+  num_layers: 26
+  num_heads: 16              # head_dim 64, kernel-optimal
+  num_kv_heads: 4            # GQA group 4: 4x smaller KV cache
+  intermediate_size: 2240    # dense fallback only (unused when use_moe=true)
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8             # routed experts per layer
+  moe_top_k: 2               # 2 active + 1 shared = sparse (was 5, OOM + dense)
+  moe_expert_dim: 1280
+  moe_shared: true
+  moe_aux_scale: 0.01        # DeepSeek-style load-balance loss
+  moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+  z_loss_scale: 0.0001       # router logit penalty (prevents explosion)
+  use_qk_norm: true          # per-head QK RMSNorm (MoE stability at 1B)
+  rope_scale: 1.0            # 1.0 off; 2.0 = 8k ctx via PI (YaRN-lite)
+  rope_yarn_mscale: 0.0    # 0=auto YaRN mscale
+  # => 1,021,321,472 total, ~408M active per token
+
+tokenizer:
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true            # T4 FP16 tensor cores, fp32 masters + loss scaling
+  loss_scale_init: 65536
+  loss_scale_window: 2000
+  batch_size: 1              # T4 16GB: B=1 only for the 1B model
+  seq_len: 512              # 512 (not 1024): 1B only fits T4 with halved activations
+  grad_accum: 128            # 1*512*128 = 65,536 tokens/step per GPU (same budget)
+  max_steps: 0
+  epochs: 2
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 1500         # 1B+Lion needs longer warmup (was 800, unstable)
+  optimizer: lion            # MANDATORY on T4 (AdamW OOMs at 1B)
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99                # lion default
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 250
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/t4_1b
+  data_dir: artifacts/shards_1b
+  resume: auto
+  activation_checkpointing: false   # B==1: no effect, grad_accum does the work
+  ckpt_segments: 1
+  ddp: true                  # 4x T4 data-parallel (NCCL)
+
+data:
+  train_glob: artifacts/shards_1b/train_*.gbin
+  val_glob: artifacts/shards_1b/val_*.gbin
+  mix:
+    darija_conversational: 0.30
+    darija_reasoning_logic: 0.20
+    arabic_conversational: 0.12
+    english_general: 0.10
+    educational_science: 0.13
+    math_reasoning: 0.07
+    general_culture_law: 0.03
+    code_switch_chat: 0.05
