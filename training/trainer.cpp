@@ -1292,7 +1292,7 @@ void Trainer::sync_gradients() {
     if (!small.empty() && small_total > 0) {
         // Grow-once staging (monotonic, no per-step cudaMalloc).
         if (!dist_fused_.defined() ||
-            static_cast<size_t>(dist_fused_.numel()) < (i64)small_total) {
+            static_cast<size_t>(dist_fused_.numel()) < small_total) {
             size_t want = small_total + small_total / 8 + 1024;
             dist_fused_ = Tensor::empty({(i64)want}, DType::F32, Device::CUDA);
         }
