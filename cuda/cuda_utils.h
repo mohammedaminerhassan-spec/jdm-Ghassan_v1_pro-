@@ -2,6 +2,10 @@
 
 #include "core/common.h"
 
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#endif
+
 namespace gai {
 struct DeviceInfo;
 
@@ -23,6 +27,7 @@ void  shutdown();
 
 const char* last_error();
 
+#ifdef __CUDACC__
 // ---- RAII wrappers for CUDA resources (P2-3: prevent leaks on exception) ----
 // PRO-HARDEN: الكونستركتور القديم كان يتجاهل فشل cudaStreamCreate/EventCreate
 // فيبني كائن بـhandle قمامة ويدمر قمامة. الآن نفشل بصوت عال فورا.
@@ -81,6 +86,7 @@ public:
     ScopedDevice(const ScopedDevice&) = delete;
     ScopedDevice& operator=(const ScopedDevice&) = delete;
 };
+#endif // __CUDACC__
 
 } // namespace cuda
 } // namespace gai
