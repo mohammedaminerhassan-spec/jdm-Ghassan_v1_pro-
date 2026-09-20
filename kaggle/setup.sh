@@ -335,6 +335,10 @@ fi
 # ---- 9b. Tokenizer vocab gate: prove the file is 32k (never assume it).
 # A legacy 16k file reaching shard building would silently waste half the
 # embeddings on every current recipe. Fail here, loudly, instead.
+# With --skip-data and no tokenizer yet, the gate is deferred to the data cell.
+if [[ "${SKIP_DATA}" -eq 1 && -z "${TOK_PATH}" ]]; then
+    echo "[tokenizer] --skip-data: vocab gate deferred (no tokenizer yet, data cell will train it)"
+else
 {
 TOK_VOCAB=$("${BUILD_DIR}/bin/data_pipeline" tok-info --tokenizer "${TOK_PATH}" 2>/dev/null \
     | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
@@ -345,6 +349,7 @@ if [[ "${TOK_VOCAB}" != "32000" ]]; then
 fi
 echo "[tokenizer] verified: ${TOK_PATH} (vocab 32000)"
 }
+fi
 
 # ---- 10. Data pipeline: convert datasets → .gbin shards (unless skipped)
 if [[ "${SKIP_DATA}" -eq 0 ]]; then
