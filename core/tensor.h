@@ -15,10 +15,21 @@ enum class Device : u32 { CPU = 0, CUDA = 1 };
 const char* device_name(Device d);
 
 // Raw device-agnostic buffer with refcounted ownership.
+//
+// Two flavors: OWNING (allocated via device_alloc, freed in ~Storage) and
+// EXTERNAL views (memory owned elsewhere, e.g. a MappedFile). External views
+// keep a shared_ptr owner token, so the backing allocation provably outlives
+// every Tensor built on it. External CPU views are READ-ONLY by contract
+// (file pages are mapped read-only; writes would fault) — Model::enable_grad
+// refuses models that contain them (see Tensor::is_external).
 class Storage {
 public:
     Storage() = default;
     Storage(size_t nbytes, Device dev, DType dt = DType::F32);
+    // External non-owning view. dev must be CPU (file/device memory the CPU
+    // can read directly). owner keeps the backing alive (may be null only
+    // when the caller guarantees a longer lifetime, e.g. static memory).
+    Storage(void* ptr, size_t nbytes, Device dev, std::shared_ptr<void> owner);
     ~Storage();
 
     Storage(const Storage&)            = delete;
@@ -28,12 +39,15 @@ public:
     const void* data() const { return ptr_; }
     size_t      nbytes() const { return nbytes_; }
     Device      device() const { return device_; }
+    bool        external() const { return external_; }
 
 private:
     void*  ptr_    = nullptr;
     size_t nbytes_ = 0;
     Device device_ = Device::CPU;
     bool   owned_  = false;
+    bool   external_ = false;
+    std::shared_ptr<void> owner_;   // non-null for external views
 };
 
 using StoragePtr = std::shared_ptr<Storage>;
@@ -48,6 +62,13 @@ public:
 
     static Tensor zeros(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
     static Tensor empty(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
+    // Non-owning view over external CPU memory (see Storage). nbytes must
+    // equal dtype_nbytes(dt, numel) exactly. The view is read-only by
+    // contract; check is_external() before writing or training with it.
+    static Tensor wrap_external(std::vector<i64> shape, DType dt,
+                                void* ptr, size_t nbytes,
+                                std::shared_ptr<void> owner);
+    bool is_external() const { return storage_ && storage_->external(); }
 
     bool   defined() const { return storage_ != nullptr; }
     DType  dtype()   const { return dtype_; }

@@ -1,5 +1,6 @@
 #include "tokenizer/bpe_trainer.h"
 #include "core/rng.h"
+#include "core/unicode.h"
 
 #include <fstream>
 #include <algorithm>
@@ -9,9 +10,25 @@
 namespace gai {
 
 void BpeTrainer::add_chunk_counts(const std::string& chunk, u64 count) {
-    if (chunk.empty()) return;
-    counts_[chunk] += count;
-    total_ += count;
+    // DeepSeek trainer rule: raw-chunk injection bypassed normalize+pre_tokenize
+    // that add_text applies, so train-vs-encode diverged (public trap).
+    // Canonicalize here: normalize + pre-tokenize, distribute count to pieces.
+    if (chunk.empty() || count == 0) return;
+    Normalizer norm(cfg_.normalizer);
+    std::string n = norm.normalize(chunk);
+    bool any = false;
+    for (const Chunk& c : pre_tokenize(n)) {
+        if (c.text.empty()) continue;
+        counts_[c.text] += count;
+        total_ += count;
+        any = true;
+    }
+    // Fallback: if pre-tokenizer yields nothing (e.g. whitespace-only),
+    // keep the normalized chunk itself so counts are never silently dropped.
+    if (!any && !n.empty()) {
+        counts_[n] += count;
+        total_ += count;
+    }
 }
 
 void BpeTrainer::add_text(const std::string& text) {
@@ -150,7 +167,11 @@ Tokenizer BpeTrainer::train() {
         const std::string& sb = vocab[static_cast<size_t>(b)];
         std::string merged = sa + sb;
 
-        if (static_cast<int>(merged.size()) > cfg_.max_token_bytes) {
+        // DeepSeek multilingual rule: max_token_bytes counted BYTES penalizes
+        // Arabic (~2B/codepoint) vs Latin (1B) — 32B = 32 Latin chars but ~16
+        // Arabic chars, biasing fertility studies. Count codepoints instead
+        // (same limit value now means 32 chars in any script).
+        if (static_cast<int>(utf8_length(merged)) > cfg_.max_token_bytes) {
             pair_count.erase(pit);
             pair_words.erase(PairKey{top.pair});
             continue;

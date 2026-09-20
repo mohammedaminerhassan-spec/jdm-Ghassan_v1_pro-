@@ -67,4 +67,10 @@ StyleFlags check_assistant_style(const std::string& reply, const std::string& us
 
 const std::vector<std::string>& robotic_phrases();
 
+// PRO-EN: English-mode style gate. The full robotic_phrases() list contains
+// normal English politeness ("certainly!", "of course!", "i hope this helps")
+// that would nuke most of a native English corpus, so --style-mode en only
+// rejects hard AI-disclosure boilerplate (model breaking character).
+bool has_hard_ai_boilerplate(const std::string& reply);
+
 } // namespace gai

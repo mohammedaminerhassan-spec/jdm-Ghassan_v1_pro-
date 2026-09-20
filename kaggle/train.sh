@@ -11,7 +11,7 @@
 #   bash kaggle/train.sh --full                         # full schedule, no budget cap
 #   bash kaggle/train.sh --dry-run                      # memory estimate only
 #   bash kaggle/train.sh --time-budget-min 420          # default 360 (6h)
-#   bash kaggle/train.sh --export-profile q4_k          # default fp16
+#   bash kaggle/train.sh --export-profile q4_0          # default fp16
 #   bash kaggle/train.sh --no-export                    # skip GGUF export
 # ----------------------------------------------------------------
 set -euo pipefail
@@ -27,6 +27,10 @@ EXPORT_GGUF=1
 EXPORT_PROFILE="fp16"
 PILOT_STEPS=100
 EXPORT_MARGIN_SEC=900   # time reserved for export + smoke test
+# FIX (set -u crash): GGUF_OUT was only set in the --pro branch, but the
+# default one-shot path uses --export "${GGUF_OUT}" unconditionally ->
+# "unbound variable" exit BEFORE training on Kaggle. Always define a default.
+GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-flash_${EXPORT_PROFILE}.gguf"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -41,15 +45,35 @@ while [[ $# -gt 0 ]]; do
         *) shift ;;
     esac
 done
+# Re-resolve default GGUF path after arg parsing (unless --pro overrode it):
+# keeps --export-profile q4_0 consistent without unbound-variable risk.
+if [[ "${CONFIG_FULL}" != *pro_moe.yaml ]]; then
+    GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-flash_${EXPORT_PROFILE}.gguf"
+fi
 
 BINARY="${BUILD_DIR}/bin/gai_train"
 GEN_BIN="${BUILD_DIR}/bin/ghassan-ai"
-# Prefer 32k tokenizer, fallback to legacy 16k.
+# PRO-HARDEN: fallback الصامت 32k->16k كان يضيع run ثم يفشل لاحقا. نفشل فورا.
 TOK="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
-if [[ ! -f "${TOK}" ]]; then TOK="${REPO_DIR}/artifacts/tokenizer/darija.gtok"; fi
+if [[ ! -f "${TOK}" ]]; then
+    echo "[ERROR] 32k tokenizer missing: ${TOK} (legacy 16k fallback DISABLED)."
+    echo "[ERROR] Run: bash kaggle/setup.sh  (trains darija32k.gtok automatically)"
+    exit 1
+fi
+# PRO-HARDEN: persistence دائم لـKaggle (نفس train_1b.sh).
+persist_output() {
+    if [[ -d "/kaggle/working" ]]; then
+        mkdir -p /kaggle/working/output 2>/dev/null || true
+        cp -r "${REPO_DIR}/artifacts/checkpoints" /kaggle/working/output/ 2>/dev/null || true
+        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
+        echo "[persist] snapshot copied to /kaggle/working/output"
+    fi
+}
+trap persist_output EXIT INT TERM
 
 echo "============================================================"
 echo "  Ghassan AI — Kaggle Training [${MODE}] (${CONFIG_FULL})"
+echo "  FLASH recipe (467M). NOT the 1B flagship — for that use train_1b.sh"
 echo "============================================================"
 
 # ---- sanity: binary
@@ -115,7 +139,9 @@ if [[ "${MODE}" == "oneshot" ]] || [[ "${MODE}" == "pilot" ]]; then
     echo ""
     echo "[pilot] Measuring real speed (${PILOT_STEPS} steps)..."
     P_START=$(date +%s)
-    run_train "${CONFIG_PILOT}" cuda --max-steps "${PILOT_STEPS}" "${FP16_OVERRIDE[@]}"
+    # --resume none: a stale pilot checkpoint would make this do ~zero work
+    # and corrupt the session budget with an absurd tok/s (see train_1b.sh).
+    run_train "${CONFIG_PILOT}" cuda --max-steps "${PILOT_STEPS}" --resume none "${FP16_OVERRIDE[@]}"
     P_END=$(date +%s)
     P_ELAPSED=$(( P_END - P_START ))
     if [[ "${P_ELAPSED}" -le 0 ]]; then P_ELAPSED=1; fi
@@ -142,7 +168,11 @@ if [[ "${MODE}" == "oneshot" ]]; then
     if [[ "${MAX_STEPS}" -lt 50 ]]; then MAX_STEPS=50; fi
     echo "[plan] Budget ${TIME_BUDGET_MIN}min, used ${USED_SEC}s -> max_steps=${MAX_STEPS}"
     echo "[plan] Expected initial loss: ~ln(32000) ≈ 10.37 (+ tiny MoE aux term)"
-    EXTRA_ARGS=(--max-steps "${MAX_STEPS}")
+    # PRO-HARDEN: oneshot كان يحسب max-steps دون تجاوز warmup فيفشل
+    # trainer بـ GAI_FAIL(warmup<total) عند budget قصير. warmup=10% دائما.
+    WARMUP_STEPS=$(( MAX_STEPS / 10 ))
+    if [[ "${WARMUP_STEPS}" -lt 20 ]]; then WARMUP_STEPS=20; fi
+    EXTRA_ARGS=(--max-steps "${MAX_STEPS}" --warmup "${WARMUP_STEPS}")
     ACTIVE_CONFIG="${CONFIG_FULL}"
 else
     echo "[plan] FULL schedule mode (no budget cap, runs the yaml schedule)"
@@ -163,12 +193,16 @@ T_END=$(date +%s)
 echo "[train] Full run took $(( (T_END - T_START) / 60 ))m $(( (T_END - T_START) % 60 ))s"
 
 # ---------------------------------------------------------------- smoke test (Darija!)
+# SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
+# must carry its own tokenizer) and no swallowed failure — a broken export
+# must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
-    echo "[smoke] Testing the exported model (Darija prompt)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" --tokenizer "${TOK}" \
+    echo "[smoke] Testing the exported model (Darija prompt, no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
         --prompt "labas, kidayer? chno smitk?" --max-tokens 40 || \
-        echo "[smoke] WARNING: smoke test failed (model file still usable?)"
+        { echo "[smoke] FAIL: self-contained GGUF generation failed"; exit 1; }
+    echo "[smoke] OK: GGUF runs standalone, no sidecar needed"
 fi
 
 echo ""

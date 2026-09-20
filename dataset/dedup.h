@@ -50,7 +50,9 @@ private:
 
     Config cfg_;
     std::unordered_set<u64> exact_;
-    std::vector<std::unordered_map<u64, u32>> band_tables_;
+    // DeepSeek LSH rule: one slot per bucket loses collisions (second writer
+    // overwrites/ignored -> order-dependent false negatives). Keep ALL doc ids.
+    std::vector<std::unordered_map<u64, std::vector<u32>>> band_tables_;
     std::vector<std::vector<u64>> signatures_;
     std::unordered_set<u64> blocklist_;
     std::vector<u64> hash_seeds_;

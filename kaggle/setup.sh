@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # kaggle/setup.sh — Build Ghassan AI from source on a Kaggle GPU session.
-# Usage: bash kaggle/setup.sh [--clean] [--skip-tests] [--skip-data]
+# Usage: bash kaggle/setup.sh [--clean] [--skip-tests] [--skip-data] [--with-parquet]
 # ----------------------------------------------------------------
 set -euo pipefail
 
@@ -12,6 +12,7 @@ SKIP_DATA=0
 DO_CLEAN=0
 FORCE_CPU=0
 REQUIRE_GPU=0
+WITH_PARQUET=OFF
 
 # Parse args (tests are SKIPPED by default to save Kaggle time; pass
 # --run-tests to execute the validation suite after the build)
@@ -20,9 +21,10 @@ while [[ $# -gt 0 ]]; do
         --clean)       DO_CLEAN=1;      shift ;;
         --run-tests)   SKIP_TESTS=0;    shift ;;
         --skip-tests)  SKIP_TESTS=1;    shift ;;
-        --skip-data)   SKIP_DATA=1;     shift ;;
+        --skip-data)   SKIP_DATA=1;    shift ;;
         --cpu-only)    FORCE_CPU=1;     shift ;;
         --require-gpu) REQUIRE_GPU=1;   shift ;;
+        --with-parquet) WITH_PARQUET=ON; shift ;;
         *) shift ;;
     esac
 done
@@ -82,6 +84,19 @@ if command -v nvcc &>/dev/null && [[ "${FORCE_CPU}" -eq 0 ]]; then
     NVCC_VER=$(nvcc --version | grep 'release' | awk '{print $NF}')
     echo "[CUDA] nvcc: ${NVCC_VER}"
     HAVE_CUDA=ON
+    # Blackwell (sm_120, e.g. RTX 5060) needs CUDA >= 12.8: older nvcc cannot
+    # even parse the arch flag and fails cryptically halfway through the build.
+    if [[ "${CC_CMAKE:-}" == 12* ]]; then
+        NVCC_MAJOR=$(echo "${NVCC_VER}" | cut -d. -f1 | tr -d ' ')
+        NVCC_MINOR=$(echo "${NVCC_VER}" | cut -d. -f2 | tr -d ' ,')
+        if [[ "${NVCC_MAJOR:-0}" -lt 12 || ( "${NVCC_MAJOR:-0}" -eq 12 && "${NVCC_MINOR:-0}" -lt 8 ) ]]; then
+            echo ""
+            echo "[ERROR] Blackwell GPU (sm_120) needs CUDA toolkit >= 12.8, found ${NVCC_VER}."
+            echo "[ERROR] Update the toolkit (or rebuild with --cpu-only to proceed without CUDA)."
+            exit 1
+        fi
+        echo "[CUDA] Blackwell sm_120 + nvcc ${NVCC_VER}: compatible"
+    fi
 else
     echo "[CUDA] nvcc not found — CPU-only build"
     HAVE_CUDA=OFF
@@ -90,6 +105,24 @@ fi
 # ---- 4. Compiler check
 echo "[compiler] GCC  : $(g++ --version | head -1)"
 echo "[compiler] CMake: $(cmake --version | head -1)"
+
+# ---- 5b. Apache Arrow (OPTIONAL native parquet input, off by default).
+# Needs: data_pipeline parquet --lake (reads dataset/parquet + qa_all.parquet
+# straight into .gbin shards). Without it the JSON route applies and nothing
+# breaks: dataset/qa_darija/*.json trains identically with zero dependencies.
+# Opt in: bash kaggle/setup.sh --with-parquet
+if [[ "${WITH_PARQUET}" == "ON" ]]; then
+    echo ""
+    echo "[parquet] --with-parquet: installing Apache Arrow C++ (~1-2 min)..."
+    if sudo apt-get install -y libarrow-dev libparquet-dev 2>/dev/null || \
+       apt-get install -y libarrow-dev libparquet-dev 2>/dev/null; then
+        echo "[parquet] Arrow installed; CMake will enable the native route."
+    else
+        echo "[parquet] WARNING: Arrow install failed — continuing JSON-only"
+        echo "[parquet] (CMake degrades gracefully; dataset/qa_darija/*.json still trains)."
+        WITH_PARQUET=OFF
+    fi
+fi
 
 # ---- 5. Clean if requested
 if [[ "${DO_CLEAN}" -eq 1 ]]; then
@@ -100,18 +133,31 @@ fi
 
 # ---- 6. Configure
 echo ""
-echo "[build] Configuring with CUDA=${HAVE_CUDA}..."
+echo "[build] Configuring with CUDA=${HAVE_CUDA} PARQUET=${WITH_PARQUET}..."
+# PRO-HARDEN: ccache يسرع rebuilds الـKaggle (nvcc بطيء) بلا تكلفة.
+CCACHE_FLAGS=()
+if command -v ccache &>/dev/null; then
+    CCACHE_FLAGS=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+elif sudo apt-get install -y ccache 2>/dev/null || apt-get install -y ccache 2>/dev/null; then
+    CCACHE_FLAGS=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+    echo "[build] ccache enabled"
+fi
 cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DGAI_ENABLE_CUDA="${HAVE_CUDA}" \
     -DGAI_ENABLE_OPENMP=ON \
     -DGAI_BUILD_TESTS=ON \
+    -DGAI_ENABLE_PARQUET="${WITH_PARQUET}" \
+    "${CCACHE_FLAGS[@]}" \
     ${CUDA_ARCH_FLAG:-}
 
 # ---- 7. Build (with automatic CUDA -> CPU fallback)
-NCPU=$(nproc)
-echo "[build] Building with ${NCPU} parallel jobs..."
-if ! cmake --build "${BUILD_DIR}" --parallel "${NCPU}"; then
+# PRO-HARDEN: nproc الكامل (4x nvcc) يفجر 13GB RAM الـKaggle. نحدد JOBS<=2.
+JOBS=$(nproc --ignore=1 2>/dev/null || echo 2)
+if [[ "${JOBS}" -gt 2 ]]; then JOBS=2; fi
+if [[ "${JOBS}" -lt 1 ]]; then JOBS=1; fi
+echo "[build] Building with ${JOBS} parallel jobs (capped for Kaggle RAM)..."
+if ! cmake --build "${BUILD_DIR}" --parallel "${JOBS}"; then
     if [[ "${HAVE_CUDA}" == "ON" ]]; then
         echo ""
         echo "[build] CUDA build FAILED — retrying with CUDA disabled (CPU-only)."
@@ -122,8 +168,9 @@ if ! cmake --build "${BUILD_DIR}" --parallel "${NCPU}"; then
             -DCMAKE_BUILD_TYPE=Release \
             -DGAI_ENABLE_CUDA=OFF \
             -DGAI_ENABLE_OPENMP=ON \
-            -DGAI_BUILD_TESTS=ON
-        if ! cmake --build "${BUILD_DIR}" --parallel "${NCPU}"; then
+            -DGAI_BUILD_TESTS=ON \
+            -DGAI_ENABLE_PARQUET="${WITH_PARQUET}"
+        if ! cmake --build "${BUILD_DIR}" --parallel "${JOBS}"; then
             echo "[ERROR] CPU-only build also failed. See the log above."
             exit 1
         fi
@@ -175,17 +222,27 @@ fi
 
 # ---- 9. Tokenizer check (automatic training when missing)
 # 32k multilingual vocab (was 16k: too high fertility for Arabic/Arabizi).
-# Prefers darija32k.gtok, falls back to legacy darija.gtok for old runs.
+# All current model recipes are 32k: shard building MUST use the 32k file.
+# A legacy 16k file, if present, is reported but NEVER used for sharding
+# (it would silently waste half the embedding rows — fail-loud instead).
 echo ""
 TOK_PATH="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
 TOK_LEGACY="${REPO_DIR}/artifacts/tokenizer/darija.gtok"
+TOK_EN="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
 if [[ -f "${TOK_PATH}" ]]; then
     TOK_SIZE=$(du -h "${TOK_PATH}" | cut -f1)
     echo "[tokenizer] Found: ${TOK_PATH} (${TOK_SIZE})"
-elif [[ -f "${TOK_LEGACY}" ]]; then
-    echo "[tokenizer] Found legacy 16k: ${TOK_LEGACY} (consider retraining 32k for new runs)"
-    TOK_PATH="${TOK_LEGACY}"
+elif [[ -f "${TOK_EN}" ]]; then
+    # PRO-EN: English-only runs ship english32k.gtok in the zip; darija32k is
+    # simply not needed (en_pro.yaml points at english32k). Skip Darija BPE.
+    echo "[tokenizer] English run: ${TOK_EN} ships in the zip, darija32k not needed."
+    echo "[tokenizer] Skipping Darija BPE training."
+    TOK_PATH="${TOK_EN}"
 else
+    if [[ -f "${TOK_LEGACY}" ]]; then
+        echo "[tokenizer] NOTE: legacy 16k file exists at ${TOK_LEGACY}, but all"
+        echo "[tokenizer] current recipes need 32k — it will NOT be used. Training 32k..."
+    fi
     echo "[tokenizer] darija32k.gtok not found — training it automatically."
     echo "[tokenizer] Step 1/4: dumping corpus files..."
     # Data lives in JSON/JSONL ("Ai dariga datasets") and/or CSV tables
@@ -193,6 +250,16 @@ else
     DATA_DIRS=()
     if [[ -d "${REPO_DIR}/Ai dariga datasets" ]]; then DATA_DIRS+=("${REPO_DIR}/Ai dariga datasets"); fi
     if [[ -d "${REPO_DIR}/Ghassan V1 flach data" ]]; then DATA_DIRS+=("${REPO_DIR}/Ghassan V1 flach data"); fi
+    # PRO-HARDEN: على Kaggle البيانات تأتي كـ Dataset مربوط في /kaggle/input/*
+    # لا كمجلد repo-local. بدون هذا البحث يفشل tokenizer/shards بصمت.
+    # يدعم أيضا $KAGGLE_DATASET كفلتر اختياري.
+    if [[ -d "/kaggle/input" ]]; then
+        for d in /kaggle/input/*/; do
+            [[ -d "$d" ]] || continue
+            if [[ -n "${KAGGLE_DATASET:-}" && "$d" != *"${KAGGLE_DATASET}"* ]]; then continue; fi
+            DATA_DIRS+=("$d")
+        done
+    fi
     if [[ ${#DATA_DIRS[@]} -eq 0 ]]; then DATA_DIRS=("${REPO_DIR}/Ai dariga datasets"); fi
     CORPUS_DIR="${REPO_DIR}/artifacts/corpus"
     mkdir -p "${REPO_DIR}/artifacts/tokenizer" "${CORPUS_DIR}"
@@ -246,11 +313,30 @@ else
     }
     if [[ -f "${TOK_PATH}" ]]; then
         echo "[tokenizer] Trained: ${TOK_PATH} ($(du -h "${TOK_PATH}" | cut -f1))"
+        # DISK FIT (19.5GB Kaggle + 3GB data): corpus txt was only needed for BPE.
+        # Shards are built directly from JSON afterwards, so delete the 3GB dump now.
+        echo "[cleanup] removing BPE corpus dumps (tokenizer is done, shards come from JSON)..."
+        rm -rf "${CORPUS_DIR}" 2>/dev/null || true
+        df -h "${REPO_DIR}" | tail -n 1 || true
     else
         echo "[ERROR] Tokenizer was not produced at ${TOK_PATH}"
         exit 1
     fi
 fi
+
+# ---- 9b. Tokenizer vocab gate: prove the file is 32k (never assume it).
+# A legacy 16k file reaching shard building would silently waste half the
+# embeddings on every current recipe. Fail here, loudly, instead.
+{
+TOK_VOCAB=$("${BUILD_DIR}/bin/data_pipeline" tok-info --tokenizer "${TOK_PATH}" 2>/dev/null \
+    | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
+if [[ "${TOK_VOCAB}" != "32000" ]]; then
+    echo "[ERROR] tokenizer ${TOK_PATH} has vocab_size=${TOK_VOCAB:-unreadable}, need 32000."
+    echo "[ERROR] Delete the stale file and re-run setup.sh to train darija32k.gtok."
+    exit 1
+fi
+echo "[tokenizer] verified: ${TOK_PATH} (vocab 32000)"
+}
 
 # ---- 10. Data pipeline: convert datasets → .gbin shards (unless skipped)
 if [[ "${SKIP_DATA}" -eq 0 ]]; then
@@ -259,6 +345,18 @@ if [[ "${SKIP_DATA}" -eq 0 ]]; then
     DATA_DIR=""
     if [[ -d "${REPO_DIR}/Ai dariga datasets" ]]; then DATA_DIR="${REPO_DIR}/Ai dariga datasets"; fi
     if [[ -d "${REPO_DIR}/Ghassan V1 flach data" ]]; then DATA_DIR="${REPO_DIR}/Ghassan V1 flach data"; fi
+    # PRO-HARDEN: fallback إلى /kaggle/input (أول dataset فيه json/csv) +
+    # دعم $DATA_DIR كتجاوز صريح من البيئة لسكربتات الـCI.
+    if [[ -n "${DATA_DIR_OVERRIDE:-}" && -d "${DATA_DIR_OVERRIDE}" ]]; then DATA_DIR="${DATA_DIR_OVERRIDE}"; fi
+    if [[ -z "${DATA_DIR}" && -d "/kaggle/input" ]]; then
+        for d in /kaggle/input/*/; do
+            [[ -d "$d" ]] || continue
+            if [[ -n "$(find "$d" -maxdepth 3 \( -iname '*.json' -o -iname '*.jsonl' -o -name '*.csv' \) 2>/dev/null | head -n 1)" ]]; then
+                DATA_DIR="$d"
+                break
+            fi
+        done
+    fi
 
     if [[ -z "${DATA_DIR}" ]]; then
         echo "[data] WARNING: no dataset directory found (Ai dariga datasets / Ghassan V1 flach data)"

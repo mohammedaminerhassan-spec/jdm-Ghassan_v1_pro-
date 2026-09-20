@@ -95,7 +95,7 @@ void* malloc_device(size_t nbytes) {
 }
 
 void free_device(void* ptr) {
-    if (ptr) cudaFree(ptr);
+    if (ptr) CUDA_CHECK(cudaFree(ptr));  // PRO-HARDEN: كان يتجاهل الخطأ فيخفي double-free
 }
 
 void memset_zero(void* ptr, size_t nbytes) {
@@ -142,7 +142,17 @@ void shutdown() {
         cublasDestroy(g_cublas);
         g_cublas = nullptr;
     }
-    if (g_initialized) cudaDeviceReset();
+    cuda_ops::free_workspace();
+    cuda_ops::free_sampling_workspace();
+    cuda_ops::moe_free_workspace();
+    // PRO-HARDEN: cudaDeviceReset كان يبطل كل Tensor حي (dangling UAF إن بقي
+    // Model/static بعده). نكتفي بـ synchronize ونترك Reset لمتغير بيئة صريح
+    // للاختبارات المعزولة فقط.
+    if (g_initialized) {
+        cudaDeviceSynchronize();
+        const char* r = std::getenv("GAI_CUDA_RESET");
+        if (r && (r[0] == '1' || r[0] == 'y' || r[0] == 'Y')) cudaDeviceReset();
+    }
     g_initialized = false;
 }
 

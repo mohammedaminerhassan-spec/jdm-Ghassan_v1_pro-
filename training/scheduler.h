@@ -20,6 +20,10 @@ public:
 
     float lr_at(i64 step) const {
         if (total_ <= 0) return peak_;
+        // PRO-HARDEN: step<0 كان يستكمل خارج النطاق (warmup formula تعطي
+        // قيم شاذة) وstep>total كان يعتمد على clamp جزئي. نثبت المجال.
+        if (step < 0) step = 0;
+        if (step > total_) step = total_;
         if (warmup_ > 0 && step < warmup_) {
             // start at 1/warmup of peak rather than exactly 0 so step 0 makes progress
             return peak_ * (static_cast<float>(step + 1) / static_cast<float>(warmup_));

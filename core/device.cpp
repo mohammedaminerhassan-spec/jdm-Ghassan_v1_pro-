@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/ops.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -13,7 +14,9 @@ namespace gai {
 bool is_gpu(Device d) { return d == Device::CUDA; }
 
 // ---------------------------------------------------------------- info
-// T4-ONLY: CPU + CUDA sm_75. No Metal/Vulkan/TPU probing by design.
+// Portable backends: CPU (OpenMP, everywhere: Windows/Linux/macOS) +
+// optional CUDA (NVIDIA GPUs; T4 sm_75 is the reference target, any arch
+// works when built with matching -DCMAKE_CUDA_ARCHITECTURES).
 static DeviceInfo probe_device() {
     DeviceInfo info;
 #ifdef GAI_CUDA
@@ -33,14 +36,15 @@ const DeviceInfo& device_info() {
 bool cuda_available() { return device_info().cuda_available; }
 
 Device best_device() {
-    // T4-ONLY: CUDA when compiled + available, else CPU. No fallback guessing.
+    // CUDA when compiled + available, else portable CPU. The CPU backend is
+    // the universal fallback (local PCs, macOS, Linux without NVIDIA).
     if (cuda_available()) return Device::CUDA;
     return Device::CPU;
 }
 
 void print_device_report() {
     const DeviceInfo& d = device_info();
-    log_info("---------------- device (T4-only) ----------------");
+    log_info("---------------- device (portable: cpu + cuda) ----------------");
     if (d.cuda_available) {
         log_info(strfmt("  CUDA device %d/%d : %s (sm_%d%d)",
                         d.device_index, d.device_count, d.name.c_str(), d.cc_major, d.cc_minor));
@@ -90,12 +94,27 @@ void* device_alloc(size_t nbytes, Device dev, DType /*dt*/) {
     if (nbytes == 0) return nullptr;
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
+        // PRO-HARDEN: فحص VRAM الحرة قبل cudaMalloc يعطي رسالة عملية
+        // (أي B/T تخفض) بدل GAI_FAIL غامض وسط step يضيع ساعة T4.
+        const DeviceInfo& di = device_info();
+        if (di.cuda_available && di.free_mem > 0 && nbytes > di.free_mem) {
+            GAI_FAIL(strfmt("CUDA OOM guard: need %s but only %s free. "
+                            "Lower batch_size/seq_len/max_context (see dry-run).",
+                            human_bytes(nbytes).c_str(), human_bytes(di.free_mem).c_str()));
+        }
         return cuda::malloc_device(nbytes);
 #else
         GAI_FAIL("CUDA allocation requested but the build has no CUDA support (CPU-only build)");
 #endif
     }
-    return aligned_alloc_64(nbytes);
+    // CPU: رسالة أوضح من bad_alloc العاري عند RAM ضعيفة.
+    try {
+        return aligned_alloc_64(nbytes);
+    } catch (const std::bad_alloc&) {
+        GAI_FAIL(strfmt("CPU OOM: need %s. Close apps, lower batch_size/seq_len, "
+                        "or use streaming shards.", human_bytes(nbytes).c_str()));
+    }
+    return nullptr;  // unreachable
 }
 
 void device_free(void* ptr, Device dev) {
@@ -103,6 +122,9 @@ void device_free(void* ptr, Device dev) {
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
         cuda::free_device(ptr);
+#else
+        // PRO-HARDEN: الصمت هنا كان يخفي leak (مؤشر CUDA يضيع بلا تحرير).
+        GAI_FAIL("device_free: CUDA pointer freed in a CPU-only build (leak hidden)");
 #endif
         return;
     }
@@ -114,6 +136,8 @@ void device_memset_zero(void* ptr, size_t nbytes, Device dev) {
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
         cuda::memset_zero(ptr, nbytes);
+#else
+        GAI_FAIL("device_memset_zero: CUDA pointer in a CPU-only build (noop hidden)");
 #endif
         return;
     }
@@ -130,11 +154,14 @@ void device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, siz
 #ifdef GAI_CUDA
     if ((dst_dev == Device::CUDA || dst_dev == Device::CPU) &&
         (src_dev == Device::CUDA || src_dev == Device::CPU)) {
+        // PERF telemetry: direction-tagged transfer bytes for the P2-2 report.
+        if (dst_dev == Device::CUDA && src_dev == Device::CPU) ops::perf_note_h2d(nbytes);
+        else if (dst_dev == Device::CPU && src_dev == Device::CUDA) ops::perf_note_d2h(nbytes);
         cuda::copy(dst, dst_dev == Device::CUDA, src, src_dev == Device::CUDA, nbytes);
         return;
     }
 #endif
-    GAI_FAIL("device copy involving unsupported device combination (T4-only: cpu/cuda)");
+    GAI_FAIL("device copy involving unsupported device combination (only cpu/cuda exist)");
 }
 
 void device_synchronize(Device dev) {

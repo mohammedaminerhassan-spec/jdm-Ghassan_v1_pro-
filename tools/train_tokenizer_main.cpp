@@ -29,7 +29,11 @@ static void usage() {
     "  --study             train 16k/24k/32k and report fertility per slice\n"
     "  --eval <file>       held-out file for the fertility report\n"
     "  --keep-diacritics   do not strip harakat\n"
-    "  --fold-letters      normalise أإآ->ا etc (not recommended for the LM)\n";
+    "  --fold-letters      normalise أإآ->ا etc (not recommended for the LM)\n"
+    "  --keep-case         do NOT lowercase Latin (REQUIRED for English corpora:\n"
+    "                      default lowercasing destroys capitalization signal;\n"
+    "                      the flag is stored in the .gtok and honored by\n"
+    "                      tokenizer + shards + inference)\n";
 }
 
 static std::vector<std::string> collect_inputs(const std::string& path) {
@@ -123,6 +127,9 @@ int main(int argc, char** argv) {
         NormalizerConfig ncfg;
         if (args.flag("keep-diacritics")) ncfg.strip_diacritics = false;
         if (args.flag("fold-letters")) ncfg.fold_letters = true;
+        // PRO-EN: English needs case preserved (default lowercases Latin for
+        // Darija sparsity). Stored in .gtok -> shards + inference follow it.
+        if (args.flag("keep-case")) ncfg.lowercase_latin = false;
 
         // ---------------- gather corpus
         std::vector<std::string> corpus_lines;

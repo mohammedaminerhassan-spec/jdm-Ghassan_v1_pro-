@@ -110,6 +110,12 @@ void moe_forward(const float* x, const float* router_w,
                  float* s_gate, float* s_up, float* s_act,
                  i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
+    // FIX: stack buffers t_idx[8]/t_w[8] below overflow when K>8 (direct
+    // cpu::moe_* call bypassing ModelConfig::validate) -> stack smash,
+    // silent corruption on training. Fail fast (Kaggle/T4 + low-PC safety).
+    GAI_CHECK(K >= 1 && K <= 8, "moe_forward: K must be in [1,8]");
+    GAI_CHECK(ne > 0 && ne <= 64, "moe_forward: ne out of range");
+    GAI_CHECK(d > 0 && E > 0, "moe_forward: bad dims");
 #ifdef GAI_OPENMP
     #pragma omp parallel if(N > 4)
 #endif
@@ -138,6 +144,10 @@ void moe_forward(const float* x, const float* router_w,
             i32 t_idx[8];
             float t_w[8];
             topk_pick(sc.logits.data(), ne, K, t_idx, t_w);
+            float sum_w = 0.0f;
+            for (int k = 0; k < K; ++k) sum_w += t_w[k];
+            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
+            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
 
             if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
                                          sizeof(float) * (size_t)ne);
@@ -176,6 +186,94 @@ void moe_forward(const float* x, const float* router_w,
     }
 }
 
+void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
+                      const float* gates, const float* ups, const float* downs,
+                      const float* sh_g, const float* sh_u, const float* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K) {
+    if (N <= 0) return;
+    GAI_CHECK(K >= 1 && K <= 8, "moe_forward_bias: K must be in [1,8]");
+    GAI_CHECK(ne > 0 && ne <= 64, "moe_forward_bias: ne out of range");
+    GAI_CHECK(d > 0 && E > 0, "moe_forward_bias: bad dims");
+#ifdef GAI_OPENMP
+    #pragma omp parallel if(N > 4)
+#endif
+    {
+        FwdScratch sc;
+        sc.ensure(ne, E, d);
+        std::vector<float> sel;
+        sel.resize(static_cast<size_t>(ne));
+#ifdef GAI_OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (i64 t = 0; t < N; ++t) {
+            const float* xt = x + t * d;
+            float* outt = out + t * d;
+
+            for (int e = 0; e < ne; ++e)
+                sc.logits[e] = dot_row(xt, router_w + (size_t)e * d, d);
+            {
+                float jj = g_jitter_cpu.load(std::memory_order_relaxed);
+                if (jj > 0.0f && probs_cache) {
+                    for (int e = 0; e < ne; ++e)
+                        sc.logits[e] *= (1.0f + jj * 2.0f * jitter_u_cpu(t, e));
+                }
+            }
+            softmax_row(sc.logits.data(), ne);
+
+            // Selection uses logits+bias (bias steers load, carries no grad).
+            for (int e = 0; e < ne; ++e)
+                sel[static_cast<size_t>(e)] = sc.logits[static_cast<size_t>(e)] +
+                    (router_bias ? router_bias[e] : 0.0f);
+            i32 t_idx[8];
+            float t_sel[8];
+            topk_pick(sel.data(), ne, K, t_idx, t_sel);
+            // Weights stay softmax(router) at selected experts, renormalized.
+            float t_w[8];
+            float sum_w = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                t_w[k] = sc.logits[static_cast<size_t>(t_idx[k])];
+                sum_w += t_w[k];
+            }
+            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
+            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+
+            if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
+                                         sizeof(float) * (size_t)ne);
+            if (idx_cache) std::memcpy(idx_cache + t * K, t_idx, sizeof(i32) * (size_t)K);
+            if (w_cache) std::memcpy(w_cache + t * K, t_w, sizeof(float) * (size_t)K);
+
+            if (sh_g && sh_u && sh_d) {
+                linear_forward(xt, sh_g, sc.g.data(), 1, d, E);
+                linear_forward(xt, sh_u, sc.u.data(), 1, d, E);
+                swiglu_forward(sc.g.data(), sc.u.data(), sc.a.data(), E);
+                linear_forward(sc.a.data(), sh_d, outt, 1, E, d);
+            } else {
+                std::fill(outt, outt + d, 0.0f);
+            }
+
+            for (int k = 0; k < K; ++k) {
+                int e = t_idx[k];
+                float w = t_w[k];
+                size_t slot = ((size_t)t * K + k) * (size_t)E;
+                const float* ge = gates + (size_t)e * E * d;
+                const float* ue = ups   + (size_t)e * E * d;
+                const float* de = downs + (size_t)e * d * E;
+                float* sg = s_gate + slot;
+                float* su = s_up + slot;
+                float* sa = s_act + slot;
+                linear_forward(xt, ge, sg, 1, d, E);
+                linear_forward(xt, ue, su, 1, d, E);
+                swiglu_forward(sg, su, sa, E);
+                linear_forward(sa, de, sc.tmp.data(), 1, E, d);
+                for (int j = 0; j < d; ++j) outt[j] += w * sc.tmp[j];
+            }
+        }
+    }
+}
+
 void moe_backward(const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
                   const float* sh_g, const float* sh_u, const float* sh_d,
@@ -189,6 +287,9 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
+    // Same stack-safety contract as forward (see above).
+    GAI_CHECK(K >= 1 && K <= 8, "moe_backward: K must be in [1,8]");
+    GAI_CHECK(ne > 0 && ne <= 64, "moe_backward: ne out of range");
     // NOTE: serial over tokens BY DESIGN on CPU. Concurrent tokens accumulate
     // into the same expert rows (dsh_*/dgate*/dup*/ddown*), so a naive
     // `#pragma omp parallel for` would race. The T4/CUDA path (cuda/moe.cu)
@@ -231,10 +332,13 @@ void moe_backward(const float* x, const float* router_w,
         }
 
         // ---- routed experts
+        float g_expert[8] = {0.0f};
+        float sum_p = 0.0f;
         for (int k = 0; k < K; ++k) {
             int e = idxt[k];
             float w = twt[k];
             if (e < 0 || e >= ne) continue;
+            sum_p += pt[e];
             size_t slot = ((size_t)t * K + k) * (size_t)E;
             const float* sg = s_gate + slot;
             const float* su = s_up + slot;
@@ -259,7 +363,19 @@ void moe_backward(const float* x, const float* router_w,
 
             // router gradient needs the expert output: out_e = act @ de^T
             linear_forward(sa, de, sc.oute.data(), 1, E, d);
-            sc.dp[e] += dot_row(dt, sc.oute.data(), d);
+            g_expert[k] = dot_row(dt, sc.oute.data(), d);
+        }
+
+        // Backprop through top-k normalization: w_k = p_{e_k} / S, S = sum(p_{e_j})
+        // dL/dp_{e_k} = (g_k - bar_g) / S, where bar_g = sum(g_j * w_j)
+        float inv_S = sum_p > 1e-8f ? (1.0f / sum_p) : 0.0f;
+        float bar_g = 0.0f;
+        for (int k = 0; k < K; ++k) bar_g += g_expert[k] * twt[k];
+        for (int k = 0; k < K; ++k) {
+            int e = idxt[k];
+            if (e >= 0 && e < ne) {
+                sc.dp[e] += (g_expert[k] - bar_g) * inv_S;
+            }
         }
 
         // aux load-balance term. NOTE: aux_scale here is pre-scaled by the

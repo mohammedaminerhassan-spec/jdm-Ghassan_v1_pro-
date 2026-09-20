@@ -56,6 +56,14 @@ bool DistributedContext::init(const Config& cfg) {
     ncclUniqueId nccl_id;
     std::memset(&nccl_id, 0, sizeof(nccl_id));
     if (global_rank_ == 0) {
+        // FIX: a stale ID file from a crashed 4xT4 run has the correct size,
+        // so ranks 1..3 could read the OLD id before rank 0 rewrites it ->
+        // ncclCommInitRank mismatch / hang. Unlink first so followers only
+        // ever see a fresh, complete ID (train_4xt4.sh also removes it).
+        {
+            std::error_code ec;
+            std::filesystem::remove(id_file, ec);
+        }
         NCCL_CHECK(ncclGetUniqueId(&nccl_id));
         std::ofstream f(id_file, std::ios::binary | std::ios::trunc);
         if (!f.good()) GAI_FAIL("NCCL: cannot publish ID file " + id_file);

@@ -18,16 +18,18 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# T4-ONLY BUILD. This project targets exactly two backends:
-#   CPU (portable, OpenMP) and CUDA sm_75 (Tesla T4, e.g. Kaggle).
-# Metal / Vulkan / TPU backends were removed on purpose: dead options slow
-# down configuration, grow the build graph, and invite untested code paths.
+# PORTABLE BUILD. Backends: CPU (portable OpenMP — Windows / Linux / macOS)
+# and optional CUDA (NVIDIA GPUs; sm_75 Tesla T4 is the reference target,
+# e.g. Kaggle). The CPU backend always builds, so the engine runs everywhere
+# even without a GPU toolkit. Metal / Vulkan / TPU have no native backend:
+# --device metal|vulkan falls back to CPU with a warning (see tools/main.cpp).
 # ---------------------------------------------------------------- options
 option(GAI_ENABLE_CUDA   "Build CUDA backend if a toolkit is found" ON)
 option(GAI_ENABLE_OPENMP "Use OpenMP for CPU kernels"               ON)
 option(GAI_BUILD_TESTS   "Build unit / gradient / benchmark tests"  ON)
 option(GAI_NATIVE_ARCH   "Compile with -march=native"               OFF)
 option(GAI_ENABLE_NCCL   "Build NCCL multi-GPU support"             ON)
+option(GAI_ENABLE_PARQUET "Build native Parquet input via Apache Arrow" OFF)
 
 # ---------------------------------------------------------------- compiler flags
 # Flags are applied ONLY to C++ targets (via gai_apply_cxx_flags), never to the
@@ -38,12 +40,14 @@ function(gai_apply_cxx_flags target)
         # /MP = parallel compilation inside one project (fastest local builds).
         # /WX = zero-warning policy: any warning fails the build (no silent rot).
         target_compile_options(${target} PRIVATE /W3 /WX /permissive- /Zc:preprocessor /bigobj /utf-8 /MP)
-        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2> $<$<CONFIG:Release>:/fp:fast>)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
     else()
         # -Werror = zero-warning policy on GCC/Clang (Kaggle). Unused-param kept
         # off: dispatch wrappers intentionally name all params for symmetry.
+        # NOTE: -ffast-math is removed because -ffinite-math-only breaks std::isfinite/isnan
+        # which is required for dynamic loss scaling to detect FP16 overflow.
         target_compile_options(${target} PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers)
-        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3> $<$<CONFIG:Release>:-ffast-math>)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
         if(GAI_NATIVE_ARCH)
             target_compile_options(${target} PRIVATE -march=native)
         endif()
@@ -70,8 +74,15 @@ if(GAI_ENABLE_CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-            # T4-only: sm_75 keeps nvcc fast (one arch, no fatbins).
-            # Override with -DCMAKE_CUDA_ARCHITECTURES=80 for A100, etc.
+            # Default: sm_75 keeps nvcc fast on Kaggle T4 (one arch, no fatbins).
+            # Other GPUs: rebuild with -DCMAKE_CUDA_ARCHITECTURES=<sm> (e.g. 86
+            # for RTX 3090, 89 for 4090, 80 for A100, 120 for RTX 5060/Blackwell)
+            # or NATIVE (CMake >= 3.24). setup.sh detects this automatically.
+            # sm_120 needs CUDA toolkit >= 12.8 (setup.sh gates this loudly).
+            # Kernels are arch-generic CUDA (no sm_75 PTX/intrinsics): Blackwell
+            # builds run correctly; launch tuning is T4-shaped (retune with
+            # Nsight on the target GPU for peak occupancy).
+            # No CUDA toolkit at all -> portable CPU-only build (runs anywhere).
             set(CMAKE_CUDA_ARCHITECTURES 75)
         endif()
         find_package(CUDAToolkit REQUIRED)
@@ -134,6 +145,26 @@ if(GAI_HAVE_CUDA AND GAI_ENABLE_NCCL)
     endif()
 endif()
 
+# ---------------------------------------------------------------- Parquet (optional lake input)
+# Native .parquet reading needs Apache Arrow C++ (large dependency, absent on
+# most machines). OFF by default: the JSON route (dataset/qa_darija/*.json)
+# needs no dependency and always works. kaggle/setup.sh --with-parquet
+# installs Arrow and turns this ON. Never fatal when missing: configure
+# degrades to JSON-only with a warning (same graceful pattern as NCCL).
+set(GAI_HAVE_PARQUET OFF)
+if(GAI_ENABLE_PARQUET)
+    find_package(Arrow QUIET)
+    find_package(Parquet QUIET)
+    if(Arrow_FOUND AND Parquet_FOUND)
+        set(GAI_HAVE_PARQUET ON)
+        target_link_libraries(gai_core PUBLIC Arrow::arrow_shared Parquet::parquet_shared)
+        target_compile_definitions(gai_core PUBLIC GAI_PARQUET=1)
+        message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} (native lake input enabled)")
+    else()
+        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> JSON route only (dataset/qa_darija/*.json needs no dependency)")
+    endif()
+endif()
+
 if(WIN32)
     target_compile_definitions(gai_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -155,7 +186,30 @@ foreach(t ghassan-ai train_tokenizer corpus_stats data_pipeline gai_train)
     gai_apply_cxx_flags(${t})
 endforeach()
 
-# ---------------------------------------------------------------- tests (T4-only: cpu + cuda)
+# ---------------------------------------------------------------- gemini-chat (optional, C++ + libcurl)
+# Maybni ghir ila CURL MSVC-compatible kayna (vcpkg install curl + toolchain).
+# MinGW/msys curl (msys64/ucrt64) makhdamch m3a MSVC linker/headers -> OFF automatically.
+# Ila OFF, khdem b tools/gemini_chat.py (stdlib only, bla install, nefs log format).
+option(GAI_BUILD_GEMINI_CHAT "Build C++ gemini-chat (needs MSVC-compatible libcurl)" ON)
+find_package(CURL QUIET)
+set(GAI_HAVE_USABLE_CURL OFF)
+if(CURL_FOUND AND GAI_BUILD_GEMINI_CHAT)
+    if(MSVC AND "${CURL_INCLUDE_DIR}" MATCHES "[Mm]ingw|[Mm]sys|ucrt64|[Cc]ygwin")
+        message(STATUS "[ghassan-ai] gemini-chat : OFF (found CURL is MinGW/msys: ${CURL_INCLUDE_DIR}; use tools/gemini_chat.py or vcpkg curl)")
+    else()
+        set(GAI_HAVE_USABLE_CURL ON)
+    endif()
+endif()
+if(GAI_HAVE_USABLE_CURL)
+    add_executable(gemini-chat tools/gemini_chat.cpp)
+    target_link_libraries(gemini-chat PRIVATE CURL::libcurl)
+    gai_apply_cxx_flags(gemini-chat)
+    message(STATUS "[ghassan-ai] gemini-chat : ON (libcurl)")
+elseif(GAI_BUILD_GEMINI_CHAT AND NOT (MSVC AND CURL_FOUND AND "${CURL_INCLUDE_DIR}" MATCHES "[Mm]ingw|[Mm]sys|ucrt64|[Cc]ygwin"))
+    message(STATUS "[ghassan-ai] gemini-chat : OFF (no usable libcurl; use tools/gemini_chat.py)")
+endif()
+
+# ---------------------------------------------------------------- tests (portable: cpu + cuda)
 # NOTE: test_gradcheck.cpp is picked up by the glob below (gradient safety net).
 if(GAI_BUILD_TESTS)
     enable_testing()
@@ -170,5 +224,6 @@ if(GAI_BUILD_TESTS)
 endif()
 
 message(STATUS "[ghassan-ai] build type : ${CMAKE_BUILD_TYPE}")
-message(STATUS "[ghassan-ai] cuda       : ${GAI_HAVE_CUDA} (T4-only, sm_75)")
+message(STATUS "[ghassan-ai] cuda       : ${GAI_HAVE_CUDA} (ref sm_75 T4; override with -DCMAKE_CUDA_ARCHITECTURES)")
 message(STATUS "[ghassan-ai] nccl       : ${GAI_HAVE_NCCL}")
+message(STATUS "[ghassan-ai] parquet    : ${GAI_HAVE_PARQUET} (native lake input; JSON route always works)")

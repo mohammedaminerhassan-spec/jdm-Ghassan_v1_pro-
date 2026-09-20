@@ -10,6 +10,9 @@ namespace gai {
 
 struct ChatOptions {
     std::string      system;
+    // PRO-EN: "darija" (default, legacy ScriptRouter) or "en" (English persona,
+    // script-independent). Set from CLI --persona.
+    std::string      persona = "darija";
     GenerationConfig gen;
     bool             stream = true;
     bool             show_stats = false;
@@ -41,10 +44,16 @@ private:
     void trim_history();
     // returns true and fills `out` when a paraphrase was found in the index
     bool try_retrieve(const std::string& user_message, std::string& out) const;
+    // ScriptRouter: match the system persona to the user's script BEFORE the
+    // turn is encoded, so the reply stays single-script (Latin->Latin,
+    // Arabic->Arabic). Custom --system prompts are kept and only get a short
+    // directive appended instead of being replaced.
+    void apply_script_policy(const std::string& user_message);
 
     Generator&           gen_;
     ChatOptions          opts_;
     std::vector<Message> history_;
+    bool                 custom_system_ = false;
     // lazy-loaded RAG index (built on first query to keep startup fast)
     mutable std::unique_ptr<RetrievalIndex> retrieve_;
     mutable bool retrieve_tried_ = false;

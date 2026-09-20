@@ -47,14 +47,15 @@ training:
   device: cuda             # cuda (Kaggle GPU) | cpu
   precision: fp32          # fp32 master weights (stability); export Q8/Q4 GGUF after
   gemm_fp16: true          # CUDA: large GEMMs on FP16 tensor cores (T4 fast path)
-  loss_scale_init: 65536  # dynamic loss scaler start (0 disables scaling)
+  loss_scale_init: 16384     # fp16-safe max (trainer clamps to this; |dlogits| peaks at scale)
   loss_scale_window: 2000 # clean steps before doubling the scale
   batch_size: 2            # micro-batch (activations are fp32 tensors:
                            # B*T over ~2048 blows past T4 16GB — see dry-run)
   seq_len: 1024
   grad_accum: 32           # effective 2*1024*32 = 65,536 tokens/step (~11.8GB)
   max_steps: 0             # 0 = epochs mode (exactly one of max_steps/epochs)
-  epochs: 3                # <-- 3 passes over shard tokens, STAGE A/B pretraining
+  epochs: 3                # stochastic budget ~= 3x shard tokens (random-window
+                             # sampling with replacement, NOT exact corpus passes)
   learning_rate: 3.0e-4
   min_lr_ratio: 0.1
   warmup_steps: 500

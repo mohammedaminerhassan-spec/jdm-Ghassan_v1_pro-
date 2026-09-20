@@ -10,15 +10,18 @@
 #include "dataset/synth.h"
 #include "dataset/corpus_stats.h"
 #include "dataset/json_reader.h"
+#include "dataset/parquet_reader.h"
 #include "dataset/retrieval.h"
 #include "training/dataloader.h"
 #include "tokenizer/chat_template.h"
+#include "tokenizer/normalizer.h"
 
 #include <cctype>
 #include <cstdio>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <map>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -34,15 +37,19 @@ static void usage() {
     "                         [--text <file|dir>] [--chat <file.jsonl>] [--synth <n>]\n"
     "  data_pipeline inspect  --shards artifacts/shards --tokenizer tok.gtok\n"
     "  data_pipeline json-inspect --file <file.json|jsonl>\n"
+    "  data_pipeline tok-info --tokenizer tok.gtok\n"
     "  data_pipeline dump-text --dir <json-dir> --out corpus.txt\n\n"
-    "  data_pipeline csvs --dir <csv-root> --out corpus_csv.txt\n"
-    "  data_pipeline csv2json --dir <csv-root> --out json_shards\n"
+  "  data_pipeline csvs --dir <csv-root> --out corpus_csv.txt\n"
+  "  data_pipeline parquet --lake dataset/parquet/by_domain --tokenizer tok.gtok\n"
+  "                         --out artifacts/shards --domain darija_qa\n"
+  "  data_pipeline csv2json --dir <csv-root> --out json_shards\n"
     "  data_pipeline jsons --dir <json-root> --out corpus_json.txt\n"
     "  data_pipeline retrieve --index <json-file|dir> --query \"salam labas\" [--top 3]\n\n"
     "dump-text options:\n"
     "  --dir <dir>            directory with *.json / *.jsonl files (recursive)\n"
     "  --out <file>           output text corpus (one doc per line) [corpus.txt]\n"
-  "  --min-chars <n>        minimum cleaned chars         [10]\n\n"
+    "  --min-chars <n>        minimum cleaned chars         [10]\n"
+    "  --keep-case            preserve Latin case (for English BPE training)\n\n"
     "csvs options (Darija vocabulary/grammar tables -> corpus lines):\n"
     "  --dir <dir>            root scanned RECURSIVELY for *.csv\n"
     "  --out <file>           output corpus                 [corpus_csv.txt]\n"
@@ -67,18 +74,53 @@ static void usage() {
   "  --out <dir>            shard output directory        [artifacts/shards]\n"
   "  --val-ratio <f>        validation fraction           [0.005]\n"
   "  --shard-tokens <n>     tokens per shard              [50000000]\n"
-  "  --seq-len <n>          max tokens per document       [4096]\n"
+  "  --seq-len <n>          max tokens per window (long docs split, not cut) [4096]\n"
   "  --domain <name>        domain label -> train_<domain>_*.gbin (for data.mix)\n"
-  "  --min-keep <n>         fail if fewer docs kept       [1]\n"
-  "  --keep-robotic       do not apply the anti-boilerplate filter\n"
-  "  --no-dedup           skip deduplication\n\n"
+    "  --min-keep <n>         fail if fewer docs kept       [1]\n"
+    "  --keep-robotic       do not apply the anti-boilerplate filter\n"
+  "  --style-mode <m>     darija|en|off: darija = full list [default];\n"
+  "                       en = hard AI-disclosure only (for English corpora);\n"
+  "                       off = no style filtering\n"
+  "  --keep-case          preserve Latin case (REQUIRED with a --keep-case\n"
+  "                       tokenizer; default lowercases Latin for Darija)\n"
+  "  --no-dedup           skip deduplication\n"
+  "  --expect-vocab <n>   fail unless tokenizer vocab == n (0 = skip check)\n\n"
   "  accepted doc schemas (auto-detected per object):\n"
   "    chat:        {\"messages\":[{\"role\":\"user\",\"content\":\"...\"}, ...]}\n"
+  "                 (also uuid/license/reasoning/capability_target extras: ignored;\n"
+  "                  files >2GiB stream as JSONL; long docs split into windows)\n"
   "    instruction: {\"instruction\":\"...\",\"input\":\"...\",\"output\":\"...\"}\n"
   "    prompt:      {\"prompt\":\"...\",\"completion\":\"...\"} (also question/answer)\n"
   "    text:        {\"text\":\"...\"} (also content/sentence/document/...)\n"
   "  chat/instruction/prompt docs get SFT loss masks (assistant only);\n"
   "  plain-text docs get full masks (pretraining).\n\n"
+  "parquet options (NATIVE lake input: .parquet -> .gbin shards, same masks):\n"
+  "  --lake <dir>           lake dir or single .parquet file [dataset/parquet/by_domain]\n"
+  "  --dir <dir>            alias for --lake\n"
+  "  --match <substr>       only files whose NAME contains substr (per-domain\n"
+  "                       builds from one mixed lake dir, no copies)\n"
+  "  --tokenizer <path>     .gtok tokenizer (required)\n"
+  "  --out <dir>            shard output directory        [artifacts/shards]\n"
+  "  --val-ratio <f>        validation fraction           [0.005]\n"
+  "  --shard-tokens <n>     tokens per shard              [50000000]\n"
+  "  --seq-len <n>          max tokens per window (long docs split, not cut) [4096]\n"
+  "  --domain <name>        domain label -> train_<domain>_*.gbin (for data.mix)\n"
+  "  --min-keep <n>         fail if fewer docs kept       [1]\n"
+  "  --keep-robotic       do not apply the anti-boilerplate filter\n"
+  "  --style-mode <m>     darija|en|off                   [darija]\n"
+  "  --keep-case          preserve Latin case (REQUIRED with a --keep-case\n"
+  "                       tokenizer; default lowercases Latin for Darija)\n"
+  "  --no-dedup           skip deduplication\n"
+  "  --expect-vocab <n>   fail unless tokenizer vocab == n (0 = skip check)\n"
+  "  --mode qa|text|chat|auto  qa: only Q&A rows (refuse if none); text: all rows\n"
+  "                       as pretraining lines; chat: messages_json (or user +\n"
+  "                       assistant cols) -> multi-turn SFT docs; auto: QA->chat,\n"
+  "                       messages->chat, rest->text [auto]\n"
+  "  --probe              exit 0 iff native parquet is compiled in (for scripts)\n"
+  "  QA tables (question/answer cols, e.g. qa_all.parquet) -> chat docs;\n"
+  "  other string tables -> flattened pretraining text lines (like csvs).\n"
+  "  Needs -DGAI_ENABLE_PARQUET=ON + Arrow (setup.sh --with-parquet);\n"
+  "  without it the command fails loudly and the JSON route applies.\n\n"
     "jsons options (id/question/answer JSON -> corpus lines for BPE):\n"
     "  --dir <dir>            root scanned RECURSIVELY for *.json (or one file)\n"
     "  --out <file>           output corpus                 [corpus_json.txt]\n"
@@ -98,6 +140,10 @@ static void usage() {
     "  --eval-blocklist <p> eval prompts to exclude from training\n"
     "  --no-dedup           skip deduplication\n"
     "  --keep-robotic       do not apply the anti-boilerplate filter\n"
+    "  --style-mode <m>     darija|en|off                   [darija]\n"
+    "  --keep-case          preserve Latin case (REQUIRED with a --keep-case\n"
+    "                       tokenizer; default lowercases Latin for Darija)\n"
+    "  --expect-vocab <n>   fail unless tokenizer vocab == n (0 = skip check)\n"
     "  --report <path>      write the pipeline report here\n";
 }
 
@@ -105,6 +151,7 @@ struct PipelineCounters {
     u64 raw = 0, cleaned = 0, quality_dropped = 0, toxic_dropped = 0;
     u64 robotic_dropped = 0, dup_dropped = 0, blocked = 0, kept = 0;
     u64 tokens_train = 0, tokens_val = 0, docs_train = 0, docs_val = 0;
+    u64 split_docs = 0;  // PRO-EN: docs split into >1 seq_cap windows
     std::map<std::string, u64> lang_kept;
 };
 
@@ -155,54 +202,28 @@ static int cmd_synth(const Args& args) {
 // encoded with the chat template so the loss mask supervises ASSISTANT
 // tokens only (SFT-ready); plain-text docs get full masks (pretraining).
 // Same quality stack as `build`: clean -> toxicity -> PII -> style -> dedup.
-static int cmd_json(const Args& args) {
-    // ---- tokenizer
-    std::string tokpath = args.str("tokenizer");
-    GAI_CHECK(!tokpath.empty(), "--tokenizer is required");
+// ---------------------------------------------------------------- shard build core
+// Shared by `json` and `parquet`: identical tokenizer gate, writers, cleaning,
+// split, masks and report — one implementation so the two input routes can
+// never drift apart (the old json/build duplication already caused one leak).
+struct ShardBuild {
     Tokenizer tok;
-    GAI_CHECK(tok.load(tokpath), "cannot load tokenizer: " + tokpath);
-    log_info(strfmt("[tok ] vocab=%d", tok.vocab_size()));
+    double val_ratio = 0.005;
+    u64 shard_tokens = 50000000;
+    int seq_cap = 4096;
+    bool do_dedup = true;
+    bool style_filter = true;
+    // PRO-EN style modes: "darija" = current anti-robotic list (default, unchanged),
+    // "en" = English-appropriate (only hard AI-disclosure boilerplate + bullets;
+    //   "certainly!"/"of course!"/"i hope this helps" are NORMAL English and kept),
+    // "off" = no style filtering at all. Set via --style-mode.
+    std::string style_mode = "darija";
+    std::string domain;
+    std::string outdir;
 
-    // ---- options
-    std::string json_dir  = args.str("dir", ".");
-    std::string outdir        = args.str("out", "artifacts/shards");
-    const double val_ratio    = args.real("val-ratio", 0.005);
-    const u64 shard_tokens    = static_cast<u64>(args.num("shard-tokens", 50000000));
-    const int seq_cap         = static_cast<int>(args.num("seq-len", 4096));
-    const bool do_dedup       = !args.flag("no-dedup");
-    const bool style_filter   = !args.flag("keep-robotic");
-    // Optional domain label: shards become train_<domain>_*.gbin so the
-    // trainer's data.mix weights can sample domains (empty = legacy names).
-    std::string domain = args.str("domain", "");
-    for (char& ch : domain) {
-        if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
-    }
-
-    fs::create_directories(outdir);
-
-    // ---- shard writers (WITH masks: chat docs need SFT supervision)
     int train_idx = 0, val_idx = 0;
     std::unique_ptr<ShardWriter> train_w, val_w;
     u64 train_shard_tok = 0, val_shard_tok = 0;
-
-    auto shard_name = [&](const char* split, int idx) {
-        if (domain.empty()) return strfmt("%s/%s_%04d.gbin", outdir.c_str(), split, idx);
-        return strfmt("%s/%s_%s_%04d.gbin", outdir.c_str(), split, domain.c_str(), idx);
-    };
-    auto open_train = [&]() {
-        std::string p = shard_name("train", train_idx++);
-        train_w = std::make_unique<ShardWriter>(p, tok.vocab_size(), true);
-        train_shard_tok = 0;
-        log_info("[shard] opened " + p);
-    };
-    auto open_val = [&]() {
-        std::string p = shard_name("val", val_idx++);
-        val_w = std::make_unique<ShardWriter>(p, tok.vocab_size(), true);
-        val_shard_tok = 0;
-        log_info("[shard] opened " + p);
-    };
-    open_train();
-    open_val();
 
     Cleaner cleaner;
     Deduplicator dedup;
@@ -210,14 +231,97 @@ static int cmd_json(const Args& args) {
     PipelineCounters ctr;
     u64 total_tokens = 0;
     u64 chat_docs = 0, text_docs = 0;
+    CleanStats cs;  // text-path cleaning stats (chat turns use a local one)
 
-    auto is_val = [&](const std::string& key) {
-        return (hash_string(key) % 10000ull) < static_cast<u64>(val_ratio * 10000.0);
-    };
-    auto emit = [&](const std::vector<i32>& ids, const std::vector<u8>& mask,
-                    const std::string& key, const std::string& lang) {
+    void init_tokenizer(const Args& args) {
+        std::string tokpath = args.str("tokenizer");
+        GAI_CHECK(!tokpath.empty(), "--tokenizer is required");
+        GAI_CHECK(tok.load(tokpath), "cannot load tokenizer: " + tokpath);
+        log_info(strfmt("[tok ] vocab=%d", tok.vocab_size()));
+        // Fail-loud gate: a 16k legacy file must never silently encode shards
+        // for a 32k model (half the embedding rows would train on nothing).
+        const int expect_vocab = static_cast<int>(args.num("expect-vocab", 0));
+        GAI_CHECK(expect_vocab <= 0 || tok.vocab_size() == expect_vocab,
+                  strfmt("tokenizer vocab %d != expected %d (%s): refusing to encode shards",
+                         tok.vocab_size(), expect_vocab, tokpath.c_str()));
+    }
+
+    void init_options(const Args& args) {
+        val_ratio    = args.real("val-ratio", 0.005);
+        shard_tokens = static_cast<u64>(args.num("shard-tokens", 50000000));
+        seq_cap      = static_cast<int>(args.num("seq-len", 4096));
+        do_dedup     = !args.flag("no-dedup");
+        style_filter = !args.flag("keep-robotic");
+        // PRO-EN: --style-mode darija|en|off (default darija = legacy behavior).
+        style_mode = args.str("style-mode", "darija");
+        for (char& ch : style_mode) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+        if (style_mode != "darija" && style_mode != "en" && style_mode != "off")
+            GAI_FAIL("unknown --style-mode '" + style_mode + "' (darija|en|off)");
+        if (style_mode == "off") style_filter = false;
+        // PRO-EN: --keep-case preserves Latin case in cleaning (default
+        // lowercases for Darija). MUST match the tokenizer's --keep-case or
+        // shards/train/infer disagree on casing. No-op for Arabic script.
+        if (args.flag("keep-case", false)) {
+            CleanConfig cc;
+            cc.normalizer.lowercase_latin = false;
+            cleaner = Cleaner(cc);
+            log_info("[clean] keep-case: Latin capitalization preserved (English corpus)");
+        }
+        // Optional domain label: shards become train_<domain>_*.gbin so the
+        // trainer's data.mix weights can sample domains (empty = legacy names).
+        domain = args.str("domain", "");
+        for (char& ch : domain) {
+            if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
+        }
+        outdir = args.str("out", "artifacts/shards");
+        fs::create_directories(outdir);
+        open_train();
+        open_val();
+        // DeepSeek eval-hygiene: every training-data path honors the eval
+        // blocklist — otherwise eval prompts leak into train shards silently.
+        if (args.has("eval-blocklist")) dedup.load_blocklist(args.str("eval-blocklist"));
+    }
+
+    std::string shard_name(const char* split, int idx) {
+        if (domain.empty()) return strfmt("%s/%s_%04d.gbin", outdir.c_str(), split, idx);
+        return strfmt("%s/%s_%s_%04d.gbin", outdir.c_str(), split, domain.c_str(), idx);
+    }
+    void open_train() {
+        std::string p = shard_name("train", train_idx++);
+        train_w = std::make_unique<ShardWriter>(p, tok.vocab_size(), true);
+        train_shard_tok = 0;
+        log_info("[shard] opened " + p);
+    }
+    void open_val() {
+        std::string p = shard_name("val", val_idx++);
+        val_w = std::make_unique<ShardWriter>(p, tok.vocab_size(), true);
+        val_shard_tok = 0;
+        log_info("[shard] opened " + p);
+    }
+
+    // DeepSeek split rule: hash CANONICAL text, not raw. Near-dups
+    // (paraphrases, same canonical, different raw hash) previously landed
+    // independently in train/val → leakage. Canonical keeps them together.
+    bool is_val(const std::string& key) {
+        const std::string ck = Normalizer::canonical(key);
+        const std::string& hkey = ck.empty() ? key : ck;
+        return (hash_string(hkey) % 10000ull) < static_cast<u64>(val_ratio * 10000.0);
+    }
+    void emit(const std::vector<i32>& ids, const std::vector<u8>& mask,
+              const std::string& key, const std::string& lang) {
         if (ids.empty()) return;
-        if (is_val(key)) {
+        emit_split(ids, mask, key, lang, is_val(key));
+    }
+    // PRO-EN: long docs (chat_if convos average ~3-4k tokens) were TRUNCATED to
+    // seq_cap, silently discarding ~85% of assistant signal. Split into
+    // non-overlapping seq_cap windows instead: every token trains, the
+    // train/val split decision is computed ONCE from the base key so all
+    // windows of one document stay on the same side (no leakage), and each
+    // window is an independent training doc with its own correct loss mask.
+    void emit_split(const std::vector<i32>& ids, const std::vector<u8>& mask,
+                    const std::string& key, const std::string& lang, bool val) {
+        if (ids.empty()) return;
+        if (val) {
             if (val_shard_tok >= shard_tokens) { val_w->close(); open_val(); }
             val_w->add_document(ids, &mask);
             val_shard_tok += ids.size();
@@ -232,7 +336,140 @@ static int cmd_json(const Args& args) {
         }
         ++ctr.kept;
         ctr.lang_kept[lang]++;
-    };
+    }
+    void emit_windowed(const std::vector<i32>& ids, const std::vector<u8>& mask,
+                       const std::string& key, const std::string& lang) {
+        if (ids.empty()) return;
+        if (seq_cap <= 0 || static_cast<int>(ids.size()) <= seq_cap) {
+            emit(ids, mask, key, lang);
+            return;
+        }
+        const bool val = is_val(key);
+        const size_t step = static_cast<size_t>(seq_cap);
+        size_t w = 0;
+        for (size_t off = 0; off < ids.size(); off += step, ++w) {
+            const size_t n = std::min(step, ids.size() - off);
+            std::vector<i32> wid(ids.begin() + off, ids.begin() + off + n);
+            std::vector<u8> wmask(mask.begin() + off, mask.begin() + off + n);
+            emit_split(wid, wmask, key, lang, val);
+        }
+        ++ctr.split_docs;
+    }
+
+    // One JsonDoc (chat or text) through the full clean -> filter -> dedup ->
+    // tokenize -> shard path. Shared verbatim by the json and parquet routes.
+    void on_doc(const JsonDoc& doc) {
+        ++ctr.raw;
+        if (doc.is_chat) {
+            if (doc.messages.empty()) return;
+            // DeepSeek data rule: chat turns get the SAME clean+quality
+            // pipeline as text (raw HTML/mojibake in SFT skews train/infer).
+            std::vector<Message> cleaned_msgs;
+            cleaned_msgs.reserve(doc.messages.size());
+            {
+                CleanStats cs_chat;
+                for (const auto& m : doc.messages) {
+                    std::string cl;
+                    if (!cleaner.clean_line(m.content, cl, cs_chat)) { ++ctr.quality_dropped; return; }
+                    if (cl.size() < 2) { ++ctr.quality_dropped; return; }
+                    if (!quality_check(cl).accept) { ++ctr.quality_dropped; return; }
+                    cleaned_msgs.push_back(Message{m.role, cl});
+                }
+            }
+            std::string key;
+            for (const auto& m : cleaned_msgs) key += m.content + "\n";
+            for (size_t i = 0; i < cleaned_msgs.size(); ++i) {
+                const auto& m = cleaned_msgs[i];
+                if (check_toxicity(m.content).toxic) { ++ctr.toxic_dropped; return; }
+                if (scan_pii(m.content).any()) { ++ctr.blocked; return; }
+                // PRO-EN: style gate per --style-mode. darija = legacy full
+                // list; en = hard AI-disclosure only (normal English
+                // politeness like "Of course!"/"Certainly!" is KEPT).
+                if (style_filter && m.role == Role::Assistant) {
+                    bool drop = false;
+                    if (style_mode == "en") {
+                        drop = has_hard_ai_boilerplate(m.content);
+                    } else {
+                        std::string prev = i > 0 ? cleaned_msgs[i - 1].content : "";
+                        drop = check_assistant_style(m.content, prev, lid).robotic();
+                    }
+                    if (drop) { ++ctr.robotic_dropped; return; }
+                }
+            }
+            ++ctr.cleaned;
+            if (do_dedup && !dedup.add(key)) { ++ctr.dup_dropped; return; }
+            std::vector<u8> mask;
+            std::vector<i32> ids = ChatTemplate::encode(tok, cleaned_msgs, false, &mask);
+            if (ids.empty()) return;
+            // PRO-EN: split long convos into windows (was: truncate, losing ~85%
+            // of assistant signal on chat_if-style corpora).
+            total_tokens += ids.size();
+            LangScore ls = lid.classify(key);
+            emit_windowed(ids, mask, key, lang_name(ls.tag));
+            ++chat_docs;
+        } else {
+            if (doc.text.size() < 10) return;  // skip very short strings
+            std::string cleaned;
+            if (!cleaner.clean_line(doc.text, cleaned, cs)) return;
+            ++ctr.cleaned;
+            if (!quality_check(cleaned).accept) { ++ctr.quality_dropped; return; }
+            if (check_toxicity(cleaned).toxic) { ++ctr.toxic_dropped; return; }
+            if (do_dedup && !dedup.add(cleaned)) { ++ctr.dup_dropped; return; }
+            LangScore ls = lid.classify(cleaned);
+            std::vector<i32> ids = tok.encode(cleaned, true, true);
+            if (ids.empty()) return;
+            // PRO-EN: same window split for long text docs (was: truncate).
+            total_tokens += ids.size();
+            std::vector<u8> mask(ids.size(), 1);  // pretraining: supervise all
+            emit_windowed(ids, mask, cleaned, lang_name(ls.tag));
+            ++text_docs;
+        }
+    }
+
+    // Close writers, print the standard report, enforce the quality gate.
+    int finish(const Args& args, const char* title) {
+        train_w->close();
+        val_w->close();
+        log_info(strfmt("\n==================== %s ====================", title));
+        log_info(strfmt("  total docs        : %s  (chat %s / text %s)",
+                        human_count(ctr.raw).c_str(), human_count(chat_docs).c_str(),
+                        human_count(text_docs).c_str()));
+        log_info(strfmt("  cleaned           : %s", human_count(ctr.cleaned).c_str()));
+        log_info(strfmt("  quality dropped   : %s", human_count(ctr.quality_dropped).c_str()));
+        log_info(strfmt("  toxic dropped     : %s", human_count(ctr.toxic_dropped).c_str()));
+        log_info(strfmt("  pii blocked       : %s", human_count(ctr.blocked).c_str()));
+        log_info(strfmt("  robotic dropped   : %s", human_count(ctr.robotic_dropped).c_str()));
+        log_info(strfmt("  duplicates        : %s", human_count(ctr.dup_dropped).c_str()));
+        log_info(strfmt("  split windows     : %s docs exceeded seq_cap (kept as windows, not truncated)",
+                        human_count(ctr.split_docs).c_str()));
+        log_info(strfmt("  total tokens      : %s", human_count(total_tokens).c_str()));
+        log_info(strfmt("  train docs/tokens : %s / %s  (%d shards)",
+                        human_count(ctr.docs_train).c_str(), human_count(ctr.tokens_train).c_str(), train_idx));
+        log_info(strfmt("  val   docs/tokens : %s / %s  (%d shards)",
+                        human_count(ctr.docs_val).c_str(), human_count(ctr.tokens_val).c_str(), val_idx));
+        log_info("  -- by language --");
+        for (const auto& [l, n] : ctr.lang_kept)
+            log_info(strfmt("    %-12s %s", l.c_str(), human_count(n).c_str()));
+        log_info("================================================================");
+        // ---- quality gate: never let an empty or fully-duplicate corpus through
+        const u64 kept = ctr.docs_train + ctr.docs_val;
+        const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+        if (kept < min_keep) {
+            log_error(strfmt("quality gate FAILED: kept %s docs (< min-keep %s)",
+                             human_count(kept).c_str(), human_count(min_keep).c_str()));
+            return 1;
+        }
+        if (ctr.raw > 0 && ctr.dup_dropped * 2 > ctr.raw)
+            log_warn("quality gate WARNING: >50% exact duplicates — corpus is template-dominated");
+        return 0;
+    }
+};
+
+static int cmd_json(const Args& args) {
+    ShardBuild b;
+    b.init_tokenizer(args);
+    b.init_options(args);
+    std::string json_dir = args.str("dir", ".");
 
     // ---- collect json files (RECURSIVE: datasets may be nested in subfolders)
     std::vector<std::string> json_files;
@@ -256,105 +493,211 @@ static int cmd_json(const Args& args) {
 
     JsonReaderOptions ropts;
     ropts.verbose = false;
-    CleanStats cs;
 
     for (const auto& jfile : json_files) {
         log_info("[json] processing: " + jfile);
-        size_t file_docs = read_json_docs(jfile, [&](const JsonDoc& doc) {
-            ++ctr.raw;
-            if (doc.is_chat) {
-                if (doc.messages.empty()) return;
-                std::string key;
-                for (const auto& m : doc.messages) key += m.content + "\n";
-                // filters on every turn (same policy as `build --chat`)
-                for (size_t i = 0; i < doc.messages.size(); ++i) {
-                    const auto& m = doc.messages[i];
-                    if (m.content.size() < 2) { ++ctr.quality_dropped; return; }
-                    if (check_toxicity(m.content).toxic) { ++ctr.toxic_dropped; return; }
-                    if (scan_pii(m.content).any()) { ++ctr.blocked; return; }
-                    if (style_filter && m.role == Role::Assistant) {
-                        std::string prev = i > 0 ? doc.messages[i - 1].content : "";
-                        if (check_assistant_style(m.content, prev, lid).robotic()) {
-                            ++ctr.robotic_dropped;
-                            return;
-                        }
-                    }
-                }
-                ++ctr.cleaned;
-                if (do_dedup && !dedup.add(key)) { ++ctr.dup_dropped; return; }
-                std::vector<u8> mask;
-                std::vector<i32> ids = ChatTemplate::encode(tok, doc.messages, false, &mask);
-                if (ids.empty()) return;
-                if (static_cast<int>(ids.size()) > seq_cap) {
-                    ids.resize(static_cast<size_t>(seq_cap));
-                    mask.resize(static_cast<size_t>(seq_cap));
-                }
-                total_tokens += ids.size();
-                LangScore ls = lid.classify(key);
-                emit(ids, mask, key, lang_name(ls.tag));
-                ++chat_docs;
-            } else {
-                if (doc.text.size() < 10) return;  // skip very short strings
-                std::string cleaned;
-                if (!cleaner.clean_line(doc.text, cleaned, cs)) return;
-                ++ctr.cleaned;
-                if (!quality_check(cleaned).accept) { ++ctr.quality_dropped; return; }
-                if (check_toxicity(cleaned).toxic) { ++ctr.toxic_dropped; return; }
-                if (do_dedup && !dedup.add(cleaned)) { ++ctr.dup_dropped; return; }
-                LangScore ls = lid.classify(cleaned);
-                std::vector<i32> ids = tok.encode(cleaned, true, true);
-                if (ids.empty()) return;
-                if (static_cast<int>(ids.size()) > seq_cap)
-                    ids.resize(static_cast<size_t>(seq_cap));
-                total_tokens += ids.size();
-                std::vector<u8> mask(ids.size(), 1);  // pretraining: supervise all
-                emit(ids, mask, cleaned, lang_name(ls.tag));
-                ++text_docs;
-            }
-        }, ropts);
+        size_t file_docs = read_json_docs(jfile, [&](const JsonDoc& doc) { b.on_doc(doc); }, ropts);
         log_info(strfmt("  -> %s docs so far (this file: %zu)",
-                        human_count(ctr.raw).c_str(), file_docs));
+                        human_count(b.ctr.raw).c_str(), file_docs));
     }
 
-    train_w->close();
-    val_w->close();
+    return b.finish(args, "json pipeline report");
+}
 
-    log_info("\n==================== json pipeline report ====================");
-    log_info(strfmt("  total docs        : %s  (chat %s / text %s)",
-                    human_count(ctr.raw).c_str(), human_count(chat_docs).c_str(),
-                    human_count(text_docs).c_str()));
-    log_info(strfmt("  cleaned           : %s", human_count(ctr.cleaned).c_str()));
-    log_info(strfmt("  quality dropped   : %s", human_count(ctr.quality_dropped).c_str()));
-    log_info(strfmt("  toxic dropped     : %s", human_count(ctr.toxic_dropped).c_str()));
-    log_info(strfmt("  pii blocked       : %s", human_count(ctr.blocked).c_str()));
-    log_info(strfmt("  robotic dropped   : %s", human_count(ctr.robotic_dropped).c_str()));
-    log_info(strfmt("  duplicates        : %s", human_count(ctr.dup_dropped).c_str()));
-    log_info(strfmt("  total tokens      : %s", human_count(total_tokens).c_str()));
-    log_info(strfmt("  train docs/tokens : %s / %s  (%d shards)",
-                    human_count(ctr.docs_train).c_str(), human_count(ctr.tokens_train).c_str(), train_idx));
-    log_info(strfmt("  val   docs/tokens : %s / %s  (%d shards)",
-                    human_count(ctr.docs_val).c_str(), human_count(ctr.tokens_val).c_str(), val_idx));
-    log_info("  -- by language --");
-    for (const auto& [l, n] : ctr.lang_kept)
-        log_info(strfmt("    %-12s %s", l.c_str(), human_count(n).c_str()));
-    log_info("================================================================");
-    // ---- quality gate: never let an empty or fully-duplicate corpus through
-    const u64 kept = ctr.docs_train + ctr.docs_val;
-    const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
-    if (kept < min_keep) {
-        log_error(strfmt("quality gate FAILED: kept %s docs (< min-keep %s)",
-                         human_count(kept).c_str(), human_count(min_keep).c_str()));
+static int cmd_parquet(const Args& args) {
+    // Route probe for scripts (build_billion_data.sh picks the fastest
+    // AVAILABLE input: native parquet when compiled in, else JSON).
+    if (args.flag("probe")) {
+        if (parquet_available()) {
+            std::cout << "parquet=native\n";
+            return 0;
+        }
+        std::cout << "parquet=unavailable (rebuild with -DGAI_ENABLE_PARQUET=ON; JSON route works)\n";
+        return 2;
+    }
+    // Fail BEFORE opening shard writers: without Arrow the row stream below
+    // throws, and unwinding would flush header-only empty shards into the
+    // output dir (they would then masquerade as a built darija_qa domain).
+    if (!parquet_available()) {
+        log_error("parquet input needs Apache Arrow: rebuild with -DGAI_ENABLE_PARQUET=ON "
+                  "(kaggle/setup.sh --with-parquet), or use the JSON route "
+                  "dataset/qa_darija/*.json which needs no extra dependency");
         return 1;
     }
-    if (ctr.raw > 0 && ctr.dup_dropped * 2 > ctr.raw)
-        log_warn("quality gate WARNING: >50% exact duplicates — corpus is template-dominated");
-    return 0;
+    ShardBuild b;
+    b.init_tokenizer(args);
+    b.init_options(args);
+    // --lake preferred, --dir accepted as an alias (mirrors json).
+    std::string lake = args.str("lake", args.str("dir", "dataset/parquet/by_domain"));
+    std::vector<std::string> files = list_parquet_files(lake);
+    // PRO-EN: --match <substr> keeps only files whose NAME contains substr,
+    // so one lake dir holding english_chat_part*.parquet +
+    // english_instruction_part*.parquet builds each --domain separately
+    // without copying gigabytes on a 19.5GB Kaggle HDD.
+    if (args.has("match")) {
+        const std::string m = args.str("match");
+        std::vector<std::string> kept;
+        for (const auto& f : files)
+            if (fs::path(f).filename().string().find(m) != std::string::npos)
+                kept.push_back(f);
+        files.swap(kept);
+    }
+    if (files.empty()) {
+        log_error("no .parquet files found in: " + lake);
+        return 1;
+    }
+    log_info(strfmt("[parquet] found %zu file(s) in %s (native=%s)",
+                    files.size(), lake.c_str(), parquet_available() ? "yes" : "no"));
+    // --mode selects the contract (default auto):
+    //   qa   : only question/answer rows become chat docs; anything else is
+    //          skipped. Refuses loudly when no QA table exists (protects the
+    //          darija_qa mix weight from silently filling with text docs).
+    //   text : every row becomes one pretraining text line (the csvs
+    //          equivalent for the typed lake; used for darija_vocab).
+    //   chat : messages_json (canonical [{"role","content"}...], as emitted by
+    //          the chat_if converter) or user+assistant columns become
+    //          multi-turn SFT docs. Refuses loudly when no chat column exists.
+    //   auto : QA rows -> chat docs, messages_* rows -> chat docs,
+    //          everything else -> text lines.
+    std::string mode = args.str("mode", "auto");
+    if (mode != "auto" && mode != "qa" && mode != "text" && mode != "chat")
+        GAI_FAIL("parquet: unknown --mode '" + mode + "' (qa|text|chat|auto)");
+    ParquetOptions popts;
+    popts.verbose = true;
+    u64 qa_rows = 0, skipped_rows = 0, qa_files = 0, chat_rows = 0;
+    JsonReaderOptions jopts;  // shared caps for messages_json parsing
+    jopts.verbose = false;
+    size_t n = read_parquet_docs(files, [&](const std::map<std::string, std::string>& row) {
+        auto get = [&](const char* k) -> std::string {
+            auto it = row.find(k);
+            return it != row.end() ? it->second : "";
+        };
+        // QA schema (what build_qa.py emits): question/answer -> chat doc
+        // with assistant-only loss, exactly like the JSON prompt schema.
+        const std::string q = get("question");
+        const std::string a = get("answer");
+        if (!q.empty() && !a.empty()) {
+            if (mode == "text") {
+                // Fall through to the text flattening below (vocab use).
+            } else {
+                JsonDoc doc;
+                doc.is_chat = true;
+                doc.messages = {Message{Role::User, q}, Message{Role::Assistant, a}};
+                b.on_doc(doc);
+                ++qa_rows;
+                return;
+            }
+        } else if (mode == "qa") {
+            ++skipped_rows;  // non-QA row under --mode qa: skip loudly-counted
+            return;
+        }
+        // PRO-EN chat schema: messages_json canonical array, or user/assistant
+        // (+optional system) columns. Same JsonDoc/cleaning/masks as JSON chat.
+        if (mode == "chat" || mode == "auto") {
+            const std::string mj = get("messages_json");
+            if (!mj.empty()) {
+                JsonDoc doc;
+                if (doc_from_json_text("{\"messages\":" + mj + "}", doc, jopts)) {
+                    b.on_doc(doc);
+                    ++chat_rows;
+                    return;
+                }
+                // malformed messages_json falls through to skip counting below
+            } else {
+                const std::string u = get("user");
+                const std::string as = get("assistant");
+                if (!u.empty() && !as.empty()) {
+                    JsonDoc doc;
+                    doc.is_chat = true;
+                    const std::string sys = get("system");
+                    if (!sys.empty()) doc.messages.push_back({Role::System, sys});
+                    doc.messages.push_back({Role::User, u});
+                    doc.messages.push_back({Role::Assistant, as});
+                    b.on_doc(doc);
+                    ++chat_rows;
+                    return;
+                }
+            }
+            if (mode == "chat") { ++skipped_rows; return; }
+            // auto: no chat columns -> fall through to text flattening below
+        }
+        // Lexicon/text schema (variant cols + eng, like the csvs path):
+        // flatten the row's informative cells into one pretraining text line.
+        // (chat_if metadata cols are prefixed _ so they never leak into text.)
+        std::string line;
+        for (const auto& [k, v] : row) {
+            if (v.empty() || k.empty() || k[0] == '_') continue;
+            if (k == "messages_json" || k == "uuid") continue;
+            if (!line.empty()) line += " / ";
+            line += v;
+        }
+        if (!line.empty()) {
+            JsonDoc doc;
+            doc.is_chat = false;
+            doc.text = line;
+            b.on_doc(doc);
+            return;
+        }
+        ++skipped_rows;
+    }, popts);
+    if (mode == "qa") {
+        for (const auto& f : files) {
+            ParquetTableInfo ti = inspect_parquet(f);
+            bool has_q = false, has_a = false;
+            for (const auto& c : ti.columns) {
+                if (c == "question") has_q = true;
+                if (c == "answer") has_a = true;
+            }
+            if (has_q && has_a) ++qa_files;
+        }
+    }
+    u64 chat_files = 0;
+    if (mode == "chat") {
+        for (const auto& f : files) {
+            ParquetTableInfo ti = inspect_parquet(f);
+            bool has_mj = false, has_u = false, has_as = false;
+            for (const auto& c : ti.columns) {
+                if (c == "messages_json") has_mj = true;
+                if (c == "user") has_u = true;
+                if (c == "assistant") has_as = true;
+            }
+            if (has_mj || (has_u && has_as)) ++chat_files;
+        }
+    }
+    log_info(strfmt("[parquet] mode=%s streamed %s rows (%s QA rows, %s chat rows, %s skipped)",
+                    mode.c_str(), human_count(n).c_str(), human_count(qa_rows).c_str(),
+                    human_count(chat_rows).c_str(), human_count(skipped_rows).c_str()));
+    if (mode == "qa" && qa_files == 0) {
+        log_error("no question/answer table found under " + lake +
+                  " (lexicon-only input with --mode qa would starve the mix weight)");
+        return 1;
+    }
+    if (mode == "chat" && chat_files == 0) {
+        log_error("no messages_json (or user+assistant) table found under " + lake +
+                  " (wrong lake for --mode chat would starve the mix weight)");
+        return 1;
+    }
+    return b.finish(args, "parquet pipeline report");
 }
 
 static int cmd_json_inspect(const Args& args) {
     std::string file = args.str("file");
     GAI_CHECK(!file.empty(), "--file is required");
     inspect_json(file);
+    return 0;
+}
+
+// Prints the ACTUAL vocabulary size stored in a .gtok file (parseable line
+// first, for scripts). This is the fail-loud gate against silently building
+// 32k-model shards with the legacy 16k tokenizer: compare the printed number
+// with the model vocab before encoding a single document.
+static int cmd_tok_info(const Args& args) {
+    std::string tokpath = args.str("tokenizer");
+    GAI_CHECK(!tokpath.empty(), "--tokenizer is required");
+    Tokenizer tok;
+    GAI_CHECK(tok.load(tokpath), "cannot load tokenizer: " + tokpath);
+    std::cout << "vocab_size=" << tok.vocab_size() << "\n";
+    log_info(strfmt("[tok ] %s vocab=%d", tokpath.c_str(), tok.vocab_size()));
     return 0;
 }
 
@@ -841,6 +1184,14 @@ static int cmd_dump_text(const Args& args) {
     GAI_CHECK(out.good(), "cannot write: " + outpath);
 
     Cleaner cleaner;
+    // PRO-EN: --keep-case preserves Latin case in the BPE corpus too (must
+    // match the train_tokenizer --keep-case flag for the same model).
+    if (args.flag("keep-case", false)) {
+        CleanConfig cc;
+        cc.normalizer.lowercase_latin = false;
+        cleaner = Cleaner(cc);
+        log_info("[dump] keep-case: Latin capitalization preserved");
+    }
     CleanStats cs;
     JsonReaderOptions opts;
     opts.verbose = true;
@@ -926,6 +1277,12 @@ static int cmd_build(const Args& args) {
     Tokenizer tok;
     GAI_CHECK(tok.load(tokpath), "cannot load tokenizer: " + tokpath);
     log_info(strfmt("[tok] vocab=%d", tok.vocab_size()));
+    {
+        const int expect_vocab = static_cast<int>(args.num("expect-vocab", 0));
+        GAI_CHECK(expect_vocab <= 0 || tok.vocab_size() == expect_vocab,
+                  strfmt("tokenizer vocab %d != expected %d (%s): refusing to encode shards",
+                         tok.vocab_size(), expect_vocab, tokpath.c_str()));
+    }
 
     std::string outdir = args.str("out", "artifacts/shards");
     fs::create_directories(outdir);
@@ -934,7 +1291,14 @@ static int cmd_build(const Args& args) {
     const u64 shard_tokens  = static_cast<u64>(args.num("shard-tokens", 50000000));
     const int  seq_cap      = static_cast<int>(args.num("seq-len", 4096));
     const bool do_dedup     = !args.flag("no-dedup");
-    const bool style_filter = !args.flag("keep-robotic");
+    const bool style_filter_in = !args.flag("keep-robotic");
+    // PRO-EN: same --style-mode/--keep-case contract as the ShardBuild route
+    // (json/parquet). This legacy build route must not drift from it.
+    std::string style_mode = args.str("style-mode", "darija");
+    for (char& ch : style_mode) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+    if (style_mode != "darija" && style_mode != "en" && style_mode != "off")
+        GAI_FAIL("unknown --style-mode '" + style_mode + "' (darija|en|off)");
+    const bool style_filter = style_filter_in && style_mode != "off";
     // Optional domain label for data.mix sampling (empty = legacy names).
     std::string domain = args.str("domain", "");
     for (char& ch : domain) {
@@ -942,6 +1306,12 @@ static int cmd_build(const Args& args) {
     }
 
     Cleaner cleaner;
+    if (args.flag("keep-case", false)) {
+        CleanConfig cc;
+        cc.normalizer.lowercase_latin = false;
+        cleaner = Cleaner(cc);
+        log_info("[clean] keep-case: Latin capitalization preserved (English corpus)");
+    }
     Deduplicator dedup;
     LangId lid;
     PipelineCounters ctr;
@@ -972,16 +1342,21 @@ static int cmd_build(const Args& args) {
     open_train();
     open_val();
 
-    // Deterministic split by document hash: the same document always lands on the
-    // same side, so re-running the pipeline never leaks val into train.
+    // Deterministic split by CANONICAL hash: the same document always lands
+    // on the same side, and near-dups (same canonical) stay together —
+    // otherwise paraphrases leak across train/val silently.
     auto is_val = [&](const std::string& key) {
-        return (hash_string(key) % 10000ull) < static_cast<u64>(val_ratio * 10000.0);
+        const std::string ck = Normalizer::canonical(key);
+        const std::string& hkey = ck.empty() ? key : ck;
+        return (hash_string(hkey) % 10000ull) < static_cast<u64>(val_ratio * 10000.0);
     };
 
-    auto emit = [&](const std::vector<i32>& ids, const std::vector<u8>& mask,
-                    const std::string& key, const std::string& lang) {
+    // Local window splitter (mirrors ShardBuild::emit_windowed): long docs
+    // become non-overlapping seq_cap windows on ONE split side (was: truncate).
+    auto emit_windowed_impl = [&](const std::vector<i32>& ids, const std::vector<u8>& mask,
+                    const std::string& key, const std::string& lang, bool val) {
         if (ids.empty()) return;
-        if (is_val(key)) {
+        if (val) {
             if (val_shard_tokens >= shard_tokens) { val_w->close(); open_val(); }
             val_w->add_document(ids, &mask);
             val_shard_tokens += ids.size();
@@ -996,6 +1371,28 @@ static int cmd_build(const Args& args) {
         }
         ++ctr.kept;
         ctr.lang_kept[lang]++;
+    };
+    auto emit = [&](const std::vector<i32>& ids, const std::vector<u8>& mask,
+                    const std::string& key, const std::string& lang) {
+        if (ids.empty()) return;
+        emit_windowed_impl(ids, mask, key, lang, is_val(key));
+    };
+    auto emit_windowed = [&](const std::vector<i32>& ids, const std::vector<u8>& mask,
+                    const std::string& key, const std::string& lang) {
+        if (ids.empty()) return;
+        if (seq_cap <= 0 || static_cast<int>(ids.size()) <= seq_cap) {
+            emit(ids, mask, key, lang);
+            return;
+        }
+        const bool val = is_val(key);
+        const size_t step = static_cast<size_t>(seq_cap);
+        for (size_t off = 0; off < ids.size(); off += step) {
+            const size_t n = std::min(step, ids.size() - off);
+            emit_windowed_impl(
+                std::vector<i32>(ids.begin() + off, ids.begin() + off + n),
+                std::vector<u8>(mask.begin() + off, mask.begin() + off + n),
+                key, lang, val);
+        }
     };
 
     // ---------------- plain text ----------------
@@ -1016,9 +1413,9 @@ static int cmd_build(const Args& args) {
 
             LangScore ls = lid.classify(cleaned);
             std::vector<i32> ids = tok.encode(cleaned, true, true);
-            if (static_cast<int>(ids.size()) > seq_cap) ids.resize(static_cast<size_t>(seq_cap));
+            if (ids.empty()) continue;
             std::vector<u8> mask(ids.size(), 1);   // pretraining supervises everything
-            emit(ids, mask, cleaned, lang_name(ls.tag));
+            emit_windowed(ids, mask, cleaned, lang_name(ls.tag));
         }
         log_info("  clean: " + cs.summary());
     }
@@ -1047,9 +1444,9 @@ static int cmd_build(const Args& args) {
             if (do_dedup && !dedup.add(doc)) { ++ctr.dup_dropped; continue; }
             LangScore ls = lid.classify(doc);
             std::vector<i32> ids = tok.encode(doc, true, true);
-            if (static_cast<int>(ids.size()) > seq_cap) ids.resize(static_cast<size_t>(seq_cap));
+            if (ids.empty()) continue;
             std::vector<u8> mask(ids.size(), 1);
-            emit(ids, mask, doc, lang_name(ls.tag));
+            emit_windowed(ids, mask, doc, lang_name(ls.tag));
         }
     }
 
@@ -1075,23 +1472,40 @@ static int cmd_build(const Args& args) {
         ++ctr.raw;
         if (c.messages.empty()) continue;
 
+        // Same clean+quality rule as cmd_json: chat turns are cleaned per
+        // turn so SFT never learns raw HTML/mojibake the text path strips.
+        std::vector<Message> cleaned_msgs;
+        cleaned_msgs.reserve(c.messages.size());
+        {
+            CleanStats cs_chat;
+            bool bad = false;
+            for (const auto& m : c.messages) {
+                std::string cl;
+                if (!cleaner.clean_line(m.content, cl, cs_chat)) { ++ctr.quality_dropped; bad = true; break; }
+                if (cl.size() < 2 || !quality_check(cl).accept) { ++ctr.quality_dropped; bad = true; break; }
+                cleaned_msgs.push_back(Message{m.role, cl});
+            }
+            if (bad) continue;
+        }
         // build a joining key for dedup / split
         std::string key;
-        for (const auto& m : c.messages) key += m.content + "\n";
+        for (const auto& m : cleaned_msgs) key += m.content + "\n";
 
-        // filters on assistant turns
+        // filters on assistant turns (style gate honors --style-mode)
         bool drop = false;
-        for (size_t i = 0; i < c.messages.size(); ++i) {
-            const auto& m = c.messages[i];
+        for (size_t i = 0; i < cleaned_msgs.size(); ++i) {
+            const auto& m = cleaned_msgs[i];
             if (check_toxicity(m.content).toxic) { ++ctr.toxic_dropped; drop = true; break; }
             if (scan_pii(m.content).any())       { ++ctr.blocked; drop = true; break; }
             if (style_filter && m.role == Role::Assistant) {
-                std::string prev = i > 0 ? c.messages[i - 1].content : "";
-                if (check_assistant_style(m.content, prev, lid).robotic()) {
-                    ++ctr.robotic_dropped;
-                    drop = true;
-                    break;
+                bool bad_style = false;
+                if (style_mode == "en") {
+                    bad_style = has_hard_ai_boilerplate(m.content);
+                } else {
+                    std::string prev = i > 0 ? cleaned_msgs[i - 1].content : "";
+                    bad_style = check_assistant_style(m.content, prev, lid).robotic();
                 }
+                if (bad_style) { ++ctr.robotic_dropped; drop = true; break; }
             }
         }
         if (drop) continue;
@@ -1100,13 +1514,10 @@ static int cmd_build(const Args& args) {
         if (do_dedup && !dedup.add(key)) { ++ctr.dup_dropped; continue; }
 
         std::vector<u8> mask;
-        std::vector<i32> ids = ChatTemplate::encode(tok, c.messages, false, &mask);
-        if (static_cast<int>(ids.size()) > seq_cap) {
-            ids.resize(static_cast<size_t>(seq_cap));
-            mask.resize(static_cast<size_t>(seq_cap));
-        }
+        std::vector<i32> ids = ChatTemplate::encode(tok, cleaned_msgs, false, &mask);
+        if (ids.empty()) continue;
         LangScore ls = lid.classify(key);
-        emit(ids, mask, key, lang_name(ls.tag));
+        emit_windowed(ids, mask, key, lang_name(ls.tag));
     }
 
     train_w->close();
@@ -1118,10 +1529,11 @@ static int cmd_build(const Args& args) {
     rep << strfmt("  raw documents      : %s\n", human_count(ctr.raw).c_str());
     rep << strfmt("  passed cleaning    : %s\n", human_count(ctr.cleaned).c_str());
     rep << strfmt("  dropped quality    : %s\n", human_count(ctr.quality_dropped).c_str());
-    rep << strfmt("  dropped toxicity   : %s\n", human_count(ctr.toxic_dropped).c_str());
+    rep << strfmt("  dropped toxicity   : %s  (rule lists only, NOT a safety guarantee)\n", human_count(ctr.toxic_dropped).c_str());
     rep << strfmt("  dropped robotic    : %s\n", human_count(ctr.robotic_dropped).c_str());
     rep << strfmt("  dropped pii        : %s\n", human_count(ctr.blocked).c_str());
     rep << strfmt("  dropped duplicate  : %s\n", human_count(ctr.dup_dropped).c_str());
+    rep << strfmt("  split windows      : %s docs exceeded seq_cap (kept as windows)\n", human_count(ctr.split_docs).c_str());
     rep << strfmt("  kept               : %s\n", human_count(ctr.kept).c_str());
     rep << "\n";
     rep << strfmt("  train docs/tokens  : %s / %s  (%d shards)\n",
@@ -1232,7 +1644,9 @@ int main(int argc, char** argv) {
 
     try {
         if (cmd == "json")            return cmd_json(args);
+        if (cmd == "parquet")         return cmd_parquet(args);
         if (cmd == "json-inspect")    return cmd_json_inspect(args);
+        if (cmd == "tok-info")        return cmd_tok_info(args);
         if (cmd == "dump-text")       return cmd_dump_text(args);
         if (cmd == "csvs")            return cmd_csvs(args);
         if (cmd == "csv2json")        return cmd_csv2json(args);

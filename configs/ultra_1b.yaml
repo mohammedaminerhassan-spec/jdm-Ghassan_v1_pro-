@@ -1,22 +1,24 @@
-# Ghassan v1 Ultra — 1B MoE architecture + training recipe
-# Parameter math (tied lm_head):
-#   tok_emb  : 16000 x 768                        = 12,288,000
-#   per layer: attn 1,572,864 + moe 25,959,936 + 2x768 norms
-#            = 27,534,336 per layer
+# Ghassan v1 Ultra — FLAGSHIP single-T4 1B MoE recipe (use this on Kaggle;
+# configs/t4_1b.yaml is the separate legacy 4xT4-DDP experiment, not this model).
+# Parameter math (tied lm_head, 32k vocab — verified against model/model.cpp):
+#   tok_emb  : 32000 x 768                        = 24,576,000
+#   per layer: attn 1,572,864 + moe 25,959,936 + 2x768 norms + qknorm 128
+#            = 27,534,464 per layer
 #     attn: wq 589,824 + wk 196,608 + wv 196,608 + wo 589,824 = 1,572,864
 #     moe : router 7,680
 #           + gate 10*1024*768 = 7,864,320
 #           + up   10*1024*768 = 7,864,320
 #           + down 10*768*1024 = 7,864,320
 #           + shared 3*1024*768 = 2,359,296
-#            = 25,959,936 + router = 25,967,616? + norms -> 27,534,336
-#   36 layers: 36 x 27,534,336                    = 991,236,096
+#            = 25,959,936 (router included)
+#     norms  : attn_norm 768 + ffn_norm 768 + qk_qnorm 64 + qk_knorm 64 = 1,664
+#   36 layers: 36 x 27,534,464                    = 991,240,704
 #   final_norm:                                   = 768
-#   TOTAL:                                        = 1,003,524,864 (~1.00B)
-# Active per token: attn + top-2 experts + shared = 1.57M + 4.72M + 2.36M
-#   = ~8.65M/layer x36 = ~311M + embeddings 12M = ~324M active ("1B / 324M active")
+#   TOTAL:                                        = 1,015,817,472 (~1.016B)
+# Active per token: attn 1.57M + router 0.01M + top-2 routed 4.72M + shared 2.36M
+#   = ~8.66M/layer x36 = ~311.8M + embeddings 24.6M = ~336M active ("1B / 336M active")
 #
-# T4 NOTE: 1B fp32 = 4GB weights + 4GB grads + Lion 4GB = 12GB.
+# T4 NOTE: 1B fp32 = 4.06GB weights + 4.06GB grads + Lion 4.06GB = ~12.2GB.
 #   AdamW would be 16GB+ -> OOM. So optimizer MUST be lion here.
 #   batch_size=1 + seq_len 512 (halved activations) + grad_accum 128.
 #   vocab 32k multilingual (was 16k: too high fertility for Arabizi/Arabic).
@@ -56,13 +58,15 @@ training:
   precision: fp32
   gemm_fp16: true          # 10/10: T4 FP16 tensor cores ON (fp32 masters + loss scaling).
                           # Old false forced pure fp32 SGEMM = 3-5x slower, 9h budget => 58M tok only.
-  loss_scale_init: 65536
+  loss_scale_init: 16384     # fp16-safe max (trainer clamps to this; |dlogits| peaks at scale)
   loss_scale_window: 2000
   batch_size: 1            # T4 16GB: B=1 only for 1B model
   seq_len: 512             # 512 fits T4 (1024 OOMs at 1B even with Lion)
   grad_accum: 128          # effective 1*512*128 = 65,536 tokens/step (same budget)
   max_steps: 0             # 0 = epochs mode
-  epochs: 2                # 2 passes over ~1B-token shards = ~2B tokens seen
+  epochs: 2                # stochastic token budget ~= 2x shard tokens (random-window
+                           # sampling with replacement, NOT exact corpus passes; the
+                           # trainer logs exact supervised tokens seen)
   learning_rate: 3.0e-4
   min_lr_ratio: 0.1
   warmup_steps: 1500       # was 800: too short for 1B+Lion
@@ -90,10 +94,27 @@ training:
 data:
   train_glob: artifacts/shards_1b/train_*.gbin
   val_glob: artifacts/shards_1b/val_*.gbin
+  # ACTIVE MIX (must equal what kaggle/build_billion_data.sh materializes —
+  # every domain below is built there, so preflight passes and no weight
+  # silently vanishes in renormalization).
+  #   darija_conversational: synth fluency (700k convs, governor+reasoning in)
+  #   darija_vocab:          YOUR dataset-main/*.csv (words, conjugation, grammar)
+  #   darija_speak:          YOUR model_speak/ single-script speaking targets
+  #   educational_science:   JSON knowledge corpus
+  #   darija_qa:             YOUR dataset/qa_darija/ (275k grounded Q&A over the
+  #                            CSV tables: teaches RESPONDING, assistant-only loss)
+  # To add a domain: build shards with
+  #   data_pipeline ... --domain <name>
+  # then append "<name>: <weight>" here (weights renormalize automatically;
+  # the trainer startup log prints the effective mix — read it, don't assume).
   mix:
-    darija_conversational: 0.35
-    darija_reasoning_logic: 0.20
-    arabic_conversational: 0.12
+    darija_conversational: 0.40
+    darija_vocab: 0.20
+    darija_speak: 0.15
     educational_science: 0.15
-    general_culture_law: 0.08
-    code_switch_chat: 0.10
+    darija_qa: 0.10         # grounded Q&A over the CSV tables (response
+                            # supervision; built by dataset/build_qa.py,
+                            # materialized as train_darija_qa_*.gbin)
+
+# inference sampling (CLI only, not training): --temp 0.7 --top-k 40 --top-p 0.92
+# --min-p 0.05 --repeat 1.12 --no-repeat-ngram 3 (Darija anti-loop)

@@ -4,7 +4,7 @@
 # Do NOT run full training from this file.
 
 model:
-  vocab_size: 16000
+  vocab_size: 32000
   hidden_size: 768
   num_layers: 26
   num_heads: 12
@@ -24,15 +24,16 @@ model:
   # => 467,439,360 parameters
 
 tokenizer:
-  path: artifacts/tokenizer/darija.gtok
-  vocab_size: 16000
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
 
 training:
   stage: pretrain
   device: cuda
   precision: fp32
   gemm_fp16: true          # also validates the FP16 path in the pilot
-  loss_scale_init: 65536
+  loss_scale_init: 16384   # PRO-HARDEN: كان 65536 فيتجاوز سقف fp16 الآمن
+                          # (trainer يخفضه مع warning). 16384 هو الصحيح لـT4.
   loss_scale_window: 2000
   batch_size: 1            # CONSERVATIVE: start at 1, increase if VRAM allows
   seq_len: 256             # CONSERVATIVE: short context for the pilot

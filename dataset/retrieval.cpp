@@ -1,7 +1,9 @@
 #include "dataset/retrieval.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 
@@ -147,7 +149,12 @@ static bool parse_string(Cursor& c, std::string& out) {
                         if (lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             c.p += 6;
+                        } else {
+                            cp = 0xFFFD;
                         }
+                    } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                        // FIX: lone surrogate -> replacement char (no CESU-8).
+                        cp = 0xFFFD;
                     }
                     utf8_emit(out, cp);
                     break;
@@ -221,64 +228,145 @@ static bool skip_value(Cursor& c) {
 
 } // namespace
 
-bool load_qa_json(const std::string& path, std::vector<QaEntry>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.good()) return false;
-    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (text.empty()) return false;
-    Cursor c{text.data(), text.data() + text.size()};
-    skip_ws(c);
-    if (c.eof() || *c.p != '[') return false;
-    ++c.p;
-    size_t loaded = 0;
+// Stable 63-bit FNV-1a: string ids (e.g. "ghassan_darija_0002717") become
+// deterministic int64 ids instead of failing the whole file.
+static long long hash_id_str(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char ch : s) { h ^= ch; h *= 1099511628211ull; }
+    return static_cast<long long>(h & 0x7FFFFFFFFFFFFFFFull);
+}
+
+// Parses ONE object body; cursor must sit right AFTER '{'.
+// Returns false only on malformed JSON (caller skips the object).
+// Missing question/answer -> *has_qa=false (object ignored, not fatal).
+// id accepts int OR string (hashed); unknown keys (domain/script/old_id/...)
+// are skipped so enriched Darija rows load fine.
+static bool parse_qa_object_body(Cursor& c, QaEntry& e, bool& has_qa, long long auto_id) {
+    bool has_q = false, has_a = false;
+    e.id = auto_id;
     while (true) {
         skip_ws(c);
         if (c.eof()) return false;
-        if (*c.p == ']') { ++c.p; break; }
-        if (*c.p != '{') return false;
+        if (*c.p == '}') { ++c.p; break; }
+        std::string key;
+        if (!parse_string(c, key)) return false;
+        skip_ws(c);
+        if (c.eof() || *c.p != ':') return false;
         ++c.p;
-        QaEntry e;
-        bool has_q = false, has_a = false, has_id = false;
-        while (true) {
-            skip_ws(c);
-            if (c.eof()) return false;
-            if (*c.p == '}') { ++c.p; break; }
-            std::string key;
-            if (!parse_string(c, key)) return false;
-            skip_ws(c);
-            if (c.eof() || *c.p != ':') return false;
-            ++c.p;
-            skip_ws(c);
-            if (key == "question") {
-                if (!parse_string(c, e.question)) return false;
-                has_q = true;
-            } else if (key == "answer") {
-                if (!parse_string(c, e.answer)) return false;
-                has_a = true;
-            } else if (key == "id") {
-                if (!parse_int(c, e.id)) return false;
-                has_id = true;
+        skip_ws(c);
+        if (key == "question") {
+            if (!parse_string(c, e.question)) return false;
+            has_q = true;
+        } else if (key == "answer") {
+            if (!parse_string(c, e.answer)) return false;
+            has_a = true;
+        } else if (key == "id") {
+            if (!c.eof() && *c.p == '"') {
+                std::string sid;
+                if (!parse_string(c, sid)) return false;
+                e.id = sid.empty() ? auto_id : hash_id_str(sid);
             } else {
-                if (!skip_value(c)) return false;
+                if (!parse_int(c, e.id)) return false;
             }
-            skip_ws(c);
-            if (c.eof()) return false;
-            if (*c.p == ',') { ++c.p; continue; }
-            if (*c.p == '}') { ++c.p; break; }
-            return false;
-        }
-        if (has_q && has_a) {
-            if (!has_id) e.id = static_cast<long long>(out.size() + loaded);
-            out.push_back(std::move(e));
-            ++loaded;
+        } else {
+            if (!skip_value(c)) return false;
         }
         skip_ws(c);
         if (c.eof()) return false;
         if (*c.p == ',') { ++c.p; continue; }
-        if (*c.p == ']') { ++c.p; break; }
+        if (*c.p == '}') { ++c.p; break; }
         return false;
     }
+    has_qa = has_q && has_a && !e.question.empty() && !e.answer.empty();
     return true;
+}
+
+bool load_qa_json(const std::string& path, std::vector<QaEntry>& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+    // FIX: unbounded whole-file load -> bad_alloc/OOM on GB JSON (RAG build
+    // crash, low-PC killer). Cap at 2GiB and fail fast with a clear cause.
+    {
+        std::error_code ec;
+        const auto fsize = std::filesystem::file_size(path, ec);
+        if (!ec && fsize > (2ull << 30)) return false;
+    }
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (text.empty()) return false;
+    Cursor c{text.data(), text.data() + text.size()};
+    skip_ws(c);
+    if (c.eof()) return false;
+    size_t loaded = 0;
+    auto auto_id = [&]() { return static_cast<long long>(out.size() + loaded); };
+    if (*c.p == '[') {
+        // ---- top-level array path (train-*.json shards) ----
+        ++c.p;
+        while (true) {
+            skip_ws(c);
+            if (c.eof()) return false;
+            if (*c.p == ']') { ++c.p; break; }
+            if (*c.p != '{') return false;
+            ++c.p;
+            QaEntry e;
+            bool has_qa = false;
+            if (!parse_qa_object_body(c, e, has_qa, auto_id())) return false;
+            if (has_qa) { out.push_back(std::move(e)); ++loaded; }
+            skip_ws(c);
+            if (c.eof()) return false;
+            if (*c.p == ',') { ++c.p; continue; }
+            if (*c.p == ']') { ++c.p; break; }
+            return false;
+        }
+        return true;
+    }
+    // ---- JSONL path (one object per line(s); Darija clean files) ----
+    // Brace-depth splitter aware of strings/escapes, so pretty-printed
+    // multi-line objects also work — not just strict one-line JSONL.
+    size_t pos = static_cast<size_t>(c.p - text.data());
+    const size_t n = text.size();
+    size_t bad = 0;
+    while (pos < n) {
+        while (pos < n && (text[pos] == ' ' || text[pos] == '\t' ||
+                           text[pos] == '\n' || text[pos] == '\r'))
+            ++pos;
+        if (pos >= n) break;
+        if (text[pos] != '{') {
+            if (++bad <= 5) log_warn("retrieval: skipping non-object content in " + path);
+            while (pos < n && text[pos] != '\n') ++pos;
+            continue;
+        }
+        size_t start = pos;
+        int depth = 0;
+        bool in_str = false, esc = false;
+        while (pos < n) {
+            char ch = text[pos++];
+            if (in_str) {
+                if (esc) esc = false;
+                else if (ch == '\\') esc = true;
+                else if (ch == '"') in_str = false;
+            } else {
+                if (ch == '"') in_str = true;
+                else if (ch == '{') ++depth;
+                else if (ch == '}') {
+                    if (--depth <= 0) break;
+                }
+            }
+        }
+        if (depth != 0) {
+            log_warn("retrieval: truncated object at EOF in " + path);
+            break;
+        }
+        Cursor oc{text.data() + start, text.data() + pos};
+        if (oc.eof() || *oc.p != '{') continue;
+        ++oc.p;
+        QaEntry e;
+        bool has_qa = false;
+        if (parse_qa_object_body(oc, e, has_qa, auto_id()) && has_qa) {
+            out.push_back(std::move(e));
+            ++loaded;
+        }
+    }
+    return loaded > 0;
 }
 
 size_t load_qa_dir(const std::string& dir, std::vector<QaEntry>& out) {
@@ -289,7 +377,9 @@ size_t load_qa_dir(const std::string& dir, std::vector<QaEntry>& out) {
     auto push_from = [&](const std::string& d) {
         for (const auto& e : fs::recursive_directory_iterator(d, ec)) {
             if (!e.is_regular_file()) continue;
-            if (e.path().extension() == ".json") files.push_back(e.path().string());
+            std::string ext = e.path().extension().string();
+            for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (ext == ".json" || ext == ".jsonl") files.push_back(e.path().string());
         }
     };
     if (fs::is_regular_file(dir, ec)) {

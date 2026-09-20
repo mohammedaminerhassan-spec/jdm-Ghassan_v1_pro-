@@ -1,0 +1,85 @@
+# Ghassan Pro Aux-Free — DeepSeek-V3 §3.2 aux-loss-free MoE (EMA bias, no aux grad).
+# Requires moe_aux_scale 0.0. Bias lives in Model (host+device), persists in
+# native GGUF as layers.{L}.moe_bias (F32). Missing on load = init 0.
+# Kernels: CPU+CUDA moe_forward_bias (selection on probs+bias, weights pure softmax).
+# Use for research runs; flagship ultra_1b keeps classic aux 0.01 for stability.
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
+  moe_aux_scale: 0.0        # REQUIRED 0.0 for aux-free (no aux grad)
+  moe_aux_free: true        # EMA bias steering, no loss term
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0
+  rope_yarn_high: 32.0
+  sliding_window: 0
+  rope_type: 0
+
+tokenizer:
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 16384
+  loss_scale_window: 2000
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 32
+  max_steps: 0
+  epochs: 2
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 800
+  optimizer: lion
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 250
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/pro_auxfree
+  data_dir: artifacts/shards_1b
+  resume: auto
+  activation_checkpointing: false
+  ckpt_segments: 1
+
+# inference sampling (CLI only): --temp 0.7 --top-k 40 --top-p 0.92 --min-p 0.05
+# --repeat 1.12 --no-repeat-ngram 3 (Darija anti-loop)
+
+data:
+  train_glob: artifacts/shards_1b/train_*.gbin
+  val_glob: artifacts/shards_1b/val_*.gbin
+  mix:
+    darija_conversational: 0.40
+    darija_vocab: 0.20
+    darija_speak: 0.15
+    educational_science: 0.15
+    darija_qa: 0.10

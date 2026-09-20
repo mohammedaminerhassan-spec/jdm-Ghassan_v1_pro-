@@ -108,6 +108,12 @@ bool utf8_is_complete(const std::string& s) {
         int len = utf8_seq_len(b);
         if (len == 0) return false;
         if (i + static_cast<size_t>(len) > s.size()) return false;
+        // FIX: old code accepted invalid continuations (e.g. E2 28 A1) as
+        // complete -> tokenizer split invalid sequences (training garbage).
+        for (int k = 1; k < len; ++k) {
+            if ((static_cast<u8>(s[i + static_cast<size_t>(k)]) & 0xC0) != 0x80)
+                return false;
+        }
         i += static_cast<size_t>(len);
     }
     return true;

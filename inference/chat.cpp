@@ -8,20 +8,56 @@ namespace gai {
 
 ChatSession::ChatSession(Generator& gen, ChatOptions opts)
     : gen_(gen), opts_(std::move(opts)) {
-    if (opts_.system.empty()) opts_.system = ChatTemplate::default_system();
+    if (opts_.system.empty()) {
+        // PRO-EN: English persona is script-independent (never swapped by the
+        // ScriptRouter); Darija keeps the legacy Arabic-default routing.
+        opts_.system = (opts_.persona == "en" || opts_.persona == "english")
+                           ? ChatTemplate::default_system_english()
+                           : ChatTemplate::default_system();
+        custom_system_ = false;
+    } else {
+        custom_system_ = true;
+    }
     history_.push_back({Role::System, opts_.system});
 }
 
 void ChatSession::clear() {
-    std::string sys = history_.empty() ? ChatTemplate::default_system() : history_[0].content;
+    std::string sys;
+    if (!history_.empty()) {
+        sys = history_[0].content;
+    } else if (opts_.persona == "en" || opts_.persona == "english") {
+        sys = ChatTemplate::default_system_english();
+    } else {
+        sys = ChatTemplate::default_system();
+    }
     history_.clear();
     history_.push_back({Role::System, sys});
 }
 
 void ChatSession::set_system(const std::string& s) {
     opts_.system = s;
+    custom_system_ = true;
     if (!history_.empty() && history_[0].role == Role::System) history_[0].content = s;
     else history_.insert(history_.begin(), {Role::System, s});
+}
+
+void ChatSession::apply_script_policy(const std::string& user_message) {
+    if (history_.empty() || history_[0].role != Role::System) return;
+    // PRO-EN: with the English persona the system line is script-independent
+    // and must NOT be swapped per turn (legacy Darija routing only).
+    if (opts_.persona == "en" || opts_.persona == "english") return;
+    ReplyScript script = ChatTemplate::detect_script(user_message);
+    if (!custom_system_) {
+        // Default persona: swap the whole system line to the matching script.
+        history_[0].content = ChatTemplate::system_for_script(script);
+        opts_.system = history_[0].content;
+    } else {
+        // Custom persona: keep it, enforce the script with one directive line.
+        const std::string dir = ChatTemplate::script_directive(script);
+        if (history_[0].content.find(dir) == std::string::npos) {
+            history_[0].content += std::string("\n") + dir;
+        }
+    }
 }
 
 void ChatSession::trim_history() {
@@ -75,6 +111,9 @@ std::string ChatSession::send(const std::string& user_message) {
             return retrieved;
         }
     }
+    // ScriptRouter runs BEFORE the turn is encoded: the system persona for
+    // this turn always matches the script the user just typed in.
+    apply_script_policy(user_message);
     history_.push_back({Role::User, user_message});
     // Augment mode: prepend best hit as context when direct is off
     if (!opts_.retrieve_direct && !opts_.retrieve_index.empty()) {

@@ -1,19 +1,23 @@
-# Ghassan v1 Ultra 1B — Billion-scale synthetic data generation
-# Target: ~1B tokens total when combined with JSON + SFT shards.
+# Ghassan v1 Ultra 1B — Large-scale synthetic data generation.
+# NOTE on the legacy "~1B" name: with the capped conversation counts below,
+# the PLANNED total is ~0.5-0.7B, not 1B. The measured shard totals printed
+# by `data_pipeline inspect` are the source of truth — never scale training
+# configs from this comment.
 #
-# Math (measured on darija.gtok, seq_len 1024):
-#   1 conversation ~= 300-450 tokens (avg ~380 with system prompt + 2-14 turns)
-#   1,500,000 convs x 380 ~= 570M tokens synthetic
-#   + JSON/CSV corpora (~200-400M after dedup + arabizi doubling)
-#   + SFT chat (200k convs ~= 80M)
-#   => ~1.0B tokens total across artifacts/shards_1b + shards_1b_sft
+# Math (avg ~380 tok/conversation with system prompt + turns):
+#   700,000 pretrain convs x 380 ~= 266M tokens synthetic (<30% cap: larger
+#     synthetic fractions memorize templates instead of Darija)
+#   + JSON/CSV corpora (~200-400M after dedup; MEASURED at build time)
+#   + SFT chat (150,000 convs x ~380 ~= 57M)
+#   => ~0.5-0.7B tokens planned across artifacts/shards_1b + shards_1b_sft
 #
-# Run (needs ~30GB disk free, run once, reuse shards for all epochs):
-#   build/bin/data_pipeline synth --config configs/synth_billion.yaml
+# Run (needs ~15GB disk free, run once, reuse shards for all epochs):
 #   bash kaggle/build_billion_data.sh
+# (data_pipeline synth takes explicit CLI flags, not --config; the build
+# script below derives its batch counts from num_conversations here.)
 #
-# NOTE: do NOT generate 1.5M in one process on Kaggle (OOM/timeout).
-# The build script splits into 15 x 100k batches with different seeds.
+# NOTE: do NOT generate the full count in one process on Kaggle (OOM/timeout).
+# The build script splits into small seeded batches (14 x 50k + 2 x 75k).
 
 synth:
   seed: 1234

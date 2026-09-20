@@ -1,0 +1,92 @@
+# Ghassan Darija Flash 480M — SFT (speaking) recipe. Stage 2 of the <=8h run.
+# Architecture MUST match configs/darija_flash.yaml exactly (26L, 8 experts).
+# The speaking quality anchor is `darija_real` (model_ready: 3639 curated rows,
+# greetings/chat_general/common_qa/...): upweighted to 0.45 so the model learns
+# to SPEAK like those rows (assistant-only loss), while `darija_chat` (synth)
+# keeps fluency and variety. Retrieval index over the same model_ready dir
+# grounds answers at inference (see --retrieve-index).
+#
+# Build SFT shards on Kaggle FIRST:
+#   data_pipeline synth --out artifacts/synth/darija_sft.jsonl --n 150000 \
+#       --seed 9999 --max-template-uses 300
+#   data_pipeline build --tokenizer artifacts/tokenizer/darija32k.gtok \
+#       --expect-vocab 32000 --out artifacts/shards_darija_sft \
+#       --chat artifacts/synth/darija_sft.jsonl --domain darija_chat \
+#       --shard-tokens 50000000 --seq-len 1024
+#   data_pipeline json --dir <path-to>/model_ready \
+#       --tokenizer artifacts/tokenizer/darija32k.gtok --expect-vocab 32000 \
+#       --out artifacts/shards_darija_sft --domain darija_real --seq-len 1024
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+
+tokenizer:
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: sft
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 16384
+  loss_scale_window: 2000
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 32
+  max_steps: 0
+  epochs: 3
+  learning_rate: 1.2e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 200
+  optimizer: adamw
+  scheduler: cosine
+  sched_decay_frac: 0.25
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 100
+  eval_batches: 15
+  save_every: 500
+  data_dir: artifacts/shards_darija_sft
+  checkpoint_dir: artifacts/checkpoints/darija_flash_sft
+  resume: auto
+  pretrained_checkpoint: artifacts/checkpoints/darija_flash/last.ckpt
+  allow_no_pretrained: false
+  freeze_embeddings: false
+  activation_checkpointing: true
+  ckpt_segments: 2
+
+data:
+  data_dir: artifacts/shards_darija_sft
+  train_prefix: train_
+  val_prefix: val_
+  # MUST equal the --domain values materialized above (preflight fails otherwise).
+  mix:
+    darija_chat: 0.55
+    darija_real: 0.45

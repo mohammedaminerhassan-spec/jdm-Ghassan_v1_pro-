@@ -8,7 +8,7 @@
 # Usage:
 #   bash kaggle/train_full.sh                                   # 6h budget (default)
 #   bash kaggle/train_full.sh --time-budget-min 420             # custom budget
-#   bash kaggle/train_full.sh --export-profile q4_k             # default fp16
+#   bash kaggle/train_full.sh --export-profile q4_0             # default fp16
 #   bash kaggle/train_full.sh --no-export                       # skip GGUF export
 #   bash kaggle/train_full.sh --pilot-only                      # measure speed only
 # ----------------------------------------------------------------
@@ -77,12 +77,11 @@ else
     echo "[prec] CC ${CC_MAJOR:-?}.x -> fp16 tensor GEMMs"
 fi
 
-# TEMPORARY STABILITY OVERRIDE (NaN incident): the fp16 GEMM path was never
-# validated (parity test disables it) and NaNs the loss immediately.
-# Force fp32 GEMMs for pilot + both stages until kernels are audited.
-# To re-enable fp16 later, delete the two lines below.
-FP16_OVERRIDE+=(--gemm-fp16 0)
-echo "[prec] fp16 GEMMs DISABLED by stability override (fp32 everywhere)"
+# (Old fp32 override REMOVED 2026-09-16: it forced 3-5x-slower pure-fp32 SGEMM
+# on pilot + both stages, so the pilot measured the WRONG recipe. The fp16
+# path is validated by the setup.sh CUDA parity gate + loss-scaler machinery;
+# pilot and stages now run the yaml recipe. Pre-Volta GPUs still fall back
+# to fp32 via the CC<7 check above.)
 
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
@@ -92,8 +91,10 @@ mkdir -p "${CKPT_PT}" "${REPO_DIR}/artifacts/checkpoints/flash_sft"
 echo ""
 echo "[pilot] Measuring real speed (${PILOT_STEPS} steps on pretrain shards)..."
 P_START=$(date +%s)
+# --resume none: a stale pilot checkpoint would make this do ~zero work
+# and corrupt the session budget with an absurd tok/s (see train_1b.sh).
 "${BINARY}" --config "${CONFIG_PILOT}" --device cuda --tokenizer "${TOK}" \
-    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" "${FP16_OVERRIDE[@]}"
+    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none "${FP16_OVERRIDE[@]}"
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START ))
 [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
@@ -153,16 +154,21 @@ fi
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 
 # ---------------------------------------------------------------- smoke test (Darija!)
+# SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
+# must carry its own tokenizer) and no swallowed failure — a broken export
+# must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
-    echo "[smoke] Darija generation test..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" --tokenizer "${TOK}" \
+    echo "[smoke] Darija generation test (no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
         --prompt "labas, kidayer? chno smitk?" --max-tokens 40 || \
-        echo "[smoke] WARNING: smoke test failed (model file may still be usable)"
+        { echo "[smoke] FAIL: self-contained GGUF generation failed"; exit 1; }
     echo ""
-    echo "[smoke] Second prompt (Arabic script)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" --tokenizer "${TOK}" \
-        --prompt "شنو هي العاصمة ديال المغرب؟" --max-tokens 60 || true
+    echo "[smoke] Second prompt (Arabic script, no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
+        --prompt "شنو هي العاصمة ديال المغرب؟" --max-tokens 60 || \
+        { echo "[smoke] FAIL: self-contained GGUF generation failed (arabic)"; exit 1; }
+    echo "[smoke] OK: GGUF runs standalone, no sidecar needed"
 fi
 
 echo ""

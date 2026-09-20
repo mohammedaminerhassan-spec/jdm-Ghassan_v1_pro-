@@ -1,6 +1,8 @@
 # Ghassan v1 Flash - 4x T4 Training Config (FP16 tensor cores + DDP)
 # T4 = Turing sm_75: FP16 tensor cores YES, BF16 tensor cores NO.
 # So: fp32 masters + gemm_fp16=true + loss scaling (NOT bf16).
+# NOTE: اسم الملف يحمل bf16 تاريخيا لكن المحتوى fp32+gemm_fp16 وهو الصحيح
+# لـT4 (لا تعيد تسميته: سكربتات Kaggle تشير إليه بهذا الاسم).
 # Effective batch: 4 GPUs * 2 batch * 1024 seq * 16 accum = 131072 tokens/step
 
 model:

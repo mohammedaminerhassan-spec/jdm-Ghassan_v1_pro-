@@ -63,12 +63,14 @@ struct QualityConfig {
     double max_symbol_ratio    = 0.25;   // punctuation+symbols / chars
     double max_digit_ratio     = 0.30;
     double max_upper_ratio     = 0.40;
-    double max_repeat_line     = 0.30;   // fraction of duplicated lines within a doc
-    double max_word_repeat     = 0.25;   // most common word / total words
+    double max_repeat_line     = 0.15;   // fraction of duplicated lines within a doc (stricter)
+    double max_word_repeat     = 0.15;   // most common word / total words (stricter)
     double min_letter_ratio    = 0.45;
     int    min_words           = 2;
     int    max_word_length     = 60;
     bool   require_arabic_or_latin = true;
+    bool   reject_ai_disclaimers   = true; // prevent model from acting like AI assistant
+    bool   reject_placeholders     = true; // prevent unresolved templates/placeholders
 };
 
 struct QualityVerdict {

@@ -12,7 +12,8 @@ namespace gai {
 
 // ================================================================ writer
 ShardWriter::ShardWriter(const std::string& path, int vocab_size, bool with_loss_mask)
-    : path_(path), u16_mode_(vocab_size <= 65535), with_mask_(with_loss_mask) {}
+    : path_(path), u16_mode_(vocab_size <= 65535), with_mask_(with_loss_mask),
+      vocab_size_(vocab_size) {}
 
 ShardWriter::~ShardWriter() {
     if (!closed_) {
@@ -24,6 +25,12 @@ void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector
     if (tokens.empty()) return;
     doc_offsets_.push_back(static_cast<u64>(tokens_.size()));
     for (size_t i = 0; i < tokens.size(); ++i) {
+        // Fail-loud token range: an id outside the writing vocabulary (or a
+        // negative id, e.g. an unmasked -100) must never enter a shard — on
+        // load it would read OOB embeddings or silently truncate u16 casts.
+        GAI_CHECK(tokens[i] >= 0 && tokens[i] < vocab_size_,
+                  strfmt("token id %d out of writing-vocab range [0,%d)",
+                         tokens[i], vocab_size_));
         tokens_.push_back(static_cast<u32>(tokens[i]));
         if (with_mask_) mask_.push_back(mask ? (*mask)[i] : 1);
     }
@@ -71,6 +78,31 @@ bool Shard::load(const std::string& path) {
     ShardHeader h{};
     if (!f.read(reinterpret_cast<char*>(&h), sizeof(h))) return false;
     if (h.magic != GBIN_MAGIC || h.version != GBIN_VERSION) return false;
+    // FIX: corrupt/truncated .gbin with garbage dtype or huge n_tokens/n_docs
+    // caused unbounded resize -> bad_alloc/OOM + garbage offsets -> later OOB
+    // (CPU/Kaggle crash). Validate BEFORE allocating + cross-check file size.
+    if (h.dtype > 1) return false;
+    {
+        std::error_code ec;
+        const auto fsize = fs::file_size(path, ec);
+        if (!ec) {
+            const uint64_t tok_bytes = h.n_tokens * (h.dtype == 0 ? 2ull : 4ull);
+            const uint64_t need_min = sizeof(ShardHeader) + tok_bytes
+                + h.n_docs * 8ull;
+            // allow trailing mask byte per token, but never accept a header
+            // claiming MORE bytes than the file actually holds.
+            if (need_min > static_cast<uint64_t>(fsize)) return false;
+            // hard cap: single shard > 8GiB tokens is corrupt for this project.
+            if (h.n_tokens > (8ull << 30) / 2 || h.n_docs > (1ull << 30)) return false;
+            // RAM guard for FULL load (3GB+ corpora): a 50M-token shard is
+            // ~100-200MB RAM (safe). Anything above 128M tokens (~512MB u32)
+            // must use the streaming header-only path, never full RAM load,
+            // or Kaggle 30GB RAM + model weights OOM mid-run.
+            if (h.n_tokens > (128ull << 20)) return false;
+        } else if (h.n_tokens > (4ull << 30) || h.n_docs > (1ull << 30)) {
+            return false;
+        }
+    }
 
     tokens_.resize(static_cast<size_t>(h.n_tokens));
     if (h.dtype == 0) {
@@ -105,6 +137,9 @@ bool Shard::load_header(const std::string& path) {
     if (!f.read(reinterpret_cast<char*>(&h), sizeof(h))) return false;
     if (h.magic != GBIN_MAGIC || h.version != GBIN_VERSION) return false;
     if (h.n_tokens == 0) return false;
+    // Same corruption guard as load(): reject bad dtype / impossible sizes.
+    if (h.dtype > 1) return false;
+    if (h.n_tokens > (8ull << 30) / 2 || h.n_docs > (1ull << 30)) return false;
 
     // Seek to the doc table: header + token stream.
     size_t tok_bytes = static_cast<size_t>(h.n_tokens) * (h.dtype == 0 ? sizeof(u16) : sizeof(u32));
@@ -152,6 +187,12 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
     else mask_out.clear();
     if (len == 0) return true;
 
+    // PRO-HARDEN: مسار RAM كان يقرأ tokens_[start+len] بلا فحص فينهار heap
+    // على offsets فاسدة؛ مسار streaming كان يرجع false فقط. نوحد الفشل السريع.
+    GAI_CHECK(start + len <= n_tokens(),
+              strfmt("Shard::read_window OOB (start=%llu len=%llu ntok=%llu)",
+                     (unsigned long long)start, (unsigned long long)len,
+                     (unsigned long long)n_tokens()));
     if (!streaming_) {
         // RAM path: memcpy from loaded vectors.
         for (u64 i = 0; i < len; ++i) {
@@ -169,10 +210,16 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
     f.seekg(static_cast<std::streamoff>(tok_off), std::ios::beg);
     if (!f.good()) return false;
     if (header_.dtype == 0) {
-        std::vector<u16> buf(static_cast<size_t>(len));
-        if (!f.read(reinterpret_cast<char*>(buf.data()),
-                    static_cast<std::streamsize>(buf.size() * sizeof(u16)))) return false;
-        for (size_t i = 0; i < buf.size(); ++i) tok_out[i] = buf[i];
+        // T4-P1-18: never malloc on the streaming hot path. Reuse a
+        // thread-local staging buffer (grows monotonically, like t_fd_cache
+        // above — reads already happen per-thread, so this is race-free).
+        thread_local std::vector<u16> t_u16_stage;
+        if (t_u16_stage.size() < static_cast<size_t>(len))
+            t_u16_stage.resize(static_cast<size_t>(len));
+        u16* buf = t_u16_stage.data();
+        if (!f.read(reinterpret_cast<char*>(buf),
+                    static_cast<std::streamsize>(static_cast<size_t>(len) * sizeof(u16)))) return false;
+        for (size_t i = 0; i < static_cast<size_t>(len); ++i) tok_out[i] = buf[i];
     } else {
         if (!f.read(reinterpret_cast<char*>(tok_out.data()),
                     static_cast<std::streamsize>(tok_out.size() * sizeof(u32)))) return false;
@@ -322,7 +369,7 @@ std::string DataLoader::mix_report() const {
     return s;
 }
 
-void DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
+bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
     const int T = spec_.seq_len;
     // DeepSeek-quality document isolation (FIX: no cross-doc leak):
     // Old packing stitched 2-3 docs into one row with no attention mask, so
@@ -333,6 +380,9 @@ void DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
     // P2 efficiency: to avoid large PAD tails when the first random start
     // lands near a doc end, try up to 4 candidates and keep the longest fit
     // (still ONE doc per row, no packing, positions always 0..T-1 correct).
+    // P2-21 honesty note: best-of-4 is NOT uniform sampling — longer
+    // documents/regions win more often than short trailing regions. Kept
+    // deliberately as a padding-efficiency policy, not a neutral sampler.
     // Full segment-masked packing (multiple docs/row with block-causal mask)
     // is the future P2-03 upgrade; this retry already cuts PAD waste ~3x.
     u64 best_start = 0, best_end = 0, best_avail = 0;
@@ -354,18 +404,17 @@ void DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
             if (best_avail >= static_cast<u64>(T) + 1) break; // full window found
         }
     }
-    if (best_avail == 0 || best_start >= sh.n_tokens()) return; // row stays PAD/-100
+    if (best_avail == 0 || best_start >= sh.n_tokens()) return true; // row stays PAD/-100
     u64 start = best_start, doc_end_idx = best_end, avail = best_avail;
     // Need avail tokens for ids + 1 lookahead for the last target.
+    // FIX (T4/GPU-starvation): old code allocated 2 vectors per row per batch
+    // (B*T rows per step). Reuse monotonic thread-local staging instead.
     u64 want = std::min<u64>(avail, static_cast<u64>(T) + 1);
     if (start + want > sh.n_tokens()) want = sh.n_tokens() - start;
-    if (want == 0) return;
-    std::vector<u32> toks;
-    std::vector<u8> masks;
-    if (!sh.read_window(start, want, toks, masks)) {
-        log_warn("dataloader: read_window failed at " + sh.path());
-        return;
-    }
+    if (want == 0) return true;
+    thread_local std::vector<u32> toks;
+    thread_local std::vector<u8> masks;
+    if (!sh.read_window(start, want, toks, masks)) return false; // I/O failure: caller retries/fails
     // Emit at most T ids; toks[want-1] is lookahead-only for the last target.
     int filled = static_cast<int>(std::min<u64>(toks.size(), static_cast<u64>(T)));
     // If toks.size() == T+1 (full window + lookahead), filled == T, correct.
@@ -383,6 +432,7 @@ void DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
             }
         } // else targets stays -100 (doc end / no lookahead)
     }
+    return true;
 }
 
 bool DataLoader::next(Batch& out) {
@@ -397,39 +447,63 @@ bool DataLoader::next(Batch& out) {
     out.tokens_supervised = 0;
 
     for (int b = 0; b < B; ++b) {
-        const Shard* shp = nullptr;
-        if (use_mix_) {
-            // 1. pick a domain by its mix weight (one uniform draw)
-            double r = (double)rng_.uniform();
-            double acc = 0.0;
-            size_t gi = groups_.size() - 1;
-            for (size_t i = 0; i < groups_.size(); ++i) {
-                acc += groups_[i].weight;
-                if (r < acc) { gi = i; break; }
+        // P1-20: a failed window read must never become a silent padded row
+        // (it would shrink the supervised-token budget invisibly). Retry the
+        // row on another shard/window; a persistently failing shard means a
+        // corrupt disk/image, so fail the run loudly instead of training on.
+        bool row_ok = false;
+        std::string last_path;
+        for (int attempt = 0; attempt < 8 && !row_ok; ++attempt) {
+            const Shard* shp = nullptr;
+            if (use_mix_) {
+                // 1. pick a domain by its mix weight (one uniform draw)
+                double r = (double)rng_.uniform();
+                double acc = 0.0;
+                size_t gi = groups_.size() - 1;
+                for (size_t i = 0; i < groups_.size(); ++i) {
+                    acc += groups_[i].weight;
+                    if (r < acc) { gi = i; break; }
+                }
+                // 2. pick a shard inside the domain proportionally to its size
+                const DomainGroup& g = groups_[gi];
+                u64 pick = rng_.below(g.total_tokens);
+                size_t si = 0;
+                for (; si + 1 < g.shards.size(); ++si) {
+                    if (pick < g.shards[si].n_tokens()) break;
+                    pick -= g.shards[si].n_tokens();
+                }
+                shp = &g.shards[si];
+            } else {
+                // legacy: sample a shard proportionally to its size
+                u64 pick = rng_.below(total_tokens_);
+                size_t si = 0;
+                for (; si + 1 < shards_.size(); ++si) {
+                    if (pick < shards_[si].n_tokens()) break;
+                    pick -= shards_[si].n_tokens();
+                }
+                shp = &shards_[si];
             }
-            // 2. pick a shard inside the domain proportionally to its size
-            const DomainGroup& g = groups_[gi];
-            u64 pick = rng_.below(g.total_tokens);
-            size_t si = 0;
-            for (; si + 1 < g.shards.size(); ++si) {
-                if (pick < g.shards[si].n_tokens()) break;
-                pick -= g.shards[si].n_tokens();
-            }
-            shp = &g.shards[si];
-        } else {
-            // legacy: sample a shard proportionally to its size
-            u64 pick = rng_.below(total_tokens_);
-            size_t si = 0;
-            for (; si + 1 < shards_.size(); ++si) {
-                if (pick < shards_[si].n_tokens()) break;
-                pick -= shards_[si].n_tokens();
-            }
-            shp = &shards_[si];
+            last_path = shp->path();
+            row_ok = fill_from_shard(*shp, out, b);
         }
-        fill_from_shard(*shp, out, b);
+        if (!row_ok)
+            GAI_FAIL("dataloader: shard read failed 8x in a row at " + last_path +
+                     " (corrupt shard or dying disk — refusing silent padded training)");
     }
     ++batches_;
     return true;
+}
+
+void DataLoader::skip_batches(i64 n) {
+    Batch discard;
+    for (i64 i = 0; i < n; ++i) {
+        if (!next(discard)) break;
+    }
+}
+
+void DataLoader::reseed(u64 seed) {
+    rng_.seed_with(seed);
+    batches_ = 0;
 }
 
 DataLoader::State DataLoader::get_state() const {

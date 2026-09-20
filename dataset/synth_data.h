@@ -31,6 +31,13 @@ const std::vector<const char*>& backchannels_user();  // "واخا", "فهمت",
 const std::vector<Exchange>&    corrections();        // user corrects the assistant
 const std::vector<Exchange>&    misunderstandings();
 const std::vector<Exchange>&    identity_questions(); // who are you / are you human
+// Governor ("controller") exchanges: teach short-vs-detailed answers,
+// honest "ma3reftch", staying grounded, refusing toxicity. This is the data
+// that governs all other domains at SFT time.
+const std::vector<Exchange>&    governor_exchanges();
+// Step-by-step reasoning in Darija (math / science / logic chains kept short
+// and colloquial so the model learns to think before answering).
+const std::vector<Exchange>&    reasoning_exchanges();
 const std::vector<Exchange>&    msa_exchanges();
 const std::vector<std::pair<const char*, const char*>>& french_terms();  // darija -> french word
 const std::vector<const char*>& system_prompts();

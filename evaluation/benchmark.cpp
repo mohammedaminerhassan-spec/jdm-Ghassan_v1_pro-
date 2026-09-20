@@ -7,11 +7,13 @@
 #include "tokenizer/tokenizer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <numeric>
 #include <filesystem>
 
@@ -477,13 +479,16 @@ std::vector<EvalItem> Benchmark::load_suite(const std::string& dir) {
     std::vector<EvalItem> items;
     std::vector<std::string> jsonl_files;
 
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") {
+    // FIX: directory_iterator(dir) THROWS on missing dir, defeating the
+    // builtin_suite fallback below (--suite <missing> crash). Use error_code.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && !ec && entry.path().extension() == ".jsonl") {
             jsonl_files.push_back(entry.path().string());
         }
     }
-
-    if (jsonl_files.empty()) {
+    if (ec || jsonl_files.empty()) {
         return builtin_suite();
     }
 
@@ -516,16 +521,50 @@ std::vector<EvalItem> Benchmark::load_suite(const std::string& dir) {
     return items;
 }
 
+static std::string json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\r': o += "\\r"; break;
+            case '\t': o += "\\t"; break;
+            default:
+                if (c < 0x20) { char b[7]; std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+                else o.push_back(static_cast<char>(c));
+        }
+    }
+    return o;
+}
+
 void Benchmark::write_suite(const std::string& path, const std::vector<EvalItem>& items) {
     std::ofstream f(path);
     if (!f.good()) {
         log_warn("benchmark: cannot write suite to " + path);
         return;
     }
+    // DeepSeek eval rule: suite round-trip must be lossless. Old code dropped
+    // expect_any/forbid/lang/max_words/context so a re-exported suite scored
+    // weaker silently. Persist the full EvalItem.
     for (auto& it : items) {
-        f << "{\"id\":\"" << it.id << "\","
+        f << "{\"id\":\"" << json_escape(it.id) << "\","
           << "\"category\":\"" << category_name(it.category) << "\","
-          << "\"prompt\":\"" << it.prompt << "\"}\n";
+          << "\"prompt\":\"" << json_escape(it.prompt) << "\","
+          << "\"expect_lang\":\"" << json_escape(it.expect_lang) << "\","
+          << "\"max_words\":" << it.max_words << ","
+          << "\"expect_any\":[";
+        for (size_t i = 0; i < it.expect_any.size(); ++i) {
+            if (i) f << ",";
+            f << "\"" << json_escape(it.expect_any[i]) << "\"";
+        }
+        f << "],\"forbid\":[";
+        for (size_t i = 0; i < it.forbid.size(); ++i) {
+            if (i) f << ",";
+            f << "\"" << json_escape(it.forbid[i]) << "\"";
+        }
+        f << "]}\n";
     }
 }
 
@@ -550,16 +589,28 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
     std::string w;
     while (ss >> w) r.words++;
 
+    // DeepSeek eval rule: fuzzy/forbidden match case-insensitively (Darija
+    // Arabizi varies in case; old case-sensitive find under-scored valid
+    // answers). Lowercase once and match on that.
+    std::string resp_low = response;
+    std::transform(resp_low.begin(), resp_low.end(), resp_low.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     // Fuzzy match
     r.matched = item.expect_any.empty();
     for (auto& exp : item.expect_any) {
-        if (response.find(exp) != std::string::npos) { r.matched = true; break; }
+        std::string e = exp;
+        std::transform(e.begin(), e.end(), e.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (resp_low.find(e) != std::string::npos) { r.matched = true; break; }
     }
 
     // Forbidden check
     r.forbidden_hit = false;
     for (auto& fb : item.forbid) {
-        if (response.find(fb) != std::string::npos) { r.forbidden_hit = true; break; }
+        std::string b = fb;
+        std::transform(b.begin(), b.end(), b.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (resp_low.find(b) != std::string::npos) { r.forbidden_hit = true; break; }
     }
 
     // Length check
@@ -573,8 +624,22 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
     r.distinct2 = distinct_n(response, 2);
     r.max_ngram_repeat = max_ngram_repeat(response, 3);
 
-    // Language check
+    // Language check: old code computed darija_ratio but left lang_ok=true
+    // always, so expect_lang never failed. Classify and enforce it.
     r.darija_ratio = darija_marker_ratio(response, lid_);
+    r.lang_ok = true;
+    if (!item.expect_lang.empty()) {
+        LangScore ls = lid_.classify(response);
+        const char* got = lang_name(ls.tag);
+        // Accept Mixed as pass when either side is Darija/MSA (code-switching
+        // is expected in Darija eval); otherwise require exact tag match.
+        if (std::string(got) == item.expect_lang) r.lang_ok = true;
+        else if (ls.tag == LangTag::Mixed &&
+                 (item.expect_lang == "ar-MA-arab" || item.expect_lang == "ar-MA-latn" ||
+                  item.expect_lang == "ar-MSA"))
+            r.lang_ok = true;
+        else r.lang_ok = false;
+    }
 
     // Toxicity (delegate to the dataset cleaner's toxicity checker)
     {

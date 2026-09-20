@@ -61,6 +61,32 @@ void Tokenizer::finalize_index() {
     for (size_t i = 0; i < vocab_.size(); ++i) token_ids_[vocab_[i]] = static_cast<i32>(i);
 }
 
+std::vector<std::pair<std::string, std::string>> Tokenizer::merge_pairs_ordered() const {
+    // Invert merges_ (keyed by (left<<32|right) -> (rank, merged)) into a
+    // rank-ordered list of string pairs. Ranks may have gaps (build() skips
+    // pairs whose strings are missing from vocab), so size by max rank.
+    i32 max_rank = -1;
+    for (const auto& [key, val] : merges_) {
+        if (val.first > max_rank) max_rank = val.first;
+    }
+    std::vector<std::pair<std::string, std::string>> out;
+    if (max_rank < 0) return out;
+    std::vector<char> seen(static_cast<size_t>(max_rank) + 1, 0);
+    std::vector<std::pair<std::string, std::string>> by_rank(static_cast<size_t>(max_rank) + 1);
+    for (const auto& [key, val] : merges_) {
+        u32 l = static_cast<u32>(key >> 32);
+        u32 r = static_cast<u32>(key & 0xFFFFFFFFu);
+        if (l >= vocab_.size() || r >= vocab_.size()) continue;
+        by_rank[static_cast<size_t>(val.first)] = {vocab_[l], vocab_[r]};
+        seen[static_cast<size_t>(val.first)] = 1;
+    }
+    out.reserve(merges_.size());
+    for (size_t i = 0; i < by_rank.size(); ++i) {
+        if (seen[i]) out.push_back(std::move(by_rank[i]));
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- BPE core
 namespace {
 struct Node {
@@ -226,8 +252,20 @@ std::string Tokenizer::Stream::push(i32 id) {
     size_t safe = 0, i = 0;
     while (i < buf_.size()) {
         int len = utf8_seq_len(static_cast<u8>(buf_[i]));
-        if (len == 0) { ++i; safe = i; continue; }
+        // FIX: lone continuation (len==0) is NOT complete — old code emitted
+        // it immediately, splitting codepoints (inference mojibake on split
+        // boundaries). Buffer it until the head byte arrives.
+        if (len == 0) break;
         if (i + static_cast<size_t>(len) > buf_.size()) break;
+        // Validate continuations: E2 28 A1 must not count as complete.
+        bool ok = true;
+        for (int k = 1; k < len; ++k) {
+            if ((static_cast<u8>(buf_[i + static_cast<size_t>(k)]) & 0xC0) != 0x80) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) { ++i; safe = i; continue; }
         i += static_cast<size_t>(len);
         safe = i;
     }
@@ -237,7 +275,12 @@ std::string Tokenizer::Stream::push(i32 id) {
 }
 
 std::string Tokenizer::Stream::flush() {
-    std::string s = buf_;
+    // FIX: never emit raw incomplete tail (old code returned partial bytes).
+    // Complete tail passes through; truncated tail becomes U+FFFD.
+    if (buf_.empty()) return {};
+    std::string s;
+    if (utf8_is_complete(buf_)) s = buf_;
+    else s = "\xEF\xBF\xBD";
     buf_.clear();
     return s;
 }
@@ -303,6 +346,14 @@ bool Tokenizer::load(const std::string& path) {
         std::string t(len, '\0');
         if (len && !f.read(t.data(), static_cast<std::streamsize>(len))) return false;
         vocab_.push_back(std::move(t));
+    }
+    // FIX: bpe_chunk assumes byte fallback vocab[16+i] == single byte i
+    // (id = 16+byte). A custom/truncated/reordered .gtok silently produced
+    // wrong ids + token_text "" -> data loss. Enforce the invariant on load.
+    if (vocab_.size() < static_cast<size_t>(special::COUNT) + 256) return false;
+    for (int b = 0; b < 256; ++b) {
+        const std::string& t = vocab_[static_cast<size_t>(special::COUNT) + b];
+        if (t.size() != 1 || static_cast<u8>(t[0]) != static_cast<u8>(b)) return false;
     }
     finalize_index();
 

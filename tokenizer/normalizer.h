@@ -16,7 +16,11 @@ struct NormalizerConfig {
     bool collapse_whitespace = true;
     bool strip_control       = true;
     bool strip_zero_width    = true;   // keeps ZWNJ inside Arabic words
-    bool collapse_repeats    = true;   // "سلاااااام" -> "سلااام" (max 3)
+    // P1-11 FIX: Set to false so training/inference text preserves natural
+    // character repetition (e.g. Darija هههههه, code ======, Arabizi laughter).
+    // True was collapsing useful linguistic signals in the LM training data.
+    // Normalizer::canonical() (used for dedup hashing) stays aggressive.
+    bool collapse_repeats    = false;  // was true; false preserves repetitions
     bool fold_fullwidth      = true;
     int  max_repeat          = 3;
 

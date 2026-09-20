@@ -319,4 +319,22 @@ StyleFlags check_assistant_style(const std::string& reply, const std::string& us
     return f;
 }
 
+// PRO-EN: hard disclosure phrases only (see langid.h). Case-insensitive,
+// normalized like check_assistant_style so "As an AI" matches "as an ai".
+bool has_hard_ai_boilerplate(const std::string& reply) {
+    static const char* kHard[] = {
+        "as an ai", "as a language model", "as an ai language model",
+        "en tant qu'assistant", "je suis une ia",
+        "كنموذج لغوي", "بصفتي مساعدا",
+    };
+    NormalizerConfig nc;
+    nc.fold_letters = true;
+    std::string norm = Normalizer(nc).normalize(reply);
+    for (const char* p : kHard) {
+        std::string pn = Normalizer(nc).normalize(p);
+        if (contains_ci(norm, pn)) return true;
+    }
+    return false;
+}
+
 } // namespace gai

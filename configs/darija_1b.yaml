@@ -1,0 +1,101 @@
+# Ghassan Darija 1B — PRETRAIN recipe for the <=8h Kaggle T4 run.
+# Same architecture as configs/ultra_1b.yaml (math verified there):
+#   ~1.016B total (32k vocab, tied) / ~336M ACTIVE per token
+#   36 layers, 12 heads, 4 KV heads (GQA), 10 experts top-2 + shared, QK-Norm.
+# T4 NOTE: 1B fp32 = 4.06GB weights + 4.06GB grads + Lion 4.06GB = ~12.2GB,
+# so optimizer MUST stay lion, batch_size=1, seq_len=512, grad_accum=128
+# (65,536 tokens/step). 32k tokenizer is MANDATORY (never legacy 16k:
+# Arabizi/Arabic fertility collapses on 16k and the model speaks brokenly).
+#
+# Build the shards on Kaggle FIRST (repo root):
+#   data_pipeline synth --out artifacts/synth/darija_pt.jsonl --n 700000 \
+#       --seed 1234 --max-template-uses 500
+#   data_pipeline build --tokenizer artifacts/tokenizer/darija32k.gtok \
+#       --expect-vocab 32000 --out artifacts/shards_darija1b \
+#       --chat artifacts/synth/darija_pt.jsonl --domain darija_conversational \
+#       --shard-tokens 50000000 --seq-len 512
+#   data_pipeline csvs --dir dataset/dataset-main --out artifacts/corpus_darija.txt
+#   data_pipeline build --tokenizer artifacts/tokenizer/darija32k.gtok \
+#       --expect-vocab 32000 --out artifacts/shards_darija1b \
+#       --text artifacts/corpus_darija.txt --domain darija_vocab \
+#       --shard-tokens 50000000 --seq-len 512
+#   data_pipeline json --dir <path-to>/model_speak \
+#       --tokenizer artifacts/tokenizer/darija32k.gtok --expect-vocab 32000 \
+#       --out artifacts/shards_darija1b --domain darija_speak --seq-len 512
+# Run (timeboxed by pilot-measured tok/s, NOT by epochs):
+#   CONFIG_PT=configs/darija_1b.yaml CONFIG_SFT=configs/sft_darija_1b.yaml \
+#   PT_DIR=artifacts/shards_darija1b SFT_DIR=artifacts/shards_darija1b_sft \
+#   CKPT_PT=artifacts/checkpoints/darija_1b CKPT_SFT=artifacts/checkpoints/darija_1b_sft \
+#   GGUF_OUT=artifacts/ghassan-darija-1b_q4_0.gguf \
+#   bash kaggle/train_1b.sh --time-budget-min 420 --export-profile q4_0 --pt-fraction 70
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 36
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 10
+  moe_top_k: 2
+  moe_expert_dim: 1024
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+
+tokenizer:
+  path: artifacts/tokenizer/darija32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 16384
+  loss_scale_window: 2000
+  batch_size: 1
+  seq_len: 512
+  grad_accum: 128           # effective 1*512*128 = 65,536 tokens/step
+  max_steps: 0              # 0 = epochs mode; runner passes --max-steps (timeboxed)
+  epochs: 2
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 1500
+  optimizer: lion           # MANDATORY for 1B on T4 (AdamW OOMs)
+  scheduler: wsd            # Warmup-Stable-Decay: extendable across sessions
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 250
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/darija_1b
+  data_dir: artifacts/shards_darija1b
+  resume: auto
+  activation_checkpointing: false
+  ckpt_segments: 1
+
+data:
+  train_glob: artifacts/shards_darija1b/train_*.gbin
+  val_glob: artifacts/shards_darija1b/val_*.gbin
+  # MUST equal the --domain values materialized above (preflight fails otherwise).
+  mix:
+    darija_conversational: 0.55
+    darija_vocab: 0.30
+    darija_speak: 0.15

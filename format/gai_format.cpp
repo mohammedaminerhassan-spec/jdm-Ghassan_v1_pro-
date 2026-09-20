@@ -49,9 +49,24 @@ void GaiWriter::set_config(const ModelConfig& c) {
     set_meta("moe_top_k", std::to_string(c.moe_top_k));
     set_meta("moe_expert_dim", std::to_string(c.moe_expert_dim));
     set_meta("moe_shared", c.moe_shared ? "1" : "0");
+    // DeepSeek compat rule: every knob that changes numerics must round-trip.
+    // rope_scale/qk_norm/z_loss previously dropped -> silent wrong RoPE/attn
+    // on reload. Persist all of them (old files without them load as off/0).
+    set_meta("moe_aux_scale", strfmt("%.6f", (double)c.moe_aux_scale));
+    set_meta("moe_jitter", strfmt("%.6f", (double)c.moe_jitter));
     set_meta("max_seq_len", std::to_string(c.max_seq_len));
     set_meta("rope_theta", strfmt("%.6f", c.rope_theta));
+    set_meta("rope_scale", strfmt("%.6f", (double)c.rope_scale));
+    set_meta("rope_yarn_mscale", strfmt("%.6f", (double)c.rope_yarn_mscale));
+    // PRO round-trip (old files without them load as defaults).
+    set_meta("rope_yarn_low", strfmt("%.6f", (double)c.rope_yarn_low));
+    set_meta("rope_yarn_high", strfmt("%.6f", (double)c.rope_yarn_high));
+    set_meta("sliding_window", std::to_string(c.sliding_window));
+    set_meta("rope_type", std::to_string(c.rope_type));
+    set_meta("moe_aux_free", c.moe_aux_free ? "1" : "0");
     set_meta("rms_eps", strfmt("%.9f", c.rms_eps));
+    set_meta("use_qk_norm", c.use_qk_norm ? "1" : "0");
+    set_meta("z_loss_scale", strfmt("%.9f", (double)c.z_loss_scale));
     set_meta("tie_embeddings", c.tie_embeddings ? "1" : "0");
     set_meta("norm_type", "rmsnorm");
     set_meta("ffn_type", c.use_moe ? "swiglu_moe" : "swiglu");
@@ -228,9 +243,20 @@ ModelConfig GaiReader::model_config() const {
     c.moe_top_k         = static_cast<int>(meta_int("moe_top_k", c.moe_top_k));
     c.moe_expert_dim    = static_cast<int>(meta_int("moe_expert_dim", c.moe_expert_dim));
     c.moe_shared        = meta_int("moe_shared", c.moe_shared ? 1 : 0) != 0;
+    c.moe_aux_scale     = meta_f32("moe_aux_scale", c.moe_aux_scale);
+    c.moe_jitter        = meta_f32("moe_jitter", c.moe_jitter);
     c.max_seq_len       = static_cast<int>(meta_int("max_seq_len", c.max_seq_len));
     c.rope_theta        = meta_f32("rope_theta", c.rope_theta);
+    c.rope_scale        = meta_f32("rope_scale", c.rope_scale);
+    c.rope_yarn_mscale  = meta_f32("rope_yarn_mscale", c.rope_yarn_mscale);
+    c.rope_yarn_low     = meta_f32("rope_yarn_low", c.rope_yarn_low);
+    c.rope_yarn_high    = meta_f32("rope_yarn_high", c.rope_yarn_high);
+    c.sliding_window    = static_cast<int>(meta_int("sliding_window", c.sliding_window));
+    c.rope_type         = static_cast<int>(meta_int("rope_type", c.rope_type));
+    c.moe_aux_free      = meta_int("moe_aux_free", c.moe_aux_free ? 1 : 0) != 0;
     c.rms_eps           = meta_f32("rms_eps", c.rms_eps);
+    c.use_qk_norm       = meta_int("use_qk_norm", c.use_qk_norm ? 1 : 0) != 0;
+    c.z_loss_scale      = meta_f32("z_loss_scale", c.z_loss_scale);
     c.tie_embeddings    = meta_int("tie_embeddings", 1) != 0;
     c.validate();
     return c;
@@ -277,6 +303,35 @@ Tensor GaiReader::read_tensor_f32(const std::string& name) const {
     return quant::dequantize(raw, DType::F32);
 }
 
+bool GaiReader::map_weights() {
+    if (path_.empty()) return false;
+    auto m = std::make_shared<MappedFile>();
+    if (!m->open(path_)) return false;
+    // The directory was parsed from this same file; the mapping must cover it.
+    if (m->size() != file_size_ && file_size_ != 0) return false;
+    mapping_ = std::move(m);
+    return true;
+}
+
+Tensor GaiReader::read_tensor_wrapped(const std::string& name) const {
+    GAI_CHECK(weights_mapped(), "read_tensor_wrapped needs map_weights() first");
+    const TensorEntry* e = find(name);
+    GAI_CHECK(e != nullptr, "tensor not found in model file: " + name);
+    // Bounds-check BEFORE forming the view: a corrupt offset must fail fast
+    // here, never become an out-of-bounds pointer (segfault on first touch).
+    const u64 msize = mapping_->size();
+    GAI_CHECK(e->offset <= msize && e->nbytes <= msize - e->offset,
+              "tensor region outside mapped file (corrupt directory): " + name);
+    const size_t expect = dtype_nbytes(e->dtype, static_cast<size_t>(numel_of(e->dims)));
+    GAI_CHECK(e->nbytes == expect, "tensor size mismatch for " + name);
+    const char* base = static_cast<const char*>(mapping_->data());
+    void* view = const_cast<char*>(base + static_cast<size_t>(e->offset));
+    Tensor t = Tensor::wrap_external(e->dims, e->dtype, view,
+                                     static_cast<size_t>(e->nbytes), mapping_);
+    t.set_name(name);
+    return t;
+}
+
 // ================================================================ model io
 bool load_model_from_gai(const std::string& path, Model& model) {
     GaiReader r;
@@ -299,6 +354,53 @@ bool load_model_from_gai(const std::string& path, Model& model) {
         }
         p->w.copy_from(t);
     }
+    return true;
+}
+
+bool load_model_from_gai_mmap(const std::string& path, Model& model,
+                              int* wrapped_out, int* converted_out) {
+    GaiReader r;
+    if (!r.open(path)) {
+        log_error("cannot open model file: " + path);
+        return false;
+    }
+    if (!r.map_weights()) {
+        log_error("cannot memory-map model file: " + path);
+        return false;
+    }
+    int wrapped = 0, converted = 0;
+    for (Parameter* p : model.parameters()) {
+        const TensorEntry* e = r.find(p->name);
+        if (!e) {
+            log_error("model file is missing tensor: " + p->name);
+            return false;
+        }
+        if (e->dtype == DType::F32 && e->dims == p->shape) {
+            // Zero-copy path: weight memory IS the mapped file (no heap).
+            // The mapping stays alive inside the tensor's storage owner.
+            Tensor t = r.read_tensor_wrapped(p->name);
+            t.set_name(p->name);
+            p->w = t;
+            ++wrapped;
+        } else {
+            // Quantized (or otherwise non-F32) entry: CPUs have no Q kernels
+            // yet (roadmap item 9), so convert once at load like the normal
+            // path. Still correct, just not zero-copy for this tensor.
+            Tensor t = r.read_tensor_f32(p->name);
+            if (t.numel() != p->numel()) {
+                log_error(strfmt("tensor %s size mismatch: file %lld vs model %lld",
+                                 p->name.c_str(), static_cast<long long>(t.numel()),
+                                 static_cast<long long>(p->numel())));
+                return false;
+            }
+            p->w.copy_from(t);
+            ++converted;
+        }
+    }
+    if (wrapped_out) *wrapped_out = wrapped;
+    if (converted_out) *converted_out = converted;
+    log_info(strfmt("[mmap] %d tensors zero-copy file-backed, %d converted (quantized)",
+                    wrapped, converted));
     return true;
 }
 

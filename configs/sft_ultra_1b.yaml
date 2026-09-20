@@ -35,7 +35,7 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true           # 10/10: fp16 ON (was false = 3x slower SFT)
-  loss_scale_init: 65536
+  loss_scale_init: 16384    # == trainer fp16-safe clamp: the value that actually runs
   loss_scale_window: 2000
   batch_size: 1
   seq_len: 512
@@ -74,9 +74,18 @@ data:
   data_dir: artifacts/shards_1b_sft
   train_prefix: train_
   val_prefix: val_
+  # ACTIVE MIX (must equal what kaggle/build_billion_data.sh materializes:
+  # SFT synth builds darija_chat AND your model_speak/ builds darija_speak,
+  # so the old 100%-chat collapse is fixed).
+  #   darija_chat:  synth instruction fluency (governor+reasoning in)
+  #   darija_speak: YOUR model_speak/ single-script answers (style contract,
+  #                 assistant-only loss — this is what makes speech natural)
+  #   darija_qa:    YOUR dataset/qa_darija/ (275k grounded Q&A over the CSV
+  #                 tables — this is what makes answers CORRECT, assistant-only
+  #                 loss; the highest-signal domain per token in this stage)
+  # Append "<name>: <weight>" with matching shards to widen (effective mix is
+  # printed at trainer startup — verify, don't assume).
   mix:
-    darija_reasoning: 0.35
-    darija_chat: 0.25
-    arabizi_chat: 0.20
-    culture_administration: 0.10
-    code_switch_chat: 0.10
+    darija_chat: 0.45
+    darija_speak: 0.30
+    darija_qa: 0.25

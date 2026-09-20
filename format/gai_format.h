@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/mmap.h"
 #include "model/model.h"
 #include "tokenizer/tokenizer.h"
 #include <map>
@@ -67,6 +68,15 @@ public:
     // Reads raw storage (keeps the on-disk dtype).
     Tensor read_tensor_raw(const std::string& name) const;
 
+    // Memory-mapped weight access (roadmap item 5, weak-PC inference).
+    // map_weights() maps path_ read-only; read_tensor_wrapped() then returns
+    // a zero-copy read-only view of the entry's file bytes (bounds-checked).
+    // Views hold shared ownership of the mapping, so they stay valid after
+    // this reader is destroyed. Requires open() first.
+    bool   map_weights();
+    bool   weights_mapped() const { return mapping_ && mapping_->valid(); }
+    Tensor read_tensor_wrapped(const std::string& name) const;
+
     const std::string& path() const { return path_; }
     u64 file_size() const { return file_size_; }
 
@@ -76,10 +86,20 @@ private:
     std::vector<TensorEntry> entries_;
     std::string tok_blob_;
     u64 file_size_ = 0;
+    MappedFilePtr mapping_;
 };
 
 // Loads .gai weights into an allocated Model (dequantizing as required).
 bool load_model_from_gai(const std::string& path, Model& model);
+
+// Loads .gai weights with mmap-backed zero-copy views wherever the on-disk
+// dtype is exactly F32 (no heap commit for those tensors). Other entries fall
+// back to converting reads (counted in converted_out). The model stays fully
+// usable for CPU inference; training on it is refused (read-only pages).
+// Returns false (no partial model) when any tensor is missing or mismatched.
+bool load_model_from_gai_mmap(const std::string& path, Model& model,
+                              int* wrapped_out = nullptr,
+                              int* converted_out = nullptr);
 
 // Exports a Model (+ tokenizer) with the given per-tensor quantization profile.
 struct ExportProfile {

@@ -1,4 +1,6 @@
-# Ghassan v1 T4-1B — flagship 1B MoE for 4x Tesla T4 (sm_75).
+# Ghassan v1 T4-1B — LEGACY 4xT4-DDP 1B MoE experiment (sm_75).
+# NOT the flagship: configs/ultra_1b.yaml is the single-T4 flagship recipe.
+# Keep this file for train_4xt4.sh (4-GPU DDP) runs only.
 # FIX 2026-09: moe_top_k 5->2. top-5/8 = 70% dense (715M active) defeats MoE
 # sparsity, doubles activation memory (N*K*E) and OOMs T4. top-2/8 is the
 # standard sparse regime (~408M active, 40%) and fits 16GB with Lion.
@@ -64,7 +66,7 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true            # T4 FP16 tensor cores, fp32 masters + loss scaling
-  loss_scale_init: 65536
+  loss_scale_init: 16384     # fp16-safe max (trainer clamps to this; |dlogits| peaks at scale)
   loss_scale_window: 2000
   batch_size: 1              # T4 16GB: B=1 only for the 1B model
   seq_len: 512              # 512 (not 1024): 1B only fits T4 with halved activations
@@ -92,7 +94,10 @@ training:
   resume: auto
   activation_checkpointing: false   # B==1: no effect, grad_accum does the work
   ckpt_segments: 1
-  ddp: true                  # 4x T4 data-parallel (NCCL)
+  ddp: true                  # 4x T4 data-parallel (NCCL) — لـtrain_4xt4.sh فقط.
+                             # على Kaggle أحادي-GPU سي trainer يرفض DDP بصوت عال؛
+                             # استعمل configs/ultra_1b.yaml (ddp غير مضبوط=off)
+                             # عبر kaggle/train_1b.sh للـsingle-T4 flagship.
 
 data:
   train_glob: artifacts/shards_1b/train_*.gbin

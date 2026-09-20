@@ -16,22 +16,42 @@ BINARY="${BUILD_DIR}/bin/data_pipeline"
 
 # ---- default paths (can be overridden via CLI args)
 JSON_DIR="${REPO_DIR}/Ai dariga datasets"
+# PRO-HARDEN: env override + /kaggle/input fallback (Kaggle datasets مربوطة).
+if [[ -n "${JSON_DIR_OVERRIDE:-}" ]]; then JSON_DIR="${JSON_DIR_OVERRIDE}"; fi
+if [[ ! -d "${JSON_DIR}" && -d "/kaggle/input" ]]; then
+    for d in /kaggle/input/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -n "$(find "$d" -maxdepth 3 \( -iname '*.json' -o -iname '*.jsonl' \) 2>/dev/null | head -n 1)" ]]; then
+            JSON_DIR="$d"
+            break
+        fi
+    done
+fi
 TOKENIZER="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
-if [[ ! -f "${TOKENIZER}" ]]; then TOKENIZER="${REPO_DIR}/artifacts/tokenizer/darija.gtok"; fi
+# PRO-HARDEN: لا fallback صامت إلى 16k (يضيع embeddings). فشل صريح.
+if [[ -n "${TOKENIZER_OVERRIDE:-}" ]]; then TOKENIZER="${TOKENIZER_OVERRIDE}"; fi
+if [[ ! -f "${TOKENIZER}" ]]; then
+    echo "[ERROR] 32k tokenizer missing: ${TOKENIZER} (16k fallback DISABLED)."
+    exit 1
+fi
 OUT_DIR="${REPO_DIR}/artifacts/shards"
 VAL_RATIO="0.005"
 SHARD_TOKENS="50000000"
 SEQ_LEN="4096"
+# All current model recipes are 32k vocab. A 16k legacy file must NEVER
+# silently encode shards (half the embedding rows would train on nothing).
+EXPECT_VOCAB="32000"
 
 # ---- parse CLI args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json-dir)      JSON_DIR="$2";    shift 2 ;;
-        --tokenizer)     TOKENIZER="$2";   shift 2 ;;
+        --tokenizer)     TOKENIZER="$2";    shift 2 ;;
         --out)           OUT_DIR="$2";     shift 2 ;;
         --val-ratio)     VAL_RATIO="$2";   shift 2 ;;
         --shard-tokens)  SHARD_TOKENS="$2"; shift 2 ;;
         --seq-len)       SEQ_LEN="$2";     shift 2 ;;
+        --expect-vocab)  EXPECT_VOCAB="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -55,12 +75,23 @@ if [[ ! -f "${BINARY}" ]]; then
     exit 1
 fi
 
-# ---- verify tokenizer
+# ---- verify tokenizer: the FILE's real vocab must match the recipe ----
 if [[ ! -f "${TOKENIZER}" ]]; then
     echo "[ERROR] Tokenizer not found: ${TOKENIZER}"
     echo "        The tokenizer must be trained first."
     echo "        Run: ${BUILD_DIR}/bin/train_tokenizer --help"
     exit 1
+fi
+if [[ "${EXPECT_VOCAB}" != "0" ]]; then
+    TOK_VOCAB=$("${BINARY}" tok-info --tokenizer "${TOKENIZER}" 2>/dev/null \
+        | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
+    if [[ "${TOK_VOCAB}" != "${EXPECT_VOCAB}" ]]; then
+        echo "[ERROR] tokenizer ${TOKENIZER} has vocab_size=${TOK_VOCAB:-unreadable}, need ${EXPECT_VOCAB}."
+        echo "[ERROR] A legacy 16k file here would silently waste half the embeddings."
+        echo "[ERROR] Run setup.sh (trains darija32k.gtok) or pass --expect-vocab 0 to override."
+        exit 1
+    fi
+    echo "[tok] ok: ${TOKENIZER} (vocab ${TOK_VOCAB})"
 fi
 
 # ---- verify json directory
@@ -76,7 +107,7 @@ if [[ "${JSON_COUNT}" -eq 0 && "${CSV_COUNT}" -gt 0 ]]; then
     echo "[data] Step 1/2: CSV tables -> corpus text..."
     "${BINARY}" csvs --dir "${JSON_DIR}" --out "${OUT_DIR}/../corpus/corpus_csv_full.txt" || exit 1
     echo "[data] Step 2/2: corpus text -> .gbin shards..."
-    "${BINARY}" build --tokenizer "${TOKENIZER}" \
+    "${BINARY}" build --tokenizer "${TOKENIZER}" --expect-vocab "${EXPECT_VOCAB}" \
         --text "${OUT_DIR}/../corpus/corpus_csv_full.txt" \
         --out "${OUT_DIR}" --val-ratio "${VAL_RATIO}" \
         --shard-tokens "${SHARD_TOKENS}" --seq-len 1024 || exit 1
@@ -120,7 +151,7 @@ START_TIME=$(date +%s)
 
 "${BINARY}" json \
     --dir "${JSON_DIR}" \
-    --tokenizer "${TOKENIZER}" \
+    --tokenizer "${TOKENIZER}" --expect-vocab "${EXPECT_VOCAB}" \
     --out "${OUT_DIR}" \
     --val-ratio "${VAL_RATIO}" \
     --shard-tokens "${SHARD_TOKENS}" \

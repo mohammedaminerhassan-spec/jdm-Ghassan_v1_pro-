@@ -148,6 +148,79 @@ void attention_forward(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
 }
 
+// SWA (Mistral-style sliding window): simple correct kernel for window>0.
+// window==0 delegates to the flash tiled path above (zero regression risk).
+__global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restrict__ k,
+                               const float* __restrict__ v, float* __restrict__ out,
+                               float* __restrict__ probs,
+                               int T, int H, int KV, int hd, float scale, int window) {
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    const int group = H / KV;
+    const int kvh = h / group;
+    const int lane = threadIdx.x;
+    const size_t qs  = size_t(T) * H * hd;
+    const size_t kvs = size_t(T) * KV * hd;
+    const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
+    float* o = out + size_t(b) * qs + (size_t(t) * H + h) * hd;
+    int j0 = (window > 0 && t + 1 > window) ? t + 1 - window : 0;
+    int len = t + 1 - j0;
+    // scores in global probs row scratch (probs required for SWA training path;
+    // inference prefill passes probs=null and uses registers only via swa path below).
+    // To keep this kernel simple it recomputes per lane with warp reductions.
+    __shared__ float sAcc[128];
+    for (int c = lane; c < hd; c += WARP_A) sAcc[c] = 0.0f;
+    __syncwarp();
+    float mx = -FLT_MAX;
+    for (int j = j0 + lane; j <= t; j += WARP_A) {
+        const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+        float d = 0.0f;
+        for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
+        d *= scale;
+        mx = fmaxf(mx, d);
+    }
+#pragma unroll
+    for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o2));
+    float sum = 0.0f;
+    for (int j = j0; j <= t; ++j) {
+        const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+        float d = 0.0f;
+        for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
+        d *= scale;
+        float p = __expf(d - mx);
+        sum += p;
+        const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+        for (int c = lane; c < hd; c += WARP_A) sAcc[c] += p * vh[c];
+        if (probs) probs[((size_t(b) * H + h) * T + t) * T + j] = p;
+    }
+#pragma unroll
+    for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
+        sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+    float inv = 1.0f / sum;
+    for (int c = lane; c < hd; c += WARP_A) o[c] = sAcc[c] * inv;
+    if (probs) {
+        float* pr = probs + ((size_t(b) * H + h) * T + t) * T;
+        for (int j = j0 + lane; j <= t; j += WARP_A) pr[j] *= inv;
+        for (int j = lane; j < j0; j += WARP_A) pr[j] = 0.0f;
+        for (int j = t + 1 + lane; j < T; j += WARP_A) pr[j] = 0.0f;
+    }
+    (void)len;
+}
+
+void attention_forward_ex(const float* q, const float* k, const float* v,
+                          float* out, float* probs,
+                          int B, int T, int H, int KV, int hd, float scale, int window) {
+    if (window <= 0) { attention_forward(q, k, v, out, probs, B, T, H, KV, hd, scale); return; }
+    if (B <= 0 || T <= 0) return;
+    GAI_CHECK(hd <= MAX_HD, "cuda attention_ex: head_dim too large");
+    GAI_CHECK(H % KV == 0, "cuda attention_ex: H must be a multiple of KV");
+    dim3 grid(T, H, B);
+    k_attn_fwd_swa<<<grid, WARP_A>>>(q, k, v, out, probs, T, H, KV, hd, scale, window);
+    CU_CHECK2(cudaGetLastError());
+}
+
 // ---------------------------------------------------------------- backward
 // Requires the cached probs (training path).
 // Grid = (T, KV, B), block = 32 (one warp per query position).
@@ -351,6 +424,92 @@ void attention_decode(const float* q, const float* kc, const float* vc,
     int block = 128;
     size_t sh = sizeof(float) * 40;
     k_attn_decode<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, scale, scratch);
+    CU_CHECK2(cudaGetLastError());
+}
+
+void attention_backward_ex(const float* q, const float* k, const float* v,
+                           const float* probs, const float* dout,
+                           float* dq, float* dk, float* dv,
+                           int B, int T, int H, int KV, int hd, float scale, int window) {
+    // SWA forward_ex already zeroed probs outside the window, so the standard
+    // tiled backward (which multiplies by pr[j]) naturally respects the mask.
+    // Delegate directly — no separate kernel, zero regression risk.
+    (void)window;
+    attention_backward(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale);
+}
+
+__global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __restrict__ kc,
+                                 const float* __restrict__ vc, float* __restrict__ out,
+                                 int H, int KV, int hd, int cur_len, float scale,
+                                 float* __restrict__ scratch, int j0) {
+    extern __shared__ float sm[];
+    const int h = blockIdx.x;
+    const int group = H / KV;
+    const int kvh = h / group;
+    const float* qh = q + size_t(h) * hd;
+    float* s = scratch + size_t(h) * cur_len;
+
+    float local_max = -FLT_MAX;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        const float* kh = kc + (size_t(j) * KV + kvh) * hd;
+        float d = 0.0f;
+#pragma unroll 4
+        for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
+        d *= scale;
+        s[j] = d;
+        local_max = fmaxf(local_max, d);
+    }
+    int lane = threadIdx.x % WARP_A, wid = threadIdx.x / WARP_A;
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if (lane == 0) sm[wid] = local_max;
+    __syncthreads();
+    int nw = (blockDim.x + WARP_A - 1) / WARP_A;
+    if (threadIdx.x == 0) {
+        float m = sm[0];
+        for (int i = 1; i < nw; ++i) m = fmaxf(m, sm[i]);
+        sm[32] = m;
+    }
+    __syncthreads();
+    float mx = sm[32];
+
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        float p = __expf(s[j] - mx);
+        s[j] = p;
+        local_sum += p;
+    }
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1) local_sum += __shfl_xor_sync(0xffffffffu, local_sum, o);
+    if (lane == 0) sm[wid] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < nw; ++i) t += sm[i];
+        sm[33] = t;
+    }
+    __syncthreads();
+    float inv = 1.0f / sm[33];
+
+    float* o = out + size_t(h) * hd;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float a = 0.0f;
+        for (int j = j0; j < cur_len; ++j) a += s[j] * vc[(size_t(j) * KV + kvh) * hd + c];
+        o[c] = a * inv;
+    }
+}
+
+void attention_decode_ex(const float* q, const float* kc, const float* vc,
+                         float* out, int H, int KV, int hd, int cur_len, int max_len,
+                         float scale, float* scratch, int window) {
+    (void)max_len;
+    if (H <= 0 || cur_len <= 0) return;
+    if (window <= 0) { attention_decode(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch); return; }
+    int j0 = (cur_len > window) ? cur_len - window : 0;
+    int block = 128;
+    size_t sh = sizeof(float) * 40;
+    k_attn_decode_ex<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, scale, scratch, j0);
     CU_CHECK2(cudaGetLastError());
 }
 

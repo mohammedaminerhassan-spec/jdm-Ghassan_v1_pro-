@@ -17,8 +17,12 @@
 //   instruction: {"instruction":"...","input":"...","output":"..."}
 //                (+ optional "system")
 //   prompt:      {"prompt":"...","completion":"..."}  (also "question"/
-//                "answer", "problem"/"solution" — but NOT bare {id,question,
-//                answer} retrieval shards: those stay with load_qa_json)
+//                "answer", "problem"/"solution", "instruction"/"response").
+//                NOTE: bare {id,question,answer} shards (e.g. the 86-file
+//                English corpus) ALSO match here intentionally and train as
+//                user->assistant turns with assistant-only loss. They remain
+//                loadable by load_qa_json (dataset/retrieval.h) for the BM25
+//                index — the two readers share the layout on purpose.
 //   text:        {"text":"..."} (also "content","sentence","document",
 //                "body","passage","story","article" — configurable)
 // Chat/instruction/prompt docs become SFT documents: the pipeline encodes
@@ -67,6 +71,12 @@ size_t read_json_docs(const std::string& path, JsonDocCallback cb,
 // If `dir` is a single file it is read directly. Returns total documents.
 size_t read_json_dir(const std::string& dir, JsonDocCallback cb,
                      const JsonReaderOptions& opts = {});
+
+// PRO-EN: يحلل نص JSON واحد (object) إلى JsonDoc بنفس object_to_doc المستعمل
+// لمسار الملفات. يستعمله مسار parquet --mode chat لأعمدة messages_json دون
+// تكرار الـparser (نفس السكيما، نفس الحدود، نفس skip الصامت للشاذ).
+bool doc_from_json_text(const std::string& text, JsonDoc& doc,
+                        const JsonReaderOptions& opts = {});
 
 // Convenience: collect plain-text views (chat docs become "user\nassistant"
 // joined text) into a vector. For training shards prefer the callbacks.

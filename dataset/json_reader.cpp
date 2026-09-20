@@ -104,7 +104,14 @@ static bool parse_string(Cur& c, std::string& out, size_t cap) {
                         if (hex4(c.p + 2, c.end, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                             c.p += 6;
+                        } else {
+                            // Lone high surrogate + malformed \uXXXX: replacement.
+                            cp = 0xFFFD;
                         }
+                    } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                        // FIX: lone surrogate fell through to utf8_emit ->
+                        // invalid 3-byte CESU-8 (training/inference garbage).
+                        cp = 0xFFFD;
                     }
                     if (out.size() < cap) {
                         std::string tmp;
@@ -338,7 +345,27 @@ static std::string strip_bom(const std::string& s) {
     return s;
 }
 
+// Shared single-text entry: parse one JSON object text -> JsonDoc.
+// Used by doc_from_json_text (parquet chat mode) so both routes share one
+// schema mapping and one set of caps. Returns false on malformed text.
+static bool parse_text_to_doc(const std::string& text, const JsonReaderOptions& opts,
+                              JsonDoc& doc) {
+    if (text.empty() || text.size() > kMaxFileBytes) return false;
+    Cur c{text.data(), text.data() + text.size()};
+    JVal v;
+    if (!parse_value(c, v, opts.max_value_bytes, 0)) return false;
+    skip_ws(c);
+    if (!c.eof()) return false;
+    if (v.t != JVal::T::Obj) return false;
+    return object_to_doc(v, opts, doc);
+}
+
 } // namespace
+
+bool doc_from_json_text(const std::string& text, JsonDoc& doc,
+                        const JsonReaderOptions& opts) {
+    return parse_text_to_doc(text, opts, doc);
+}
 
 size_t read_json_docs(const std::string& path, JsonDocCallback cb,
                       const JsonReaderOptions& opts) {
@@ -348,10 +375,11 @@ size_t read_json_docs(const std::string& path, JsonDocCallback cb,
         if (opts.verbose) log_warn("json: cannot stat: " + path);
         return 0;
     }
-    if (fsize > kMaxFileBytes) {
-        log_warn("json: file over 2GiB, refusing: " + path);
-        return 0;
-    }
+    // PRO-EN FIX: البوابة القديمة كانت ترفض أي ملف >2GiB قبل حتى معرفة نوعه،
+    // فيرجع ملف chat_if.jsonl (7GB) صفر وثيقة بصمت تام. JSONL يُقرأ سطرا بسطر
+    // (ذاكرة ثابتة) فلا يحتاج السقف؛ السقف فقط لمصفوفات JSON الكاملة التي
+    // تُحمّل دفعة واحدة. نؤجل الفحص لمسار المصفوفة أدناه.
+    const bool over_cap = (fsize > kMaxFileBytes);
 
     size_t delivered = 0;
     auto emit = [&](const JVal& v) {
@@ -386,6 +414,10 @@ size_t read_json_docs(const std::string& path, JsonDocCallback cb,
         if (!found) return 0;
         if (ch == '[') {
             // Top-level array: load whole file (bounded) and walk elements.
+            if (over_cap) {
+                log_warn("json: array file over 2GiB, refusing (would need 2GB+ RAM): " + path);
+                return 0;
+            }
             std::ifstream f(path, std::ios::binary);
             std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             text = strip_bom(text);

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/tensor.h"
+#include <cstddef>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -19,9 +21,37 @@ namespace ops {
 void set_gemm_fp16(bool on);
 bool gemm_fp16_enabled();
 
-// BF16 tensor-core GEMM (Ampere/T4+)
+// BF16 tensor-core GEMM (Ampere+, sm_80 and newer; T4/sm_75 has no BF16 cores)
 void set_gemm_bf16(bool on);
 bool gemm_bf16_enabled();
+
+// PERF (audit #6/decode): the fp16 fast path engages for GEMMs with
+// M*N*K >= threshold (default 1M: conversion overhead eats the win below).
+// Decode is M==1, so small projections decode in fp32 by design — the generic
+// threshold is NOT a decode bug (converting ~MBs to save ~kMACs loses).
+// Exposed for Kaggle/Nsight autotuning (e.g. lower it when a persistent fp16
+// weight cache removes the per-call conversion cost).
+void set_gemm_fp16_mnk_threshold(i64 mnk);
+i64  gemm_fp16_mnk_threshold();
+
+// PERF telemetry (audit P2-2): lightweight global counters for launch/memory
+// analysis. Counting is unconditional and cheap (relaxed atomics); report via
+// perf_report() on the main rank at log cadence. All counters are lifetime
+// totals — call perf_reset() to delimit a window (e.g. per eval).
+struct PerfCounters {
+    u64 gemm_calls      = 0;   // ops::gemm dispatches (both backends)
+    u64 gemm_fp16_calls = 0;   // GEMMs routed to the fp16 tensor-core path
+    u64 h2d_bytes       = 0;   // host->device payload bytes (device_copy)
+    u64 d2h_bytes       = 0;   // device->host payload bytes
+};
+PerfCounters perf_counters();
+void         perf_reset();
+std::string  perf_report();
+// Internal notes called by the backends (CUDA fp16 path, H2D/D2H copies).
+// Public only so both backends can reach them; prefer perf_counters().
+void perf_note_fp16_gemm();
+void perf_note_h2d(size_t nbytes);
+void perf_note_d2h(size_t nbytes);
 
 // DeepSeek-V2 router jitter (train-only noise on router logits for expert
 // exploration). 0 = deterministic. Set once per run from ModelConfig.
@@ -80,6 +110,13 @@ void rope_forward(Device dev, float* q, float* k, const i32* pos,
                   i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
 void rope_backward(Device dev, float* dq, float* dk, const i32* pos,
                    i64 ntok, int n_heads, int n_kv, int head_dim, float theta);
+// Pro: rope_type 0=interleaved, 1=neox; yarn_* full YaRN ramp (1.0/32.0/1.0 = legacy).
+void rope_forward_ex(Device dev, float* q, float* k, const i32* pos,
+                     i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
+                     int rope_type, float yarn_low, float yarn_high, float yarn_scale);
+void rope_backward_ex(Device dev, float* dq, float* dk, const i32* pos,
+                      i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
+                      int rope_type, float yarn_low, float yarn_high, float yarn_scale);
 
 // ---------------------------------------------------------------- swiglu
 // out = silu(g) * u   (g,u,out all [n, d])
@@ -106,6 +143,15 @@ void moe_forward(Device dev,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
                  i64 N, int d, int E, int ne, int K);
+// Aux-loss-free: router_bias[ne] (device, nullable) steers top-k selection only.
+void moe_forward_bias(Device dev,
+                      const float* x, const float* router_w, const float* router_bias,
+                      const float* gates, const float* ups, const float* downs,
+                      const float* sh_g, const float* sh_u, const float* sh_d,
+                      float* out,
+                      float* probs_cache, i32* idx_cache, float* w_cache,
+                      float* s_gate, float* s_up, float* s_act,
+                      i64 N, int d, int E, int ne, int K);
 void moe_backward(Device dev,
                   const float* x, const float* router_w,
                   const float* gates, const float* ups, const float* downs,
@@ -122,12 +168,18 @@ void moe_backward(Device dev,
 
 // GPU fast path for the MoE load-balance fractions (CUDA only; CPU returns false).
 // Fills frac_dev[ne] on DEVICE without any N*ne / N*K host copy; optionally
-// fills h_frac[ne] / h_psum[ne] on HOST with tiny copies for the loss scalar.
+// fills h_frac[ne] / h_psum[ne] on HOST with tiny copies for the loss scalar
+// (pass nullptrs on the training hot path: zero syncs per layer).
+// d_raw_accum (or null): device scalar folded with this layer's raw term;
+// reset per microbatch with moe_aux_reset() and read once with moe_aux_read()
+// (ONE sync per microbatch instead of 2x ne-float copies per layer).
 // Returns true when the GPU path was taken.
 bool moe_aux_gpu(Device dev,
                  const float* probs, const i32* idx, float* frac_dev,
                  float* h_frac, float* h_psum,
-                 i64 N, int K, int ne);
+                 i64 N, int K, int ne, double* d_raw_accum = nullptr);
+double* moe_aux_begin(Device dev);  // zero + return device raw accum (CUDA; CPU null)
+double moe_aux_end(Device dev);     // single-sync read of the accumulator (CUDA; CPU 0.0)
 
 // ---------------------------------------------------------------- attention
 // Batched causal grouped-query attention.
@@ -145,6 +197,16 @@ void attention_backward(Device dev,
                         const float* probs, const float* dout,
                         float* dq, float* dk, float* dv,
                         int B, int T, int H, int KV, int hd, float scale);
+// SWA: window 0 = full causal, >0 = sliding window (Mistral-style).
+void attention_forward_ex(Device dev,
+                          const float* q, const float* k, const float* v,
+                          float* out, float* probs,
+                          int B, int T, int H, int KV, int hd, float scale, int window);
+void attention_backward_ex(Device dev,
+                           const float* q, const float* k, const float* v,
+                           const float* probs, const float* dout,
+                           float* dq, float* dk, float* dv,
+                           int B, int T, int H, int KV, int hd, float scale, int window);
 
 // Single-token decode against a KV cache.
 //   q      [H, hd]
@@ -153,12 +215,17 @@ void attention_decode(Device dev,
                       const float* q, const float* kcache, const float* vcache,
                       float* out, int H, int KV, int hd, int cur_len, int max_len,
                       float scale, float* scratch);
+void attention_decode_ex(Device dev,
+                         const float* q, const float* kcache, const float* vcache,
+                         float* out, int H, int KV, int hd, int cur_len, int max_len,
+                         float scale, float* scratch, int window);
 
 // ---------------------------------------------------------------- loss
 // logits[n, V], targets[n] (-100 = ignore). Returns sum of losses and count.
-// If dlogits != null it is filled with dL/dlogits (already divided by n_valid).
+// If dlogits != null it is filled with dL/dlogits in SUM form (caller scales
+// by its loss scale only; no divide-by-n_valid roundtrip, audit P1).
 // z_scale adds the z-loss stabilizer: loss += z_scale * mean(logZ^2),
-// grad += 2*z_scale*logZ*p/n_valid (prevents logit explosion at 1B+).
+// grad += 2*z_scale*logZ*p (SUM form; prevents logit explosion at 1B+).
 void softmax_cross_entropy(Device dev,
                            const float* logits, const i32* targets,
                            float* dlogits, i64 n, int V,
@@ -179,6 +246,20 @@ double global_sq_norm(Device dev, const float* g, i64 n);
 // Fused: single-sync norm over many grad tensors (see ops_cpu.h).
 double global_sq_norm_multi(Device dev,
                             const std::vector<std::pair<const float*, i64>>& parts);
+
+// ---- inference fast sampling (audit P1: no full-vocab D2H per token)
+// top-K (descending, ties by lowest id) of logits[V] into out_vals/ids[K].
+// K<=0 or K>V fails fast. CUDA keeps everything on device; the caller copies
+// only K pairs to the host.
+void topk_select(Device dev, const float* logits, int V, int K,
+                 float* out_vals, i32* out_ids);
+// Full-vocab argmax with penalties pre-applied by the caller. Exact greedy.
+i32 argmax_token(Device dev, const float* logits, int V);
+// In-place CTRL-style penalties over the full row (exact Sampler mirror).
+// hist[0..hist_n) is the penalty window slice (caller-capped, <= 2048).
+void apply_rep_penalties(Device dev, float* logits, int V,
+                         const i32* hist, int hist_n,
+                         float rep, float freq, float pres);
 
 } // namespace ops
 } // namespace gai

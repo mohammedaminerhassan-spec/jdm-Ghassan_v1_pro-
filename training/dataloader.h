@@ -46,6 +46,7 @@ private:
     std::string      path_;
     bool             u16_mode_;
     bool             with_mask_;
+    int              vocab_size_ = 0;   // range gate for add_document
     std::vector<u32> tokens_;
     std::vector<u8>  mask_;
     std::vector<u64> doc_offsets_;
@@ -132,6 +133,12 @@ public:
                   BatchSpec spec, u64 seed);
 
     bool next(Batch& out);
+    void skip_batches(i64 n);
+    // DeepSeek DDP-resume rule: re-seed the stream (rank salt) without
+    // touching shards/spec, so a rank can rebuild its exact post-resume
+    // position as reseed(rank_seed)+skip(saved_batches) instead of inheriting
+    // rank0's RNG state (which repeated data on every rank).
+    void reseed(u64 seed);
 
     u64 total_tokens() const { return total_tokens_; }
     int num_shards() const;
@@ -159,7 +166,10 @@ private:
     i64  batches_ = 0;
 
     // Pick one window [B,T] from a single shard (shared by both paths).
-    void fill_from_shard(const Shard& sh, Batch& out, int b);
+    // Returns false ONLY on storage read failure (never for short docs —
+    // those legitimately leave PAD tails). Callers must retry or fail loud;
+    // a failed window must never masquerade as an unsupervised row (P1-20).
+    bool fill_from_shard(const Shard& sh, Batch& out, int b);
 };
 
 std::vector<std::string> list_shards(const std::string& dir, const std::string& prefix);

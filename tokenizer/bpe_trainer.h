@@ -8,7 +8,7 @@ namespace gai {
 struct BpeTrainerConfig {
     int  vocab_size      = 32000;
     int  min_frequency   = 2;
-    int  max_token_bytes = 32;     // guard against absurdly long merges
+    int  max_token_bytes = 32;     // guard against absurdly long merges (codepoints, not bytes — fair for Arabic)
     bool verbose         = true;
     NormalizerConfig normalizer{};
 };

@@ -36,10 +36,15 @@ struct RetrievalHit {
 std::string retrieval_normalize(const std::string& s);
 std::vector<std::string> retrieval_tokenize(const std::string& s);
 
-// Loads one train-*.json shard (array of {id,question,answer}).
-// Returns false only when the file cannot be read/parsed at all.
+// Loads one QA file in either layout:
+//   - top-level array:  [{id,question,answer}, ...]   (train-*.json shards)
+//   - JSONL:            {id,question,answer} per line  (Darija clean files)
+// id accepts int OR string (strings hash to stable int64, e.g.
+// "ghassan_darija_0002717"); extra keys (domain/script/...) are ignored.
+// A single bad object never aborts the file. Returns false only when the
+// file cannot be read/parsed at all (or yields zero pairs).
 bool load_qa_json(const std::string& path, std::vector<QaEntry>& out);
-// Loads every *.json in a directory (sorted). Returns total pairs loaded.
+// Loads every *.json / *.jsonl in a directory (sorted). Returns total pairs.
 size_t load_qa_dir(const std::string& dir, std::vector<QaEntry>& out);
 
 class RetrievalIndex {

@@ -21,6 +21,13 @@ model:
   moe_shared: true
   moe_aux_scale: 0.01
   moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+  # P0-04 FIX: These fields must match the pretrained Pro checkpoint exactly.
+  # Missing any shape-affecting field (use_qk_norm) causes a load failure
+  # because QK norm adds per-layer weight tensors not present in the SFT model.
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
 
 tokenizer:
   path: artifacts/tokenizer/darija32k.gtok

@@ -71,6 +71,11 @@ public:
     int  vocab_size() const { return static_cast<int>(vocab_.size()); }
     const std::string& token_text(i32 id) const;
     i32  token_to_id(const std::string& tok) const;
+    // Full vocabulary (id -> raw bytes), for GGUF embedding (self-contained file).
+    const std::vector<std::string>& vocab_entries() const { return vocab_; }
+    // BPE merges as (left, right) string pairs ordered by rank, for
+    // tokenizer.ggml.merges. Gaps (filtered during build) are skipped.
+    std::vector<std::pair<std::string, std::string>> merge_pairs_ordered() const;
     bool is_special(i32 id) const { return id >= 0 && id < special::COUNT; }
     const NormalizerConfig& normalizer_config() const { return norm_.config(); }
     const Normalizer& normalizer() const { return norm_; }

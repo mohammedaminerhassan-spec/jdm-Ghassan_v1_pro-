@@ -353,6 +353,34 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
     QualityVerdict v;
     if (text.empty()) { v.accept = false; v.reason = "empty"; return v; }
 
+    if (cfg.reject_ai_disclaimers) {
+        std::string low = to_lower_ascii(text);
+        static const std::vector<const char*> disclaimers = {
+            "as an ai language model", "as a language model",
+            "as an artificial intelligence", "i don't have personal opinions",
+            "i cannot fulfill this request", "i am an ai", "i'm an ai",
+            "openai", "chatgpt", "i cannot provide", "i'm sorry, but i cannot",
+            "i am a large language model"
+        };
+        for (const char* d : disclaimers) {
+            if (low.find(d) != std::string::npos) {
+                v.accept = false; v.reason = "ai_disclaimer"; return v;
+            }
+        }
+    }
+
+    if (cfg.reject_placeholders) {
+        if (text.find("[insert ") != std::string::npos ||
+            text.find("[Insert ") != std::string::npos ||
+            text.find("<your_") != std::string::npos ||
+            text.find("<YOUR_") != std::string::npos ||
+            text.find("TODO:") != std::string::npos ||
+            text.find("[Your Name]") != std::string::npos ||
+            text.find("[your name]") != std::string::npos) {
+            v.accept = false; v.reason = "unresolved_placeholder"; return v;
+        }
+    }
+
     ScriptStats st = script_stats(text);
     if (st.total == 0) { v.accept = false; v.reason = "no content"; return v; }
 

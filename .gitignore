@@ -1,5 +1,9 @@
-# Ghassan AI — T4-only build artifacts (never commit)
+# Ghassan AI — build artifacts (never commit; local + Kaggle only)
+# NOTE: both build layouts are ignored: kaggle/setup.sh uses build/,
+# local Windows verification builds use build_test/. Binaries/logs inside
+# them (Testing/, bin/, *.ninja) must never pollute git status.
 build/
+build_test/
 out/
 .vs/
 *.user
@@ -21,6 +25,8 @@ out/
 
 # Training artifacts (large, local/Kaggle only)
 artifacts/
+kaggle_upload/
+*.parquet
 *.ckpt
 *.gai
 *.gguf

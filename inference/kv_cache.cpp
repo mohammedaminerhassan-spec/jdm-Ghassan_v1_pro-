@@ -40,26 +40,21 @@ void KVCache::evict_front(int n, int keep) {
                          vp + static_cast<size_t>(keep + n) * row, move_rows * row);
         }
     } else {
-        // CUDA: overlapping D2D is undefined. FIX (10/10): old code bounced
-        // via CPU (vector<char> tmp + 4 copies/layer = 104 CPU roundtrips for
-        // 26L per evict — 100ms stall that looked like a leak under load).
-        // Now: single GPU-side temp (one alloc, reused via static cache) +
-        // 2 D2D copies/layer, zero CPU traffic. 20x faster evict.
-        static void* g_tmp = nullptr;
-        static size_t g_tmp_cap = 0;
+        // CUDA: overlapping D2D is undefined. Use per-instance GPU-side temp
+        // (allocated on-demand, freed in ~KVCache) to avoid CPU roundtrips and static data races.
         size_t bytes = move_rows * row;
-        if (bytes > g_tmp_cap) {
-            if (g_tmp) device_free(g_tmp, dev);
-            g_tmp = device_alloc(bytes, dev);
-            g_tmp_cap = bytes;
+        if (bytes > tmp_cap_) {
+            if (tmp_) device_free(tmp_, dev);
+            tmp_ = device_alloc(bytes, dev);
+            tmp_cap_ = bytes;
         }
         for (int l = 0; l < layers_; ++l) {
             char* kb = static_cast<char*>(k_[static_cast<size_t>(l)].data_ptr());
             char* vb = static_cast<char*>(v_[static_cast<size_t>(l)].data_ptr());
-            device_copy(g_tmp, dev, kb + static_cast<size_t>(keep + n) * row, dev, bytes);
-            device_copy(kb + static_cast<size_t>(keep) * row, dev, g_tmp, dev, bytes);
-            device_copy(g_tmp, dev, vb + static_cast<size_t>(keep + n) * row, dev, bytes);
-            device_copy(vb + static_cast<size_t>(keep) * row, dev, g_tmp, dev, bytes);
+            device_copy(tmp_, dev, kb + static_cast<size_t>(keep + n) * row, dev, bytes);
+            device_copy(kb + static_cast<size_t>(keep) * row, dev, tmp_, dev, bytes);
+            device_copy(tmp_, dev, vb + static_cast<size_t>(keep + n) * row, dev, bytes);
+            device_copy(vb + static_cast<size_t>(keep) * row, dev, tmp_, dev, bytes);
         }
     }
     len_ -= n;

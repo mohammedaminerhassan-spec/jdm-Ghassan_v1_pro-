@@ -32,6 +32,8 @@ struct SynthConfig {
     double p_followup      = 0.45;
     double p_correction    = 0.08;
     double p_misunderstand = 0.06;
+    double p_governor      = 0.07;   // controller exchanges (short/long, honesty, refusal)
+    double p_reasoning     = 0.08;   // Darija step-by-step chains
     bool   include_system  = true;
     double p_system        = 0.35;
     int    max_template_uses = 400;  // diversity cap

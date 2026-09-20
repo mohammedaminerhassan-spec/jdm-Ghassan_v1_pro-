@@ -35,7 +35,10 @@ struct TrainerConfig {
     float min_lr_ratio  = 0.1f;
     i64   warmup_steps  = 2000;
     // optimizer
-    std::string optimizer = "adamw";  // adamw | lion (lion = ~50% opt memory, T4 saver)
+    // adamw | lion | muon. lion = ~50% opt memory (T4 saver). muon =
+    // orthogonalized momentum for matrices (fastest per-step progress on
+    // small models; takes learning_rate directly, use ~0.01-0.03).
+    std::string optimizer = "adamw";
     float weight_decay  = 0.1f;
     float beta1         = 0.9f;
     float beta2         = 0.95f;   // lion default overridden to 0.99 when optimizer==lion
@@ -58,6 +61,11 @@ struct TrainerConfig {
     // causal attention would change the math.
     bool  activation_checkpointing = false;
     int   ckpt_segments = 2;   // 1..8, clamped
+    // Chunked cross-entropy (roadmap item 6): row-blocks for the lm-head
+    // loss in forward_backward. 1 (or 0) = legacy full [N,V] logits+dlogits.
+    // 4 shrinks them to [N/4,V] each (~393MB saved at B=2,T=1024,V=32k) with
+    // mathematically identical grads (sums, not means, per block). 1..32.
+    int   ce_chunks = 4;
     // distributed training
     bool  ddp = false;         // enable multi-GPU DDP (auto-detected if >1 GPU)
     // io / cadence
@@ -75,6 +83,12 @@ struct TrainerConfig {
     // true: allow fresh SFT from random weights (testing only).
     bool  allow_no_pretrained  = false;
     bool  freeze_embeddings    = false;
+    // false (default): FAIL loudly when the resume checkpoint was saved with
+    // different MATH fields (rope_theta/scale/yarn, rms_eps, max_seq_len) —
+    // same weights would otherwise define a different model function.
+    // Loss weights (aux/z/jitter) stay warn-only: retuning them on resume is
+    // legitimate. true: explicit opt-out for research (--allow-recipe-drift).
+    bool  allow_recipe_drift   = false;
 
     // "pretrain" = LM training on raw shards (masks, if present, still apply).
     // "sft"/"cpt" = instruction tuning on chat shards (requires loss masks).
@@ -82,13 +96,22 @@ struct TrainerConfig {
     // stage=pretrain runs epoch-budgeted PRETRAINING (not SFT).
     std::string stage = "pretrain";
 
-    static TrainerConfig from_config(const Config& c);
+    // strict=true upgrades unknown/dead config keys from warnings to a
+    // fail-fast error (P2-5; see --strict-config).
+    static TrainerConfig from_config(const Config& c, bool strict = false);
+    // Per-rank micro throughput (one process). Global throughput multiplies by
+    // world_size — DeepSeek budgeting rule: scheduler/steps must use GLOBAL.
     i64 tokens_per_step() const {
         return static_cast<i64>(batch_size) * seq_len * grad_accum;
     }
+    i64 tokens_per_step_global(int world_size) const {
+        if (world_size < 1) world_size = 1;
+        return tokens_per_step() * static_cast<i64>(world_size);
+    }
     bool is_sft() const { return stage == "sft" || stage == "cpt"; }
-    // total planned optimizer steps given the corpus size (epochs mode)
-    i64 epoch_steps(u64 total_tokens) const;
+    // total planned optimizer steps given the corpus size (epochs mode).
+    // world_size divides the budget: 4 GPUs consume 4x tokens per step.
+    i64 epoch_steps(u64 total_tokens, int world_size = 1) const;
     std::string precision_name() const {
         if (param_dtype == DType::F16) return "fp16";
         if (param_dtype == DType::BF16) return "bf16";
@@ -115,10 +138,13 @@ private:
 
     Model&        model_;
     TrainerConfig cfg_;
-    // Only one optimizer is ever allocated (T4 memory): adamw (m+v) or lion (m).
+    // Only one optimizer is ever allocated (T4 memory): adamw (m+v),
+    // lion (m) or muon (m + tiny v + NS scratch).
     std::unique_ptr<AdamW> opt_adam_;
     std::unique_ptr<Lion>  opt_lion_;
+    std::unique_ptr<Muon>  opt_muon_;
     bool use_lion_ = false;
+    bool use_muon_ = false;
     double opt_step(float lr, float grad_scale);
     size_t opt_state_bytes() const;
     void   opt_set_step(i64 t);
@@ -142,6 +168,11 @@ private:
     Tensor ckpt_ids_;
     Tensor ckpt_targets_;
     bool use_ckpt_ = false;
+    // Persistent CPU staging for ckpt batch-slicing (grows monotonically,
+    // never per-segment malloc). Old code allocated 2 vectors per segment per
+    // micro per step -> allocator churn that starved the T4 GPU.
+    std::vector<i32> ckpt_staging_ids_;
+    std::vector<i32> ckpt_staging_tgt_;
     // one micro-batch (possibly split into segments); returns ntok-weighted loss
     double forward_backward_micro(const Batch& batch, float dscale, i64* out_ntok);
 

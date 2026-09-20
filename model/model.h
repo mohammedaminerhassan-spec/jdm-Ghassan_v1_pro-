@@ -35,12 +35,32 @@ struct ModelConfig {
     float moe_jitter        = 0.0f;   // DeepSeek-V2 router jitter (train-only
                                       // multiplicative noise on router logits,
                                       // 0.01 typical; 0 = off/deterministic)
+    bool  moe_allow_dense   = false;  // research hatch: allow top_k > ne/2
+                                      // (dense routing). Default false keeps
+                                      // the T4-safe sparse contract; set true
+                                      // only for short research runs (OOMs T4).
     // ---- stability / context additions (backward-compatible defaults)
     bool  use_qk_norm       = false;  // per-head QK RMSNorm (MoE stability at 1B)
     float z_loss_scale      = 0.0f;   // router/logit penalty: loss += scale*logZ^2
     float rope_scale        = 1.0f;   // 1.0 off; >1 extends ctx via NTK theta scaling
     float rope_yarn_mscale  = 0.0f;   // YaRN attention-scale (0=auto from rope_scale,
                                       // DeepSeek long-ctx: 0.1*ln(scale)+1)
+    // ---- Ghassan v1 Pro (DeepSeek-V3 / GLM-4 class; all default OFF so كل
+    // checkpoint موجود يبقى bit-identical. فعلها فقط لتدريب Pro جديد).
+    bool  moe_aux_free      = false;  // aux-loss-free routing (V3 §3.2): عند true
+                                      // يتوقف moe_aux_loss عن إضافة aux grad
+                                      // (bias update المنفصل خطوة لاحقة؛ الآن
+                                      // يعني توازنا عبر jitter+shared فقط)
+    float rope_yarn_low     = 1.0f;   // YaRN ramp: الأبعاد < low تبقى خطية
+    float rope_yarn_high    = 32.0f;  // الأبعاد > high تُستكمل NTK كاملة
+    int   sliding_window    = 0;      // 0=off (full causal). >0 نافذة انزلاقية
+                                      // (Mistral/SWA؛ kernel block-mask TODO —
+                                      // الحقل محفوظ ومصدّر لـGGUF + مرفوض في
+                                      // llama_compat حتى يكتمل الـkernel)
+    int   rope_type         = 0;      // 0=interleaved (legacy هذا المشروع),
+                                      // 1=neox half-rotate (HF/Llama/Qwen/DS
+                                      // التوافق؛ للـcheckpoints الجديدة فقط —
+                                      // kernels الحالية interleaved)
 
     int head_dim() const { return hidden_size / num_heads; }
     int kv_dim()   const { return num_kv_heads * head_dim(); }
@@ -132,8 +152,20 @@ struct Activations {
     Tensor moe_dact;                    // [N, K, E] backward scratch
     Tensor moe_auxfrac;                 // [ne] f32 (device) load-balance fractions
     Tensor ffn_out;    // [B*T, d]
-    Tensor logits;     // [B*T, V]
+    // Logits scratch. Full [N,V] for forward()/eval; compact [Cc,V] row-block
+    // scratch when built for chunked training (ce_chunks > 1), in which case
+    // only forward_backward() may use these activations (forward() refuses).
+    // (dlogits in the gradient scratch below follows the same sizing.)
+    Tensor logits;     // [N or Cc, V]
     Tensor pos;        // [B*T] int32 positions
+    // PERF: positions for a given (B,T) are deterministic ([t] tiled over b),
+    // and training reuses one (B,T) for 128 micros/step. Rebuilding + H2D on
+    // every forward is pure overhead, so cache validity here: forward_body
+    // refills act.pos only when (B,T) changed since the last fill.
+    int pos_cached_B = -1;
+    int pos_cached_T = -1;
+    int ce_chunks = 1; // loss chunking used by forward_backward (>=1)
+    i64 ce_rows = 0;   // rows per chunk (== N when ce_chunks == 1)
 
     // saved per layer for backward
     // NOTE: attention probs are NOT stored per layer (O(T^2) x L = 2.6GB at
@@ -145,6 +177,8 @@ struct Activations {
     std::vector<Tensor> saved_q, saved_k, saved_v;
     std::vector<Tensor> saved_qk_rms_q; // [N*H] QK-norm rrms (only when use_qk_norm)
     std::vector<Tensor> saved_qk_rms_k; // [N*KV] QK-norm rrms (only when use_qk_norm)
+    std::vector<Tensor> saved_qk_raw_q; // [N, qd] pre-norm Q (only when use_qk_norm)
+    std::vector<Tensor> saved_qk_raw_k; // [N, kvd] pre-norm K (only when use_qk_norm)
     Tensor attn_probs_tmp;              // [B*H*T*T] transient recompute buffer
     std::vector<Tensor> saved_attout;
     std::vector<Tensor> saved_xmid;     // x after attention residual
@@ -195,10 +229,13 @@ public:
     // by the same factor; the caller unscales via the optimizer grad_scale).
     double  forward_backward(const i32* ids, const i32* targets, int B, int T,
                              Activations& act, i64* out_ntok = nullptr,
-                             float dout_scale = 1.0f);
+                             float dout_scale = 1.0f, bool want_aux_stats = false);
 
-    Activations make_activations(int B, int T, bool with_grad) const;
-    size_t estimate_activation_bytes(int B, int T, bool with_grad) const;
+    // ce_chunks: row-blocks for the chunked loss in forward_backward
+    // (1 = legacy full [N,V] logits; >1 = compact [Cc,V] scratch where
+    // Cc = ceil(N/ce_chunks)). Callers of forward() must keep 1.
+    Activations make_activations(int B, int T, bool with_grad, int ce_chunks = 1) const;
+    size_t estimate_activation_bytes(int B, int T, bool with_grad, int ce_chunks = 1) const;
 
     // Raw (unscaled) DeepSeek-style load-balance aux loss summed over layers,
     // measured from the routing caches of the last forward() call. Refills the
@@ -209,6 +246,13 @@ public:
     // dense models). Call periodically to detect router collapse.
     std::string moe_balance_report() const;
     void moe_balance_reset();
+    // Aux-loss-free bias (DeepSeek-V3 §3.2): per-layer [ne] steering bias,
+    // updated by EMA on host (no grad). nullptr when aux_free is off.
+    void ensure_moe_bias();
+    const float* moe_bias_ptr(int layer) const;
+    float* moe_bias_ptr_mut(int layer);
+    void update_moe_bias(int layer, const float* frac_host, int ne);
+    const std::vector<std::vector<float>>& moe_bias_all() const { return moe_bias_; }
 
     // ---- weights io (raw f32 dump; the .gai format lives in format/)
     void save_raw(const std::string& path) const;
@@ -224,14 +268,27 @@ public:
 private:
     void alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay);
 
-    // per-layer aux-loss helper (also accumulates routing stats below)
+    // per-layer aux-loss helper (also accumulates routing stats below).
+    // want_stats=false (training hot path): no host copies at all; the raw
+    // scalar folds into d_raw_accum on device (read once per microbatch).
+    // want_stats=true (or null accum): full host raw + balance stats.
     double moe_layer_aux(Device dev, const float* probs, const i32* idx,
-                         float* auxfrac_dev, int layer, i64 N, int K, int ne);
+                         float* auxfrac_dev, int layer, i64 N, int K, int ne,
+                         bool want_stats = true, double* d_raw_accum = nullptr);
+
+    // Body of forward() up to (and including) the final norm; the lm_head
+    // GEMM is left to the caller so forward_backward() can chunk it.
+    void forward_body(const i32* ids, int B, int T, Activations& act);
 
     ModelConfig cfg_;
     // routing stats: [layer][expert] tokens routed (for balance reporting)
     mutable std::vector<std::vector<double>> moe_tok_acc_;
     mutable u64 moe_aux_batches_ = 0;
+    // aux-loss-free steering bias [layer][expert] (host master; mirrored to
+    // device on demand in forward). Empty unless moe_aux_free is on.
+    std::vector<std::vector<float>> moe_bias_;
+    std::vector<Tensor> moe_bias_dev_;
+    float moe_bias_lr_ = 0.001f;
     Device      device_ = Device::CPU;
     bool        grad_enabled_ = false;
 

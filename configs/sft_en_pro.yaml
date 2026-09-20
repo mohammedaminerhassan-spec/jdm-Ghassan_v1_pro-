@@ -1,0 +1,80 @@
+# Ghassan v1 English-Pro — SFT stage (matches en_pro.yaml architecture exactly).
+# Stage 2 after en_pro pretrain. Same shards, heavier instruction weight.
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_aux_free: false
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0
+  rope_yarn_high: 32.0
+  sliding_window: 0
+  rope_type: 0
+
+tokenizer:
+  path: artifacts/tokenizer/english32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: sft
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 16384
+  loss_scale_window: 2000
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 16           # effective 32,768 tokens/step (SFT: smaller steps)
+  max_steps: 0
+  epochs: 3
+  learning_rate: 1.2e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 200
+  optimizer: adamw
+  scheduler: wsd
+  sched_decay_frac: 0.25
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 250
+  eval_batches: 15
+  save_every: 500
+  data_dir: artifacts/shards_en
+  checkpoint_dir: artifacts/checkpoints/en_pro_sft
+  resume: auto
+  pretrained_checkpoint: artifacts/checkpoints/en_pro/last.ckpt
+  allow_no_pretrained: false
+  freeze_embeddings: false
+  activation_checkpointing: true
+  ckpt_segments: 2
+
+data:
+  data_dir: artifacts/shards_en
+  train_prefix: train_
+  val_prefix: val_
+  mix:
+    english_chat: 0.65
+    english_instruction: 0.35

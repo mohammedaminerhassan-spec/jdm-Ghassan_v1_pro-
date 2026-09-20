@@ -25,6 +25,13 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q8_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q8_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
+        // FIX: corrupt ckpt with NaN/Inf weights made amax non-finite ->
+        // scale=NaN/Inf, lround(NaN)=UB, GGUF export crash. Zero the block.
+        if (!std::isfinite(amax)) {
+            out[b].scale = 0.0f;
+            std::memset(out[b].q, 0, sizeof(out[b].q));
+            continue;
+        }
         float scale = amax / 127.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[b].scale = scale;
@@ -38,6 +45,12 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
         const float* x = src + full * Q8_BLOCK;
         float amax = 0.0f;
         for (i64 i = 0; i < rem; ++i) amax = std::max(amax, std::fabs(x[i]));
+        // Same NaN/Inf guard for the tail block (see above).
+        if (!std::isfinite(amax)) {
+            out[full].scale = 0.0f;
+            std::memset(out[full].q, 0, sizeof(out[full].q));
+            return;
+        }
         float scale = amax / 127.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[full].scale = scale;
@@ -79,6 +92,13 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q4_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q4_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
+        // FIX: NaN/Inf guard (same contract as Q8_0 above).
+        if (!std::isfinite(amax)) {
+            out[b].scale = fp32_to_fp16(0.0f);
+            // 0x88 = zero value in Q4_0 nibble encoding (+8 offset per nibble).
+            std::memset(out[b].q, 0x88, sizeof(out[b].q));
+            continue;
+        }
         float scale = amax / 8.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[b].scale = fp32_to_fp16(scale);
@@ -93,6 +113,11 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         const float* x = src + full * Q4_BLOCK;
         float amax = 0.0f;
         for (i64 i = 0; i < rem; ++i) amax = std::max(amax, std::fabs(x[i]));
+        if (!std::isfinite(amax)) {
+            out[full].scale = fp32_to_fp16(0.0f);
+            std::memset(out[full].q, 0x88, sizeof(out[full].q));
+            return;
+        }
         float scale = amax / 8.0f;
         float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
         out[full].scale = fp32_to_fp16(scale);
@@ -141,6 +166,17 @@ void quantize_q4_1(const float* src, void* dst, i64 n) {
     const i64 full = n / Q4_BLOCK;
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q4_BLOCK;
+        // PRO-HARDEN: Q8_0/Q4_0 يحرسان NaN/Inf (zero-block) لكن Q4_1 كان
+        // يترك mn/mx=NaN تسمم البلوك كاملا وينتشر في GGUF. نفس المرآة هنا.
+        bool bad = false;
+        for (int i = 0; i < Q4_BLOCK; ++i)
+            if (!std::isfinite(x[i])) { bad = true; break; }
+        if (bad) {
+            out[b].scale = fp32_to_fp16(0.0f);
+            out[b].min = fp32_to_fp16(0.0f);
+            std::memset(out[b].q, 0, sizeof(out[b].q));
+            continue;
+        }
         float mn = x[0], mx = x[0];
         for (int i = 1; i < Q4_BLOCK; ++i) { mn = std::min(mn, x[i]); mx = std::max(mx, x[i]); }
         float scale = (mx - mn) / 15.0f;

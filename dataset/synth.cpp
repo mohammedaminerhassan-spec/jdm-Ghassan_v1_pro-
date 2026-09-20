@@ -127,6 +127,14 @@ const std::unordered_map<std::string, std::vector<std::string>>& word_translit()
     return m;
 }
 
+// True when a string carries Latin letters but no Arabic ones (Arabizi,
+// French, English). Used to keep Arabic-script conversations single-script:
+// such rows are re-picked instead of leaking Latin turns into them.
+static bool is_latin_only(const std::string& text) {
+    ScriptStats ss = script_stats(text);
+    return ss.arabic == 0 && ss.latin > 0;
+}
+
 } // namespace
 
 std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_digits) {
@@ -346,6 +354,43 @@ bool SynthGenerator::generate(Conversation& out) {
             out.messages.push_back({Role::User, surface(e.user)});
             out.messages.push_back({Role::Assistant, surface(e.assistant)});
             tid = tid * 31 + hash_string(e.user);
+        } else if (p < cfg_.p_correction + cfg_.p_misunderstand + cfg_.p_governor &&
+                   !synth_data::governor_exchanges().empty()) {
+            // Governor turn: the controller data. Rows are authored
+            // single-script; the retry below keeps the whole conversation
+            // single-script too (Latin rows never leak into an Arabic-script
+            // conversation — that leak is what taught script-mixing before).
+            const auto& pool = synth_data::governor_exchanges();
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 4; ++t) {
+                const auto& cand = pick(pool, rng);
+                if (script == Script::Latin || (!is_latin_only(cand.user) &&
+                                                !is_latin_only(cand.assistant))) {
+                    chosen = &cand;
+                    break;
+                }
+                chosen = &cand;  // fallback: accept on last try rather than stall
+            }
+            out.messages.push_back({Role::User, surface(chosen->user)});
+            out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
+            tid = tid * 31 + hash_string(chosen->user);
+        } else if (p < cfg_.p_correction + cfg_.p_misunderstand + cfg_.p_governor +
+                       cfg_.p_reasoning &&
+                   !synth_data::reasoning_exchanges().empty()) {
+            const auto& pool = synth_data::reasoning_exchanges();
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 4; ++t) {
+                const auto& cand = pick(pool, rng);
+                if (script == Script::Latin || (!is_latin_only(cand.user) &&
+                                                !is_latin_only(cand.assistant))) {
+                    chosen = &cand;
+                    break;
+                }
+                chosen = &cand;
+            }
+            out.messages.push_back({Role::User, surface(chosen->user)});
+            out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
+            tid = tid * 31 + hash_string(chosen->user);
         } else if (rng.uniform() < 0.06) {
             const auto& e = pick(synth_data::identity_questions(), rng);
             out.messages.push_back({Role::User, e.user});

@@ -81,7 +81,7 @@ bool Deduplicator::add(const std::string& text) {
         std::vector<u64> sig = minhash(canon);
         const int rows = cfg_.num_hashes / cfg_.bands;
 
-        // candidate lookup
+        // candidate lookup (all ids sharing any band bucket)
         std::vector<u32> candidates;
         for (int b = 0; b < cfg_.bands; ++b) {
             u64 bh = 1469598103934665603ull;
@@ -91,7 +91,8 @@ bool Deduplicator::add(const std::string& text) {
             }
             bh = splitmix64(bh ^ static_cast<u64>(b));
             auto it = band_tables_[static_cast<size_t>(b)].find(bh);
-            if (it != band_tables_[static_cast<size_t>(b)].end()) candidates.push_back(it->second);
+            if (it != band_tables_[static_cast<size_t>(b)].end())
+                for (u32 id : it->second) candidates.push_back(id);
         }
 
         if (!candidates.empty()) {
@@ -116,7 +117,7 @@ bool Deduplicator::add(const std::string& text) {
                 bh *= 1099511628211ull;
             }
             bh = splitmix64(bh ^ static_cast<u64>(b));
-            band_tables_[static_cast<size_t>(b)].emplace(bh, idx);
+            band_tables_[static_cast<size_t>(b)][bh].push_back(idx);
         }
     }
     return true;
@@ -124,7 +125,40 @@ bool Deduplicator::add(const std::string& text) {
 
 bool Deduplicator::is_duplicate(const std::string& text) const {
     std::string canon = Normalizer::canonical(text);
-    return exact_.count(hash_string(canon)) > 0;
+    if (canon.empty()) return true;
+    u64 h = hash_string(canon);
+    // Exact + eval-blocklist always apply.
+    if (!blocklist_.empty() && blocklist_.count(h)) return true;
+    if (exact_.count(h)) return true;
+    // Near-dup estimate (read-only): same LSH lookup as add(), no insertion.
+    if (cfg_.near && !signatures_.empty()) {
+        std::vector<u64> sig = minhash(canon);
+        const int rows = cfg_.num_hashes / cfg_.bands;
+        std::vector<u32> candidates;
+        for (int b = 0; b < cfg_.bands; ++b) {
+            u64 bh = 1469598103934665603ull;
+            for (int r = 0; r < rows; ++r) {
+                bh ^= sig[static_cast<size_t>(b * rows + r)];
+                bh *= 1099511628211ull;
+            }
+            bh = splitmix64(bh ^ static_cast<u64>(b));
+            auto it = band_tables_[static_cast<size_t>(b)].find(bh);
+            if (it != band_tables_[static_cast<size_t>(b)].end())
+                for (u32 id : it->second) candidates.push_back(id);
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        for (u32 ci : candidates) {
+            if (ci >= signatures_.size()) continue;
+            const auto& other = signatures_[ci];
+            int match = 0;
+            for (int i = 0; i < cfg_.num_hashes; ++i)
+                if (other[static_cast<size_t>(i)] == sig[static_cast<size_t>(i)]) ++match;
+            double est = static_cast<double>(match) / static_cast<double>(cfg_.num_hashes);
+            if (est >= cfg_.jaccard_threshold) return true;
+        }
+    }
+    return false;
 }
 
 void Deduplicator::load_blocklist(const std::string& path) {

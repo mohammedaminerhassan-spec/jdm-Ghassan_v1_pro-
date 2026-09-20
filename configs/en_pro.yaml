@@ -1,0 +1,93 @@
+# Ghassan v1 English-Pro — MoE chat recipe for the chat_if English corpus
+# (426k multi-turn convos -> 350k deduped: english_chat + english_instruction).
+# Architecture: flash-size MoE (~480M total / ~204M active) so answers are FAST
+# (small conditional compute) yet strong. seq_len 1024: chat_if convos average
+# ~3-4k tokens and shards are window-split (never truncated), so 1024 keeps
+# full turns in context on T4 (flash memory math: ~11.8GB with ckpt, see below).
+#
+# Data contract (built by kaggle/build_english_data.sh):
+#   artifacts/shards_en/train_english_chat_*.gbin        (from *.parquet chat parts)
+#   artifacts/shards_en/train_english_instruction_*.gbin (from *_instruction parts)
+# Tokenizer (SHIPPED in the zip, trained --keep-case on chat_if):
+#   artifacts/tokenizer/english32k.gtok (vocab 32000, case preserved)
+# Shard build MUST use: --style-mode en --keep-case --seq-len 1024
+#   --expect-vocab 32000 (mismatched flags silently corrupt casing/filters).
+
+model:
+  vocab_size: 32000        # english32k.gtok (keep-case)
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4          # GQA: 3x smaller KV cache than MHA
+  intermediate_size: 2240  # dense fallback only (unused when use_moe=true)
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8           # routed experts per layer (DeepSeek-style)
+  moe_top_k: 2             # active experts per token
+  moe_expert_dim: 768      # SwiGLU hidden size per expert
+  moe_shared: true         # +1 always-on shared expert
+  moe_aux_scale: 0.01
+  moe_aux_free: false       # Pro: classic aux loss (true needs aux_scale 0.0)
+  moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0
+  rope_yarn_high: 32.0
+  sliding_window: 0
+  rope_type: 0
+  # => ~480M total, ~204M active per token (+3k QK-Norm params)
+
+tokenizer:
+  path: artifacts/tokenizer/english32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  loss_scale_init: 16384
+  loss_scale_window: 2000
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 32           # effective 2*1024*32 = 65,536 tokens/step (~11.8GB)
+  max_steps: 0
+  epochs: 2
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  optimizer: adamw
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 42
+  log_every: 10
+  eval_every: 500
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/en_pro
+  data_dir: artifacts/shards_en
+  resume: auto
+  activation_checkpointing: true
+  ckpt_segments: 2
+
+data:
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
+  # ACTIVE MIX (must equal what build_english_data.sh materializes —
+  # every domain below is built there with --domain, so preflight passes).
+  #   english_chat:        multi-turn chit-chat (logic, humor, daily life)
+  #   english_instruction: instruction-following turns (task obedience)
+  mix:
+    english_chat: 0.80
+    english_instruction: 0.20

@@ -19,6 +19,28 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     const ModelConfig& c = model.config();
     Device dev = model.device();
     max_context_ = max_context > 0 ? std::min(max_context, c.max_seq_len) : c.max_seq_len;
+    // PRO-HARDEN (T4/weak-PC OOM guard): KV cache = 2*L*max_len*kv_dim*4 bytes
+    // متجاور. بدون فحص مسبق أي max_seq_len=8192 يفجر T4 فورا. نفشل برسالة
+    // واضحة تقترح تصغير max_context بدل OOM غامض وسط التوليد.
+    {
+        size_t need = 2ULL * static_cast<size_t>(c.num_layers) *
+                      static_cast<size_t>(max_context_) *
+                      static_cast<size_t>(c.kv_dim()) * sizeof(float);
+        if (dev == Device::CUDA && cuda_available()) {
+            size_t free_b = device_info().free_mem;
+            // device_info() قد يكون stale: نعيد القياس الحي عند الإمكان عبر
+            // cached probe فقط؛ إن كان need > free نُفشل مبكرا برسالة عملية.
+            if (free_b > 0 && need > free_b) {
+                GAI_FAIL(strfmt("KV cache needs %s but only %s free on device "
+                                "(L=%d ctx=%d kv_dim=%d). Halve max_context or max_seq_len.",
+                                human_bytes(need).c_str(), human_bytes(free_b).c_str(),
+                                c.num_layers, max_context_, c.kv_dim()));
+            }
+        } else if (need > (1ULL << 30)) {
+            log_warn(strfmt("[gen ] KV cache large (%s); weak PCs should lower max_context",
+                            human_bytes(need).c_str()));
+        }
+    }
     cache_ = KVCache(c, max_context_, dev);
 
     const int d = c.hidden_size;
@@ -42,6 +64,11 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     scores_     = Tensor::empty({static_cast<i64>(c.num_heads) * max_context_}, DType::F32, dev);
     tok_dev_    = Tensor::empty({1}, DType::I32, dev);
     pos_dev_    = Tensor::empty({1}, DType::I32, dev);
+    hlast_      = Tensor::empty({d}, DType::F32, dev);
+    topk_vals_dev_ = Tensor::empty({(i64)FAST_TOPK_MAX}, DType::F32, dev);
+    topk_ids_dev_  = Tensor::empty({(i64)FAST_TOPK_MAX}, DType::I32, dev);
+    topk_vals_host_.assign(FAST_TOPK_MAX, 0.0f);
+    topk_ids_host_.assign(FAST_TOPK_MAX, 0);
     logits_host_.assign(static_cast<size_t>(c.vocab_size), 0.0f);
 
     log_info(strfmt("[gen ] context %d | kv cache %s | device %s",
@@ -52,10 +79,12 @@ void Generator::reset() {
     cache_.reset();
     history_.clear();
     stats_ = GenerationStats{};
+    absolute_pos_ = 0;   // P0-03: reset absolute position counter
 }
 
 // ---------------------------------------------------------------- decode step
-float* Generator::decode_step(i32 token, int position) {
+// Full body through the LM head; result stays in logits_dev_ (no copy).
+float* Generator::decode_step_logits(i32 token, int position) {
     const ModelConfig& c = model_.config();
     const int d   = c.hidden_size;
     const int qd  = c.q_dim();
@@ -96,8 +125,12 @@ float* Generator::decode_step(i32 token, int position) {
         }
 
         const float theta_eff = rope_theta_eff(c);
-        device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
-        ops::rope_forward(dev, q_.f32(), k_.f32(), pos_dev_.i32p(), 1, H, KV, hd, theta_eff);
+        // T4-P1-25: the position value is loop-invariant — upload once per
+        // decode step, not once per layer (was 36 tiny H2D copies/token).
+        if (l == 0)
+            device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
+        ops::rope_forward_ex(dev, q_.f32(), k_.f32(), pos_dev_.i32p(), 1, H, KV, hd, theta_eff,
+                             c.rope_type, c.rope_yarn_low, c.rope_yarn_high, c.rope_scale);
 
         // write into the cache (same-device D2D via device_copy)
         {
@@ -108,22 +141,24 @@ float* Generator::decode_step(i32 token, int position) {
             device_copy(vdst, dev, v_.f32(), dev, bytes);
         }
 
-        ops::attention_decode(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
-                              H, KV, hd, slot + 1, max_context_, scale, scores_.f32());
+        ops::attention_decode_ex(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
+                                 H, KV, hd, slot + 1, max_context_, scale, scores_.f32(),
+                                 c.sliding_window);
 
         ops::linear_forward(dev, attn_.f32(), L.wo.w.f32(), proj_.f32(), 1, qd, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
 
         ops::rmsnorm_forward(dev, x_.f32(), L.ffn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
         if (L.has_moe()) {
-            ops::moe_forward(dev, xb_.f32(), L.router.w.f32(),
-                             L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
-                             L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
-                             L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
-                             L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
-                             proj_.f32(), nullptr, nullptr, nullptr,
-                             moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
-                             1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
+            const float* bias = model_.moe_bias_ptr(l);
+            ops::moe_forward_bias(dev, xb_.f32(), L.router.w.f32(), bias,
+                                  L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                  L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                  L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                  L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                  proj_.f32(), nullptr, nullptr, nullptr,
+                                  moe_gate_.f32(), moe_up_.f32(), moe_act_.f32(),
+                                  1, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
         } else {
             ops::linear_forward(dev, xb_.f32(), L.w_gate.w.f32(), gate_.f32(), 1, d, F);
             ops::linear_forward(dev, xb_.f32(), L.w_up.w.f32(),   up_.f32(),   1, d, F);
@@ -137,7 +172,15 @@ float* Generator::decode_step(i32 token, int position) {
 
     ops::rmsnorm_forward(dev, x_.f32(), model_.final_norm().w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
     ops::linear_forward(dev, xb_.f32(), model_.lm_head().w.f32(), logits_dev_.f32(), 1, d, V);
-    device_copy(logits_host_.data(), Device::CPU, logits_dev_.f32(), dev,
+    return logits_dev_.f32();
+}
+
+// Legacy single-token step: full-vocab D2H + CPU sampling (kept for CPU,
+// tiny vocabs, disabled fast path, and top_k=0 full-distribution sampling).
+float* Generator::decode_step(i32 token, int position) {
+    const int V = model_.config().vocab_size;
+    float* lp = decode_step_logits(token, position);
+    device_copy(logits_host_.data(), Device::CPU, lp, model_.device(),
                 sizeof(float) * static_cast<size_t>(V));
     return logits_host_.data();
 }
@@ -150,7 +193,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
             decode_step(tokens[i], start_pos + static_cast<int>(i));
-            history_.push_back(tokens[i]);
+            push_history(tokens[i]);
         }
         return;
     }
@@ -167,7 +210,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     Tensor d_ids({P}, DType::I32, dev);
     d_ids.copy_from(ids);
     Tensor pos({P}, DType::I32, Device::CPU);
-    for (int i = 0; i < P; ++i) pos.i32p()[i] = i;
+    for (int i = 0; i < P; ++i) pos.i32p()[i] = start_pos + i;  // P0-03: use start_pos offset
     Tensor d_pos({P}, DType::I32, dev);
     d_pos.copy_from(pos);
 
@@ -204,24 +247,26 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
             ops::rmsnorm_forward(dev, k.f32(), L.qk_knorm.w.f32(), k.f32(),
                                  nullptr, (i64)P * KV, hd, c.rms_eps);
         }
-        ops::rope_forward(dev, q.f32(), k.f32(), d_pos.i32p(), P, H, KV, hd, rope_theta_eff(c));
+        ops::rope_forward_ex(dev, q.f32(), k.f32(), d_pos.i32p(), P, H, KV, hd, rope_theta_eff(c),
+                             c.rope_type, c.rope_yarn_low, c.rope_yarn_high, c.rope_scale);
         // fill cache rows [0,P)
         device_copy(cache_.k(l), dev, k.f32(), dev, sizeof(float) * (size_t)P * kvd);
         device_copy(cache_.v(l), dev, v.f32(), dev, sizeof(float) * (size_t)P * kvd);
-        ops::attention_forward(dev, q.f32(), k.f32(), v.f32(), att.f32(), nullptr,
-                               1, P, H, KV, hd, scale);
+        ops::attention_forward_ex(dev, q.f32(), k.f32(), v.f32(), att.f32(), nullptr,
+                                  1, P, H, KV, hd, scale, c.sliding_window);
         ops::linear_forward(dev, att.f32(), L.wo.w.f32(), proj.f32(), P, qd, d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
         ops::rmsnorm_forward(dev, x.f32(), L.ffn_norm.w.f32(), xb.f32(), nullptr, P, d, c.rms_eps);
         if (L.has_moe()) {
-            ops::moe_forward(dev, xb.f32(), L.router.w.f32(),
-                             L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
-                             L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
-                             L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
-                             L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
-                             proj.f32(), nullptr, nullptr, nullptr,
-                             mg.f32(), mu.f32(), ma.f32(),
-                             P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
+            const float* bias = model_.moe_bias_ptr(l);
+            ops::moe_forward_bias(dev, xb.f32(), L.router.w.f32(), bias,
+                                  L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
+                                  L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
+                                  L.sh_up.w.defined()   ? L.sh_up.w.f32()   : nullptr,
+                                  L.sh_down.w.defined() ? L.sh_down.w.f32() : nullptr,
+                                  proj.f32(), nullptr, nullptr, nullptr,
+                                  mg.f32(), mu.f32(), ma.f32(),
+                                  P, d, c.moe_expert_dim, c.num_experts, c.moe_top_k);
         } else {
             ops::linear_forward(dev, xb.f32(), L.w_gate.w.f32(), gtmp.f32(), P, d, c.intermediate_size);
             ops::linear_forward(dev, xb.f32(), L.w_up.w.f32(), utmp.f32(), P, d, c.intermediate_size);
@@ -231,18 +276,22 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
     }
     cache_.set_length(P);
-    // final norm + head for the LAST position only (what sampling needs).
-    // To avoid a gather kernel, run the head batched then keep the last row.
-    Tensor hnorm({(i64)P * d}, DType::F32, dev);
-    ops::rmsnorm_forward(dev, x.f32(), model_.final_norm().w.f32(), hnorm.f32(), nullptr, P, d, c.rms_eps);
-    Tensor all_logits({(i64)P * c.vocab_size}, DType::F32, dev);
-    ops::linear_forward(dev, hnorm.f32(), model_.lm_head().w.f32(), all_logits.f32(), P, d, c.vocab_size);
+    // Final norm + head for the LAST position only (what sampling needs).
+    // AUDIT P1 FIX: old code ran the full [P,V] head (524MB temp + wasted
+    // GEMM at P=4096) then kept one row. Rows are independent, so norm+head
+    // run on row P-1 directly into the persistent [V] scratch: bit-identical
+    // logits, O(V) memory instead of O(P*V).
+    ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
+                         model_.final_norm().w.f32(), hlast_.f32(),
+                         nullptr, 1, d, c.rms_eps);
+    ops::linear_forward(dev, hlast_.f32(), model_.lm_head().w.f32(),
+                        logits_dev_.f32(), 1, d, c.vocab_size);
     device_copy(logits_host_.data(), Device::CPU,
-                all_logits.f32() + (size_t)(P - 1) * c.vocab_size, dev,
+                logits_dev_.f32(), dev,
                 sizeof(float) * (size_t)c.vocab_size);
     // keep single-token scratch in sync for the upcoming decode steps
     device_copy(x_.f32(), dev, x.f32() + (size_t)(P - 1) * d, dev, sizeof(float) * (size_t)d);
-    for (auto t : tokens) history_.push_back(t);
+    for (auto t : tokens) push_history(t);
 }
 
 // ---------------------------------------------------------------- prefill
@@ -257,20 +306,64 @@ void Generator::prefill(const std::vector<i32>& tokens) {
     if (start == 0 && tokens.size() > 1) {
         // sliding window for very long prompts, keeping BOS+system prefix
         std::vector<i32> work = tokens;
+        int64_t pos_base = 0;  // absolute coordinate of work[0]
+        bool truncated = false;
+        int drop = 0;
         if (static_cast<int>(work.size()) > max_context_) {
-            int drop = static_cast<int>(work.size()) - max_context_;
+            drop = static_cast<int>(work.size()) - max_context_;
             work.erase(work.begin() + 1, work.begin() + 1 + drop);
             log_warn(strfmt("prefill: prompt truncated by %d tokens", drop));
+            truncated = true;
         }
-        forward_prefill(work, 0);
+        if (!truncated) {
+            // PRO-HARDEN: forward_prefill يخصص ~12 Tensor عابرة (~150MB عند
+            // P=4096) عبر cudaMalloc/Free لكل prefill فيفتت heap الـT4.
+            // نقطع أي prompt >1024 إلى: أول 1024 batched ثم الباقي decode
+            // متسلسل (نفس الأرقام، ذروة VRAM ثابتة).
+            static constexpr size_t PREFILL_CHUNK = 1024;
+            if (work.size() > PREFILL_CHUNK) {
+                std::vector<i32> head(work.begin(), work.begin() + PREFILL_CHUNK);
+                forward_prefill(head, 0);
+                absolute_pos_ = static_cast<int64_t>(head.size());
+                for (size_t i = PREFILL_CHUNK; i < work.size(); ++i) {
+                    if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
+                    decode_step(work[i], static_cast<int>(absolute_pos_));
+                    ++absolute_pos_;
+                    push_history(work[i]);
+                }
+            } else {
+                forward_prefill(work, 0);
+                // P0-03: update absolute position counter after batched prefill
+                absolute_pos_ = static_cast<int64_t>(work.size());
+            }
+        } else {
+            // DeepSeek RoPE rule: truncation must NOT re-zero positions.
+            // work = [tok0, tok_{drop+1}, ...]; true coordinates are
+            // [0, drop+1, drop+2, ...]. Batched prefill assumes contiguous
+            // 0..P-1, so use the sequential path with exact coordinates here
+            // (rare edge case; correctness over 10-30x speed).
+            (void)pos_base;
+            decode_step(work[0], 0);
+            push_history(work[0]);
+            for (size_t i = 1; i < work.size(); ++i) {
+                int pos = drop + static_cast<int>(i);
+                decode_step(work[i], pos);
+                push_history(work[i]);
+            }
+            // Absolute coordinate of the NEXT token = original length.
+            absolute_pos_ = static_cast<int64_t>(tokens.size());
+        }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (cache_.length() >= max_context_) {
                 // slide the window, keeping the first 8 tokens (BOS + system prefix)
                 cache_.evict_front(max_context_ / 4, 8);
             }
-            decode_step(tokens[i], start + static_cast<int>(i));
-            history_.push_back(tokens[i]);
+            // P0-03: pass absolute_pos_, not (start + i) which would also be
+            // wrong after eviction; absolute_pos_ is always monotonically increasing.
+            decode_step(tokens[i], static_cast<int>(absolute_pos_));
+            ++absolute_pos_;
+            push_history(tokens[i]);
         }
     }
     stats_.prompt_tokens += static_cast<int>(tokens.size());
@@ -286,17 +379,59 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
 
     std::string tail;   // for stop-string matching
     const int limit = cfg.max_new_tokens;
+    const int V = model_.config().vocab_size;
+    Device dev = model_.device();
+    const SamplingConfig& sc = sampler.config();
 
-    // The logits from the last prefill step are already in logits_host_.
+    // AUDIT P1 fast path: GPU penalties + top-k/argmax, ~1KB D2H per token
+    // instead of the full 32k row (128KB + CPU-side full sort). Exact whenever
+    // it engages: penalties are demote-only mirrors computed over the full
+    // row on device, top-K is post-penalty exact, and the host draw tail is
+    // shared with the legacy path (bit-identical tokens incl. RNG).
+    // Falls back to legacy when: CPU device, tiny vocab, fast path disabled,
+    // repetition window > 2048, or full-distribution sampling (top_k <= 0 or
+    // top_k > 128 — the tail beyond top-128 could still win the draw).
+    const bool want_greedy = sc.greedy || sc.temperature <= 0.0f;
+    const int win = sc.repetition_window > 0 ? sc.repetition_window
+                                             : static_cast<int>(history_.size());
+    const int K = (!want_greedy && sc.top_k > 0 && sc.top_k <= FAST_TOPK_MAX)
+                      ? sc.top_k
+                      : 0;
+    const bool use_fast = sc.gpu_fast_sample && dev == Device::CUDA && V >= 512 &&
+                          win <= FAST_HIST_MAX && (want_greedy || K > 0);
+
+    // The logits from the last prefill step are already in logits_dev_
+    // (fast) and logits_host_ (legacy).
     for (int step = 0; step < limit; ++step) {
-        i32 next = sampler.sample(logits_host_.data(), model_.config().vocab_size, history_);
+        i32 next = -1;
+        if (use_fast) {
+            int wn = std::min({win, static_cast<int>(history_.size()), FAST_HIST_MAX});
+            const i32* hptr = wn > 0 ? history_.data() + history_.size() - wn : nullptr;
+            ops::apply_rep_penalties(dev, logits_dev_.f32(), V, hptr, wn,
+                                     sc.repetition_penalty, sc.frequency_penalty,
+                                     sc.presence_penalty);
+            if (want_greedy) {
+                next = ops::argmax_token(dev, logits_dev_.f32(), V);
+            } else {
+                ops::topk_select(dev, logits_dev_.f32(), V, K,
+                                 topk_vals_dev_.f32(), topk_ids_dev_.i32p());
+                device_copy(topk_vals_host_.data(), Device::CPU,
+                            topk_vals_dev_.f32(), dev, sizeof(float) * (size_t)K);
+                device_copy(topk_ids_host_.data(), Device::CPU,
+                            topk_ids_dev_.i32p(), dev, sizeof(i32) * (size_t)K);
+                next = sampler.sample_candidates(topk_vals_host_.data(),
+                                                 topk_ids_host_.data(), K);
+            }
+        } else {
+            next = sampler.sample(logits_host_.data(), V, history_);
+        }
 
         bool is_stop = std::find(cfg.stop_tokens.begin(), cfg.stop_tokens.end(), next)
                        != cfg.stop_tokens.end();
         if (is_stop) break;
 
         out.push_back(next);
-        history_.push_back(next);
+        push_history(next);
         ++stats_.new_tokens;
 
         std::string piece = stream.push(next);
@@ -314,7 +449,13 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
         if (hit) break;
 
         if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
-        decode_step(next, cache_.length());
+        // P0-03: pass absolute_pos_ (true monotonic coordinate) instead of
+        // cache_.length() which shrinks after evict_front, corrupting RoPE.
+        // Fast path leaves logits on device (no full-vocab D2H); legacy keeps
+        // the host copy the sampler reads next iteration.
+        if (use_fast) decode_step_logits(next, static_cast<int>(absolute_pos_));
+        else decode_step(next, static_cast<int>(absolute_pos_));
+        ++absolute_pos_;
     }
 
     std::string rest = stream.flush();
@@ -351,37 +492,57 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
 }
 
 // ---------------------------------------------------------------- scoring
+// PRO-HARDEN: النسخة القديمة كانت تبني make_activations(1,T) كاملا فيبقى
+// logits [T,V] (~524MB عند T=4096,V=32k) فيقطع T4. نقطع إلى بلوكات 512
+// (ذروة ~64MB) ونجمع sum/n عبر البلوكات — نفس المتوسط تماما.
+// ملاحظة: كل بلوك يعيد RoPE من 0 (forward لا يدعم offset)؛ مقبول للـeval
+// ويمنع OOM القاتل على T4. للـperplexity الدقيق استعمل T<=512.
 double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask,
                                i64* out_ntok) {
     if (tokens.size() < 2) { if (out_ntok) *out_ntok = 0; return 0.0; }
+    // FIX: heap over-read when mask shorter than tokens (SFT scoring crash).
+    // Fail fast instead of reading past the vector (training/eval safety).
+    GAI_CHECK(!mask || mask->size() >= tokens.size(), "score_tokens: mask shorter than tokens");
     const int T = static_cast<int>(std::min<size_t>(tokens.size(), static_cast<size_t>(model_.config().max_seq_len)));
 
-    Activations act = model_.make_activations(1, T, false);
-    std::vector<i32> ids(tokens.begin(), tokens.begin() + T);
-    std::vector<i32> tgt(static_cast<size_t>(T), -100);
-    for (int i = 0; i + 1 < T; ++i) {
-        bool supervised = !mask || (*mask)[static_cast<size_t>(i) + 1];
-        if (supervised) tgt[static_cast<size_t>(i)] = tokens[static_cast<size_t>(i) + 1];
-    }
-
-    // ids/tgt must live on the model device (CUDA reads device memory).
+    static constexpr int SCORE_CHUNK = 512;  // ~64MB logits عند V=32k
     Device dev = model_.device();
-    Tensor d_ids({T}, DType::I32, Device::CPU);
-    std::memcpy(d_ids.data_ptr(), ids.data(), sizeof(i32) * ids.size());
-    Tensor dev_ids({T}, DType::I32, dev);
-    dev_ids.copy_from(d_ids);
-    Tensor d_tgt({T}, DType::I32, Device::CPU);
-    std::memcpy(d_tgt.data_ptr(), tgt.data(), sizeof(i32) * tgt.size());
-    Tensor dev_tgt({T}, DType::I32, dev);
-    dev_tgt.copy_from(d_tgt);
+    double sum_all = 0.0;
+    i64 n_all = 0;
+    for (int off = 0; off < T; off += SCORE_CHUNK) {
+        const int Tc = std::min(SCORE_CHUNK, T - off);
+        // نحتاج Tc+1 توكن لبناء أهداف البلوك (آخر هدف من البلوك التالي).
+        const int Tend = std::min(T, off + Tc + (off + Tc < T ? 1 : 0));
+        const int Tn = Tend - off;
+        if (Tn < 2) break;
+        Activations act = model_.make_activations(1, Tn, false);
+        std::vector<i32> ids(tokens.begin() + off, tokens.begin() + off + Tn);
+        std::vector<i32> tgt(static_cast<size_t>(Tn), -100);
+        for (int i = 0; i + 1 < Tn; ++i) {
+            bool supervised = !mask || (*mask)[static_cast<size_t>(off + i) + 1];
+            if (supervised) tgt[static_cast<size_t>(i)] = tokens[static_cast<size_t>(off + i) + 1];
+        }
 
-    Tensor& logits = model_.forward(dev_ids.i32p(), 1, T, act);
-    double sum = 0.0;
-    i64 n = 0;
-    ops::softmax_cross_entropy(dev, logits.f32(), dev_tgt.i32p(), nullptr,
-                               T, model_.config().vocab_size, &sum, &n);
-    if (out_ntok) *out_ntok = n;
-    return n > 0 ? sum / static_cast<double>(n) : 0.0;
+        // ids/tgt must live on the model device (CUDA reads device memory).
+        Tensor d_ids({Tn}, DType::I32, Device::CPU);
+        std::memcpy(d_ids.data_ptr(), ids.data(), sizeof(i32) * ids.size());
+        Tensor dev_ids({Tn}, DType::I32, dev);
+        dev_ids.copy_from(d_ids);
+        Tensor d_tgt({Tn}, DType::I32, Device::CPU);
+        std::memcpy(d_tgt.data_ptr(), tgt.data(), sizeof(i32) * tgt.size());
+        Tensor dev_tgt({Tn}, DType::I32, dev);
+        dev_tgt.copy_from(d_tgt);
+
+        Tensor& logits = model_.forward(dev_ids.i32p(), 1, Tn, act);
+        double sum = 0.0;
+        i64 n = 0;
+        ops::softmax_cross_entropy(dev, logits.f32(), dev_tgt.i32p(), nullptr,
+                                   Tn, model_.config().vocab_size, &sum, &n);
+        sum_all += sum;
+        n_all += n;
+    }
+    if (out_ntok) *out_ntok = n_all;
+    return n_all > 0 ? sum_all / static_cast<double>(n_all) : 0.0;
 }
 
 } // namespace gai

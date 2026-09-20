@@ -1,14 +1,17 @@
 # Ghassan v1 Pro — Upgraded MoE architecture + training recipe
-# Parameter math (tied lm_head):
-#   tok_emb  : 16000 × 768                        = 12,288,000
+# Parameter math (tied lm_head, 32k vocab — مصحح: كان مكتوب 16k خطأ):
+#   tok_emb  : 32000 × 768                        = 24,576,000 (was 12.2M @16k)
 #   per layer: attn 1,572,864 + moe 15,931,392 + 2×768 norms
 #            = 17,505,792 per layer
 #   26 layers: 26 × 17,505,792                    = 455,150,592
 #   final_norm:                                   = 768
-#   TOTAL:                                        = 467,439,360  (~467M, <= 500M cap)
+#   TOTAL:                                        = 479,727,360  (~480M, <= 500M cap)
+#   (التعليق القديم 467M كان محسوبا على vocab 16k؛ الفعلي 32k هو ~480M)
 # Active per token: attn + top-2 experts + shared ≈ 6.9M/layer
-#   => ~179M + embeddings ≈ 191M active ("200M + MoE")
-#
+#   => ~179M + embeddings ≈ 204M active
+# NOTE: shards_pro لا يبنيها أي سكربت افتراضيا. ابنها بـ:
+#   data_pipeline build --domain ... --out artifacts/shards_pro
+# أو درب --pro بعد convert_data.sh --out artifacts/shards_pro.
 # v1 Pro upgrades:
 #   - Full WSD (Warmup-Stable-Decay) learning rate schedule for optimal MoE convergence
 #   - Extended epoch training (5 passes) over clean, repaired, multi-domain shards
@@ -47,13 +50,14 @@ training:
   device: cuda             # cuda (Kaggle GPU) | cpu
   precision: fp32          # fp32 master weights (stability); export Q4 GGUF after
   gemm_fp16: true          # CUDA: large GEMMs on FP16 tensor cores
-  loss_scale_init: 65536
+  loss_scale_init: 16384     # fp16-safe max (trainer clamps to this; |dlogits| peaks at scale)
   loss_scale_window: 2000
   batch_size: 2
   seq_len: 1024
   grad_accum: 32           # effective 2*1024*32 = 65,536 tokens/step
   max_steps: 0             # 0 = epochs mode
-  epochs: 5                # 5 full passes over the augmented dataset
+  epochs: 5                # stochastic budget ~= 5x shard tokens (random-window
+                             # sampling with replacement, NOT exact corpus passes)
   learning_rate: 3.5e-4
   min_lr_ratio: 0.1
   warmup_steps: 600
