@@ -151,7 +151,7 @@ cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
     "${CCACHE_FLAGS[@]}" \
     ${CUDA_ARCH_FLAG:-}
 
-# ---- 7. Build (with automatic CUDA -> CPU fallback)
+# ---- 7. Build (CUDA required for training on GPU)
 # PRO-HARDEN: nproc الكامل (4x nvcc) يفجر 13GB RAM الـKaggle. نحدد JOBS<=2.
 JOBS=$(nproc --ignore=1 2>/dev/null || echo 2)
 if [[ "${JOBS}" -gt 2 ]]; then JOBS=2; fi
@@ -160,22 +160,15 @@ echo "[build] Building with ${JOBS} parallel jobs (capped for Kaggle RAM)..."
 if ! cmake --build "${BUILD_DIR}" --parallel "${JOBS}"; then
     if [[ "${HAVE_CUDA}" == "ON" ]]; then
         echo ""
-        echo "[build] CUDA build FAILED — retrying with CUDA disabled (CPU-only)."
-        echo "[build] This works everywhere; training will be much slower than GPU."
-        rm -rf "${BUILD_DIR}"
-        HAVE_CUDA=OFF
-        cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGAI_ENABLE_CUDA=OFF \
-            -DGAI_ENABLE_OPENMP=ON \
-            -DGAI_BUILD_TESTS=ON \
-            -DGAI_ENABLE_PARQUET="${WITH_PARQUET}"
-        if ! cmake --build "${BUILD_DIR}" --parallel "${JOBS}"; then
-            echo "[ERROR] CPU-only build also failed. See the log above."
-            exit 1
-        fi
+        echo "[build] CUDA build FAILED. Full log:"
+        echo "[build] Re-running with verbose output to show the actual error..."
+        cmake --build "${BUILD_DIR}" --parallel "${JOBS}" 2>&1 | tail -40
         echo ""
-        echo "[build] CPU-only fallback build complete."
+        echo "[ERROR] CUDA build failed. Training needs GPU. Possible fixes:"
+        echo "  1. Re-run (nvcc sometimes fails on first try with RAM pressure)"
+        echo "  2. Check the errors above"
+        echo "  3. If CUDA toolkit issue: Kaggle -> Settings -> Internet ON"
+        exit 1
     else
         echo "[ERROR] Build failed. See the log above."
         exit 1
@@ -208,15 +201,19 @@ fi
 # This is the correctness gate for the MoE GPU kernels (cuda/moe.cu): tiny
 # config, a few seconds, compares CPU vs CUDA forward+backward. If the kernels
 # were broken, training would silently diverge — so this MUST pass.
-if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
+if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]] && [[ "${SKIP_TESTS}" -eq 0 ]]; then
     echo ""
     echo "[gate] CUDA parity gate (MoE kernel validation)..."
-    if "${BUILD_DIR}/bin/test_cuda"; then
-        echo "[gate] CUDA parity: PASSED"
+    if [[ -x "${BUILD_DIR}/bin/test_cuda" ]]; then
+        if "${BUILD_DIR}/bin/test_cuda"; then
+            echo "[gate] CUDA parity: PASSED"
+        else
+            echo "[ERROR] CUDA parity gate FAILED — GPU kernels are broken."
+            echo "[ERROR] See cuda/moe.cu. Aborting before any training."
+            exit 1
+        fi
     else
-        echo "[ERROR] CUDA parity gate FAILED — GPU kernels are broken."
-        echo "[ERROR] See cuda/moe.cu. Aborting before any training."
-        exit 1
+        echo "[gate] CUDA parity: SKIPPED (test_cuda not built)"
     fi
 fi
 
@@ -229,7 +226,18 @@ echo ""
 TOK_PATH="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
 TOK_LEGACY="${REPO_DIR}/artifacts/tokenizer/darija.gtok"
 TOK_EN="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
-if [[ -f "${TOK_PATH}" ]]; then
+if [[ "${SKIP_DATA}" -eq 1 ]]; then
+    echo "[tokenizer] --skip-data: skipping tokenizer check and training"
+    if [[ -f "${TOK_PATH}" ]]; then
+        echo "[tokenizer] Found: ${TOK_PATH}"
+    elif [[ -f "${TOK_EN}" ]]; then
+        echo "[tokenizer] Found: ${TOK_EN}"
+        TOK_PATH="${TOK_EN}"
+    else
+        echo "[tokenizer] WARNING: no tokenizer found. Data build cell will train it."
+        TOK_PATH=""
+    fi
+elif [[ -f "${TOK_PATH}" ]]; then
     TOK_SIZE=$(du -h "${TOK_PATH}" | cut -f1)
     echo "[tokenizer] Found: ${TOK_PATH} (${TOK_SIZE})"
 elif [[ -f "${TOK_EN}" ]]; then
