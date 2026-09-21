@@ -97,13 +97,17 @@ ParquetTableInfo inspect_parquet(const std::string& path) {
     auto maybe_file = arrow::io::ReadableFile::Open(path);
     if (!maybe_file.ok()) return info;
     std::shared_ptr<arrow::io::RandomAccessFile> file = maybe_file.ValueOrDie();
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    if (!parquet::arrow::OpenFile(file, arrow::default_memory_pool(), &reader).ok()) return info;
+    // Result-based OpenFile: the Status out-param overload was REMOVED in
+    // Arrow 25 (and the old num_rows()/ReadRowGroup-out-param went with it).
+    // The Result spelling below compiles on old AND new Arrow alike.
+    auto maybe_reader = parquet::arrow::OpenFile(file);
+    if (!maybe_reader.ok()) return info;
+    std::unique_ptr<parquet::arrow::FileReader> reader = std::move(maybe_reader).ValueOrDie();
     std::shared_ptr<arrow::Schema> schema;
     if (!reader->GetSchema(&schema).ok()) return info;
     for (int i = 0; i < schema->num_fields(); ++i)
         info.columns.push_back(schema->field(i)->name());
-    info.rows = reader->num_rows();
+    info.rows = reader->parquet_reader()->num_rows();
     return info;
 }
 
@@ -119,11 +123,12 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
             continue;
         }
         std::shared_ptr<arrow::io::RandomAccessFile> file = maybe_file.ValueOrDie();
-        std::unique_ptr<parquet::arrow::FileReader> reader;
-        if (!parquet::arrow::OpenFile(file, arrow::default_memory_pool(), &reader).ok()) {
+        auto maybe_reader = parquet::arrow::OpenFile(file);
+        if (!maybe_reader.ok()) {
             log_warn("parquet: cannot read footer of " + path + "; skipped");
             continue;
         }
+        std::unique_ptr<parquet::arrow::FileReader> reader = std::move(maybe_reader).ValueOrDie();
         std::shared_ptr<arrow::Schema> schema;
         if (!reader->GetSchema(&schema).ok() || schema->num_fields() == 0) {
             log_warn("parquet: no readable schema in " + path + "; skipped");
@@ -131,19 +136,30 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
         }
         std::vector<std::string> cols;
         for (int i = 0; i < schema->num_fields(); ++i) cols.push_back(schema->field(i)->name());
+        // Row counts via the embedded ParquetFileReader: FileReader::num_rows()
+        // was removed in Arrow 25, this spelling is version-stable.
+        const int64_t file_rows = reader->parquet_reader()->num_rows();
+        const int file_groups = reader->parquet_reader()->num_row_groups();
         if (opts.verbose) {
             std::string cl;
             for (size_t i = 0; i < cols.size(); ++i) cl += (i ? "," : "") + cols[i];
             log_info(strfmt("[parquet] %s: %lld rows x %d cols (%s)",
-                            path.c_str(), static_cast<long long>(reader->num_rows()),
+                            path.c_str(), static_cast<long long>(file_rows),
                             static_cast<int>(cols.size()), cl.c_str()));
         }
         // Row-group streaming: one group resident at a time (bounded RAM even
         // for the 275k-row QA table).
-        for (int rg = 0; rg < reader->num_row_groups(); ++rg) {
+        for (int rg = 0; rg < file_groups; ++rg) {
             if (opts.max_rows > 0 && static_cast<size_t>(delivered) >= opts.max_rows) break;
-            std::shared_ptr<arrow::Table> table;
-            if (!reader->ReadRowGroup(rg, &table).ok() || !table || table->num_rows() == 0) {
+            // Result-based ReadRowGroup: the Status out-param overload is
+            // deprecated since Arrow 24 (fatal under our -Werror).
+            auto maybe_table = reader->ReadRowGroup(rg);
+            if (!maybe_table.ok()) {
+                log_warn(strfmt("parquet: unreadable row group %d in %s; skipped", rg, path.c_str()));
+                continue;
+            }
+            std::shared_ptr<arrow::Table> table = maybe_table.ValueOrDie();
+            if (!table || table->num_rows() == 0) {
                 log_warn(strfmt("parquet: unreadable row group %d in %s; skipped", rg, path.c_str()));
                 continue;
             }
