@@ -5,6 +5,18 @@
 #include <filesystem>
 #include <string>
 
+// Third-party headers MUST live at global scope: including Arrow inside
+// `namespace gai` (as this file once did) drags <bitset>/<string>/etc. into
+// gai:: scope and GCC 11 + Arrow 25 fails with
+// "'__throw_out_of_range_fmt' was not declared in this scope" plus cascading
+// unused-function errors. Global scope keeps ::arrow / ::parquet / ::std exact.
+#ifdef GAI_PARQUET
+#include <arrow/api.h>
+#include <arrow/compute/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/reader.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace gai {
@@ -27,11 +39,6 @@ std::vector<std::string> list_parquet_files(const std::string& dir_or_file) {
 }
 
 #ifdef GAI_PARQUET
-
-#include <arrow/api.h>
-#include <arrow/compute/api.h>
-#include <arrow/io/api.h>
-#include <parquet/arrow/reader.h>
 
 // Decode one chunk to UTF-8 strings. Handles the encodings our factory
 // emits (PLAIN + RLE_DICTIONARY over BYTE_ARRAY): plain string/binary
