@@ -221,17 +221,27 @@ LangScore LangId::classify(const std::string& raw) const {
             s.confidence = 0.3;
         }
     } else if (latin_dominant) {
-        if (dar_lt_density >= 0.08 || dar_lt + arabizi >= 2) {
+        // Collision guard (Hermes lake): common English words overlap the
+        // Darija-Latin lexicon (had/hit/sir/fine...), so 2 stray collisions
+        // in clearly-English text used to hijack the tag. Each language wins
+        // only against weaker densities; ties keep the legacy Darija tag.
+        // EN threshold 0.08 (+count>=2 rescue): Hermes short answers
+        // ("A. It compensates...") have few markers but are English.
+        const bool dar_hit = (dar_lt_density >= 0.08 || dar_lt + arabizi >= 2);
+        const bool en_hit  = (en_density >= 0.08 || en >= 2);
+        const bool fr_hit  = (fr_density >= 0.15);
+        if (dar_hit && en_density <= dar_lt_density) {
             s.tag = LangTag::DarijaLatn;
             s.confidence = std::min(1.0, 0.4 + dar_lt_density * 4.0);
-        } else if (fr_density >= 0.15 && fr_density > en_density) {
+        } else if (fr_hit && fr_density > en_density && fr_density >= dar_lt_density) {
             s.tag = LangTag::French;
             s.confidence = std::min(1.0, 0.35 + fr_density * 2.0);
-        } else if (en_density >= 0.08 || en >= 2) {
-            // EN threshold lowered 0.15->0.08 (+count>=2 rescue): Hermes short
-            // answers ("A. It compensates...") have few markers but are English.
+        } else if (en_hit && en_density >= dar_lt_density) {
             s.tag = LangTag::English;
             s.confidence = std::min(1.0, 0.35 + en_density * 2.0);
+        } else if (dar_hit) {
+            s.tag = LangTag::DarijaLatn;
+            s.confidence = std::min(1.0, 0.4 + dar_lt_density * 4.0);
         } else {
             s.tag = LangTag::Other;
             s.confidence = 0.2;

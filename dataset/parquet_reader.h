@@ -1,20 +1,20 @@
 #pragma once
 
-// dataset/parquet_reader.h — native Apache Parquet input (OPTIONAL backend).
+// dataset/parquet_reader.h — native Apache Parquet input (THE lake input).
 //
-// The default build has NO parquet support: the project stays pure C++ and
-// the JSON route (dataset/qa_darija/*.json) needs no extra dependency.
-// Rebuild with -DGAI_ENABLE_PARQUET=ON plus Apache Arrow C++ to enable:
-//   data_pipeline parquet --lake dataset/parquet/by_domain --domain darija_qa ...
+// The default build has NO parquet support: rebuild with
+// -DGAI_ENABLE_PARQUET=ON plus Apache Arrow C++ to enable:
+//   data_pipeline parquet --lake english_parquet --mode chat --domain english_chat ...
 // (kaggle/setup.sh --with-parquet installs Arrow and passes the flag.)
+// There is no JSON file route: the Hermes lake is the only training input.
 //
-// Contract (mirrors json_reader.h: skips, never crashes):
+// Contract (skips, never crashes):
 //   * recursive .parquet discovery, sorted (deterministic order)
 //   * row-group streaming (bounded RAM, never whole-file materialization)
 //   * only UTF-8 string columns are read (String/Binary/LargeString +
-//     dictionary-encoded strings, i.e. exactly what build_qa.py /
-//     build_parquet_lake.py emit with pyarrow+zstd). Anything else is
-//     skipped with a warning, never fatal.
+//     dictionary-encoded strings, i.e. exactly what
+//     tools/convert_hermes_to_parquet.py emits with pyarrow+zstd).
+//     Anything else is skipped with a warning, never fatal.
 //   * per-value byte cap + row cap, malformed rows skipped loudly
 // Narrow on purpose: this reads OUR lake files, not arbitrary parquet.
 

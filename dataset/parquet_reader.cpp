@@ -217,8 +217,7 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
                          const ParquetOptions& /*opts*/) {
     (void)files;
     GAI_FAIL("parquet input needs Apache Arrow: rebuild with -DGAI_ENABLE_PARQUET=ON "
-             "(kaggle/setup.sh --with-parquet), or use the JSON route "
-             "dataset/qa_darija/*.json which needs no extra dependency");
+             "(kaggle/setup.sh --with-parquet). No JSON fallback exists (parquet-only).");
     return 0;
 }
 
