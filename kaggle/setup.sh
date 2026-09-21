@@ -119,18 +119,20 @@ if [[ "${WITH_PARQUET}" == "ON" ]]; then
     echo ""
     echo "[parquet] --with-parquet: installing Apache Arrow C++ (~2-4 min)..."
     if sudo apt-get update -qq 2>/dev/null || apt-get update -qq; then
-        sudo apt-get install -y -q ca-certificates lsb-release wget gnupg 2>/dev/null || \
-        apt-get install -y -q ca-certificates lsb-release wget gnupg
+        sudo apt-get install -y -qq ca-certificates lsb-release wget gnupg 2>/dev/null || \
+        apt-get install -y -qq ca-certificates lsb-release wget gnupg
         CODENAME=$(lsb_release --cs 2>/dev/null || echo jammy)
         echo "[parquet] Ubuntu codename: ${CODENAME}"
         sudo wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-${CODENAME}.deb" -O /tmp/arrow-apt.deb 2>/dev/null || \
         wget -q "https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-${CODENAME}.deb" -O /tmp/arrow-apt.deb
-        sudo apt-get install -y -q /tmp/arrow-apt.deb 2>/dev/null || \
-        apt-get install -y -q /tmp/arrow-apt.deb
+        sudo apt-get install -y -qq /tmp/arrow-apt.deb 2>/dev/null || \
+        apt-get install -y -qq /tmp/arrow-apt.deb
         sudo apt-get update -qq 2>/dev/null || apt-get update -qq
     fi
-    if sudo apt-get install -y -q libarrow-dev libparquet-dev 2>/dev/null || \
-       apt-get install -y -q libarrow-dev libparquet-dev; then
+    # NOTE: -qq (not -q) on purpose: apt's per-package Get: lines freeze the
+    # Kaggle browser tab on long installs. Errors still surface (set -e + tail).
+    if sudo apt-get install -y -qq libarrow-dev libparquet-dev 2>/dev/null || \
+       apt-get install -y -qq libarrow-dev libparquet-dev; then
         echo "[parquet] Arrow installed; CMake will enable the native lake route."
     else
         echo ""
@@ -155,7 +157,7 @@ echo "[build] Configuring with CUDA=${HAVE_CUDA} PARQUET=${WITH_PARQUET}..."
 CCACHE_FLAGS=()
 if command -v ccache &>/dev/null; then
     CCACHE_FLAGS=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
-elif sudo apt-get install -y ccache 2>/dev/null || apt-get install -y ccache 2>/dev/null; then
+elif sudo apt-get install -y -qq ccache 2>/dev/null || apt-get install -y -qq ccache 2>/dev/null; then
     CCACHE_FLAGS=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
     echo "[build] ccache enabled"
 fi
