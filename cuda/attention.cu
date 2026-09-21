@@ -165,7 +165,6 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
     float* o = out + size_t(b) * qs + (size_t(t) * H + h) * hd;
     int j0 = (window > 0 && t + 1 > window) ? t + 1 - window : 0;
-    int len = t + 1 - j0;
     // scores in global probs row scratch (probs required for SWA training path;
     // inference prefill passes probs=null and uses registers only via swa path below).
     // To keep this kernel simple it recomputes per lane with warp reductions.
@@ -206,7 +205,6 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
         for (int j = lane; j < j0; j += WARP_A) pr[j] = 0.0f;
         for (int j = t + 1 + lane; j < T; j += WARP_A) pr[j] = 0.0f;
     }
-    (void)len;
 }
 
 void attention_forward_ex(const float* q, const float* k, const float* v,
