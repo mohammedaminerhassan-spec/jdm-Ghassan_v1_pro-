@@ -145,12 +145,14 @@ if(GAI_HAVE_CUDA AND GAI_ENABLE_NCCL)
     endif()
 endif()
 
-# ---------------------------------------------------------------- Parquet (optional lake input)
+# ---------------------------------------------------------------- Parquet (THE lake input, Hermes English)
 # Native .parquet reading needs Apache Arrow C++ (large dependency, absent on
-# most machines). OFF by default: the JSON route (dataset/qa_darija/*.json)
-# needs no dependency and always works. kaggle/setup.sh --with-parquet
-# installs Arrow and turns this ON. Never fatal when missing: configure
-# degrades to JSON-only with a warning (same graceful pattern as NCCL).
+# most machines). OFF by default for local CPU builds; Kaggle training MUST
+# use kaggle/setup.sh --with-parquet which installs Arrow and turns this ON.
+# There is NO JSON file route anymore (parquet-only project): Hermes was
+# converted once via tools/convert_hermes_to_parquet.py into
+# english_parquet/english_chat_part*.parquet + english_instruction_part*.parquet.
+# Without Arrow, `data_pipeline parquet` fails loudly (never silent).
 set(GAI_HAVE_PARQUET OFF)
 if(GAI_ENABLE_PARQUET)
     find_package(Arrow QUIET)
@@ -161,7 +163,7 @@ if(GAI_ENABLE_PARQUET)
         target_compile_definitions(gai_core PUBLIC GAI_PARQUET=1)
         message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} (native lake input enabled)")
     else()
-        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> JSON route only (dataset/qa_darija/*.json needs no dependency)")
+        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled (install Arrow: kaggle/setup.sh --with-parquet)")
     endif()
 endif()
 

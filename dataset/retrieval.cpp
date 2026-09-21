@@ -12,6 +12,25 @@ namespace fs = std::filesystem;
 namespace gai {
 
 std::string retrieval_normalize(const std::string& s) {
+    // PARQUET-ONLY EN fix: Arabizi digit folding (3->a,7->h,9->q) corrupted
+    // English numbers ("What is 3+4?" -> "what is a"). Apply it ONLY when the
+    // text looks Darija-like (Arabic bytes or arabizi digit-inside-word);
+    // pure English keeps its digits so math/RAG grounding stays exact.
+    bool has_arabic = false;
+    for (size_t k = 0; k < s.size(); ++k) {
+        if (static_cast<unsigned char>(s[k]) >= 0x80) { has_arabic = true; break; }
+    }
+    bool arabizi_like = false;
+    for (size_t k = 0; k + 1 < s.size() && !arabizi_like; ++k) {
+        char a = s[k], b = s[k + 1];
+        bool a_al = (a >= 'a' && a <= 'z') || (a >= 'A' && a <= 'Z');
+        bool b_al = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+        if ((a_al && (b == '3' || b == '7' || b == '9' || b == '5' || b == '2')) ||
+            ((a == '3' || a == '7' || a == '9' || a == '5' || a == '2') && b_al)) {
+            arabizi_like = true;
+        }
+    }
+    const bool fold_digits = has_arabic || arabizi_like;
     std::string o;
     o.reserve(s.size());
     bool space = true; // collapse + trim
@@ -37,14 +56,18 @@ std::string retrieval_normalize(const std::string& s) {
             ++i;
         } else if (c >= '0' && c <= '9') {
             // Arabizi digits -> latin letters so "3likom" == "alikom",
-            // "7al" == "hal", "9ahwa" == "qahwa". This is the paraphrase
-            // bridge the user asked for: different spelling, same intent.
-            if (c == '3') o += 'a';
-            else if (c == '7') o += 'h';
-            else if (c == '9') o += 'q';
-            else if (c == '5') o += 'k'; // kh -> k (close enough for match)
-            else if (c == '2') o += 'a'; // hamza -> a
-            else o += s[i];
+            // "7al" == "hal", "9ahwa" == "qahwa". English-only queries keep
+            // digits (fold_digits==false) so "3+4" never becomes "a".
+            if (fold_digits) {
+                if (c == '3') o += 'a';
+                else if (c == '7') o += 'h';
+                else if (c == '9') o += 'q';
+                else if (c == '5') o += 'k'; // kh -> k (close enough for match)
+                else if (c == '2') o += 'a'; // hamza -> a
+                else o += s[i];
+            } else {
+                o += s[i];
+            }
             space = false;
             ++i;
         } else {

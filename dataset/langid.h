@@ -25,10 +25,12 @@ struct LangScore {
     double  darija_score = 0.0;      // darija-marker density
     double  msa_score = 0.0;
     double  french_score = 0.0;
+    double  english_score = 0.0;     // english-marker density (Hermes lake)
     double  arabizi_score = 0.0;     // digit-as-letter density
     double  arabic_ratio = 0.0;
     double  latin_ratio = 0.0;
     bool    is_darija() const { return tag == LangTag::DarijaArab || tag == LangTag::DarijaLatn; }
+    bool    is_english() const { return tag == LangTag::English; }
 };
 
 // Rule + lexicon based identifier tuned for our exact problem: separating Moroccan

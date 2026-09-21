@@ -461,6 +461,62 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
     return v;
 }
 
+// ================================================================ english quality
+// PARQUET-ONLY EN profile: keeps Hermes multiple-choice ("A."), code and
+// math that the Darija defaults drop. Single source of truth for --style-mode en.
+QualityConfig english_quality_config() {
+    QualityConfig c;
+    c.max_symbol_ratio = 0.35;   // code: = * / { } ; are legitimate
+    c.max_digit_ratio = 0.50;    // math: numbers dominate short answers
+    c.max_upper_ratio = 0.60;    // "A. It compensates..." is uppercase-heavy
+    c.max_repeat_line = 0.30;
+    c.max_word_repeat = 0.40;    // short answers repeat the prompt words
+    c.min_letter_ratio = 0.30;
+    c.min_words = 1;             // CRITICAL: keeps "A." multiple-choice answers
+    c.max_word_length = 80;      // URLs / code tokens are long
+    c.require_arabic_or_latin = true;
+    c.reject_ai_disclaimers = false;  // handled by hard list below (not the full Darija list)
+    c.reject_placeholders = true;
+    return c;
+}
+
+static bool has_hard_disclosure_en(const std::string& text) {
+    static const char* kHard[] = {
+        "as an ai", "as a language model", "as an ai language model",
+        "i am a large language model", "i cannot fulfill this request",
+    };
+    std::string low = to_lower_ascii(text);
+    for (const char* p : kHard) {
+        if (low.find(p) != std::string::npos) return true;
+    }
+    return false;
+}
+
+QualityVerdict quality_check_english(const std::string& text, const QualityConfig& cfg) {
+    QualityConfig c = cfg;
+    // defaults are the EN profile when the caller passes a default cfg
+    if (c.min_words == 2 && c.min_letter_ratio == 0.45) c = english_quality_config();
+    QualityVerdict v = quality_check(text, c);
+    if (!v.accept) {
+        // single-letter / "A." answers fail word stats: rescue them explicitly.
+        std::string t = text;
+        size_t a = t.find_first_not_of(" \t\n\r");
+        size_t b = t.find_last_not_of(" \t\n\r");
+        std::string s = (a == std::string::npos) ? "" : t.substr(a, b - a + 1);
+        if ((s.size() == 1 || s.size() == 2) && !s.empty()) {
+            v.accept = true; v.reason.clear(); return v;
+        }
+        if (s.size() <= 4 && (s[0] >= 'A' && s[0] <= 'Z')) {
+            v.accept = true; v.reason.clear(); return v;
+        }
+        return v;
+    }
+    if (has_hard_disclosure_en(text)) {
+        v.accept = false; v.reason = "ai_disclosure_hard"; return v;
+    }
+    return v;
+}
+
 // ================================================================ toxicity
 ToxicityResult check_toxicity(const std::string& text) {
     // Conservative rule lists. Word-boundary matching to avoid false positives on

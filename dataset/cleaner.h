@@ -80,6 +80,15 @@ struct QualityVerdict {
 
 QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg = {});
 
+// PARQUET-ONLY EN profile (Hermes lake: 522k chat + 478k instruction).
+// Relaxed for English code/math/multiple-choice:
+//   min_words=1 (keeps "A."/"D." answers that Darija min_words=2 drops),
+//   min_letter_ratio=0.30 (code has symbols), max_symbol=0.35, max_digit=0.50,
+//   hard AI-disclosure only (normal politeness kept).
+// Use when --style-mode en; Darija keeps quality_check().
+QualityConfig english_quality_config();
+QualityVerdict quality_check_english(const std::string& text, const QualityConfig& cfg = {});
+
 // ---------------------------------------------------------------- toxicity
 // Deliberately conservative: rule lists over slurs/explicit content in Arabic,
 // Darija, French and English. Reduces the worst outputs; not a safety guarantee.

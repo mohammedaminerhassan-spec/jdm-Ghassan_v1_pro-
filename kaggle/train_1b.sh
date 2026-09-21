@@ -49,7 +49,9 @@ done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
-TOK="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
+# PARQUET-ONLY EN: override for English-Pro runs:
+#   TOK=artifacts/tokenizer/english32k.gtok CONFIG_PT=configs/en_pro.yaml ... bash kaggle/train_1b.sh
+TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/darija32k.gtok}"
 # PRO-HARDEN: fallback الصامت إلى 16k كان يضيع run كاملا ثم يفشل عند البوابة.
 # نفشل فورا إن غاب 32k (setup.sh يدربه تلقائيا).
 if [[ ! -f "${TOK}" ]]; then

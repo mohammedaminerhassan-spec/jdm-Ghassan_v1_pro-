@@ -99,8 +99,12 @@ public:
     BenchmarkReport run();
 
     // Loads .jsonl suites from a directory; falls back to the built-in suite.
+    // PARQUET-ONLY EN: builtin_suite() is Darija; builtin_suite_en() is the
+    // Hermes English suite (40 items: conversation, instruction, reasoning,
+    // coding, hallucination, toxicity). Use --suite-en or categories filter.
     static std::vector<EvalItem> load_suite(const std::string& dir);
     static std::vector<EvalItem> builtin_suite();
+    static std::vector<EvalItem> builtin_suite_en();
     static void write_suite(const std::string& path, const std::vector<EvalItem>& items);
 
 private:

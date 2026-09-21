@@ -26,6 +26,8 @@ out/
 # Training artifacts (large, local/Kaggle only)
 artifacts/
 kaggle_upload/
+english_parquet/
+data/
 *.parquet
 *.ckpt
 *.gai
@@ -34,6 +36,7 @@ kaggle_upload/
 *.gtok
 *.jsonl
 !evaluation/datasets/**/*.jsonl
+corpus_*.txt
 
 # Kaggle / local temp
 *.log

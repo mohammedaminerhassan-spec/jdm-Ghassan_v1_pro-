@@ -1,37 +1,20 @@
 #pragma once
 
-// dataset/json_reader.h — the JSON ingestion path for Ghassan AI training.
+// dataset/json_reader.h — PARQUET-ONLY project: JSON file ingestion REMOVED.
 //
-// This is THE data format of the project: big JSON/JSONL corpora
-// (conversations, instructions, plain text) -> .gbin training shards.
-// No Parquet, no Python, no external dependencies: pure C++.
+// Hermes (openhermes2_5.json, 1M rows) was converted once via
+//   python tools/convert_hermes_to_parquet.py
+// into english_parquet/english_chat_part*.parquet +
+// english_parquet/english_instruction_part*.parquet
+// and training reads ONLY that lake via dataset/parquet_reader.h
+// (data_pipeline parquet --mode chat --style-mode en --keep-case).
 //
-// Accepted layouts (auto-detected per file, mixed layouts allowed in JSONL):
-//   1. JSONL: one JSON object per line (best for huge corpora, streams).
-//   2. JSON array of objects:  [{...}, {...}]
-//   3. Single JSON object:     {...}
-// Accepted object schemas (first match wins, case-sensitive keys):
-//   chat:        {"messages":[{"role":"user","content":"..."}, ...]}
-//                role aliases: human->user, gpt/assistant/ai->assistant,
-//                from/value pairs, "conversation"/"turns" arrays.
-//   instruction: {"instruction":"...","input":"...","output":"..."}
-//                (+ optional "system")
-//   prompt:      {"prompt":"...","completion":"..."}  (also "question"/
-//                "answer", "problem"/"solution", "instruction"/"response").
-//                NOTE: bare {id,question,answer} shards (e.g. the 86-file
-//                English corpus) ALSO match here intentionally and train as
-//                user->assistant turns with assistant-only loss. They remain
-//                loadable by load_qa_json (dataset/retrieval.h) for the BM25
-//                index — the two readers share the layout on purpose.
-//   text:        {"text":"..."} (also "content","sentence","document",
-//                "body","passage","story","article" — configurable)
-// Chat/instruction/prompt docs become SFT documents: the pipeline encodes
-// them with ChatTemplate so the loss mask supervises ASSISTANT tokens only.
-// Plain-text docs become pretraining documents (mask = supervise all).
-//
-// Safety: bounded nesting depth, per-value byte cap, whole-file size cap,
-// strict UTF-8-preserving string parsing with \uXXXX + surrogate support.
-// Malformed lines/objects are skipped with a warning, never fatal.
+// This header keeps the MINIMAL chat-document types + the single
+// messages_json parser used by the parquet chat route. File-based JSON
+// ingestion (read_json_docs / read_json_dir / load_json_texts /
+// inspect_json) was DELETED on purpose: a second ingestion path silently
+// diverges (the old "conversations" plural key dropped 100% of Hermes
+// docs) and wastes T4 hours. Use the Parquet lake, never JSON files.
 
 #include "core/common.h"
 #include "tokenizer/chat_template.h"
@@ -61,30 +44,16 @@ struct JsonReaderOptions {
 
 using JsonDocCallback = std::function<void(const JsonDoc&)>;
 
-// Reads one file (.json array / object, or .jsonl lines) and calls `cb`
-// once per extracted document. Returns total documents delivered.
-// A single bad line/object never aborts the file.
-size_t read_json_docs(const std::string& path, JsonDocCallback cb,
-                      const JsonReaderOptions& opts = {});
+// PARQUET-ONLY: file-based JSON ingestion is REMOVED (was read_json_docs /
+// read_json_dir / load_json_texts / inspect_json). Any call is a recipe bug:
+// convert the corpus once with tools/convert_hermes_to_parquet.py and use
+//   data_pipeline parquet --mode chat --lake english_parquet ...
+// Keeping the old path would re-introduce the silent-drop divergence.
 
-// Recursively scans `dir` for *.json / *.jsonl (sorted) and reads them all.
-// If `dir` is a single file it is read directly. Returns total documents.
-size_t read_json_dir(const std::string& dir, JsonDocCallback cb,
-                     const JsonReaderOptions& opts = {});
-
-// PRO-EN: يحلل نص JSON واحد (object) إلى JsonDoc بنفس object_to_doc المستعمل
-// لمسار الملفات. يستعمله مسار parquet --mode chat لأعمدة messages_json دون
-// تكرار الـparser (نفس السكيما، نفس الحدود، نفس skip الصامت للشاذ).
+// Parses ONE {"messages":[...]} object text (parquet messages_json column)
+// into a JsonDoc with the same schema mapping + caps as before. Returns
+// false on malformed text (caller counts it as skipped, never fatal).
 bool doc_from_json_text(const std::string& text, JsonDoc& doc,
                         const JsonReaderOptions& opts = {});
-
-// Convenience: collect plain-text views (chat docs become "user\nassistant"
-// joined text) into a vector. For training shards prefer the callbacks.
-std::vector<std::string> load_json_texts(const std::string& path,
-                                         const JsonReaderOptions& opts = {});
-
-// Prints schema statistics for a file: format, doc count, schema mix,
-// longest values. Used by `data_pipeline json-inspect`.
-void inspect_json(const std::string& path);
 
 } // namespace gai

@@ -29,16 +29,18 @@ using namespace gai;
 
 static void usage() {
     std::cout <<
-    "data_pipeline - dataset construction for Ghassan AI\n\n"
+    "data_pipeline - dataset construction for Ghassan AI (PARQUET-ONLY)\n\n"
+    "Hermes JSON was converted once:\n"
+    "  python tools/convert_hermes_to_parquet.py --input data/openhermes2_5.json --out english_parquet\n"
+    "Training reads ONLY the lake (no JSON file route):\n"
+    "  data_pipeline parquet --lake english_parquet --tokenizer tok.gtok --out artifacts/shards_en\n\n"
     "usage:\n"
-    "  data_pipeline json     --dir <json-dir> --tokenizer tok.gtok --out artifacts/shards\n"
+    "  data_pipeline parquet  --lake <parquet-dir> --tokenizer tok.gtok --out artifacts/shards\n"
     "  data_pipeline synth    --out data/synth.jsonl --n 50000\n"
     "  data_pipeline build    --tokenizer tok.gtok --out artifacts/shards \\\n"
     "                         [--text <file|dir>] [--chat <file.jsonl>] [--synth <n>]\n"
     "  data_pipeline inspect  --shards artifacts/shards --tokenizer tok.gtok\n"
-    "  data_pipeline json-inspect --file <file.json|jsonl>\n"
-    "  data_pipeline tok-info --tokenizer tok.gtok\n"
-    "  data_pipeline dump-text --dir <json-dir> --out corpus.txt\n\n"
+    "  data_pipeline tok-info --tokenizer tok.gtok\n\n"
   "  data_pipeline csvs --dir <csv-root> --out corpus_csv.txt\n"
   "  data_pipeline parquet --lake dataset/parquet/by_domain --tokenizer tok.gtok\n"
   "                         --out artifacts/shards --domain darija_qa\n"
@@ -68,33 +70,10 @@ static void usage() {
     "  --query <text>         user question (paraphrases match by shared words)\n"
     "  --top <n>              hits to show                  [3]\n"
     "  --min-score <f>        hide hits below this score    [0]\n\n"
-  "json options (THE training-data path: JSON/JSONL -> .gbin shards):\n"
-  "  --dir <dir>            directory with *.json / *.jsonl (recursive, or one file)\n"
-  "  --tokenizer <path>     .gtok tokenizer (required)\n"
-  "  --out <dir>            shard output directory        [artifacts/shards]\n"
-  "  --val-ratio <f>        validation fraction           [0.005]\n"
-  "  --shard-tokens <n>     tokens per shard              [50000000]\n"
-  "  --seq-len <n>          max tokens per window (long docs split, not cut) [4096]\n"
-  "  --domain <name>        domain label -> train_<domain>_*.gbin (for data.mix)\n"
-    "  --min-keep <n>         fail if fewer docs kept       [1]\n"
-    "  --keep-robotic       do not apply the anti-boilerplate filter\n"
-  "  --style-mode <m>     darija|en|off: darija = full list [default];\n"
-  "                       en = hard AI-disclosure only (for English corpora);\n"
-  "                       off = no style filtering\n"
-  "  --keep-case          preserve Latin case (REQUIRED with a --keep-case\n"
-  "                       tokenizer; default lowercases Latin for Darija)\n"
-  "  --no-dedup           skip deduplication\n"
-  "  --expect-vocab <n>   fail unless tokenizer vocab == n (0 = skip check)\n\n"
-  "  accepted doc schemas (auto-detected per object):\n"
-  "    chat:        {\"messages\":[{\"role\":\"user\",\"content\":\"...\"}, ...]}\n"
-  "                 (also uuid/license/reasoning/capability_target extras: ignored;\n"
-  "                  files >2GiB stream as JSONL; long docs split into windows)\n"
-  "    instruction: {\"instruction\":\"...\",\"input\":\"...\",\"output\":\"...\"}\n"
-  "    prompt:      {\"prompt\":\"...\",\"completion\":\"...\"} (also question/answer)\n"
-  "    text:        {\"text\":\"...\"} (also content/sentence/document/...)\n"
-  "  chat/instruction/prompt docs get SFT loss masks (assistant only);\n"
-  "  plain-text docs get full masks (pretraining).\n\n"
-  "parquet options (NATIVE lake input: .parquet -> .gbin shards, same masks):\n"
+  "parquet options (THE training-data path: .parquet lake -> .gbin shards):\n"
+  "  Hermes lake: english_parquet/english_chat_part*.parquet +\n"
+  "               english_parquet/english_instruction_part*.parquet\n"
+  "               (built once by tools/convert_hermes_to_parquet.py)\n"
   "  --lake <dir>           lake dir or single .parquet file [dataset/parquet/by_domain]\n"
   "  --dir <dir>            alias for --lake\n"
   "  --match <substr>       only files whose NAME contains substr (per-domain\n"
@@ -357,9 +336,10 @@ struct ShardBuild {
     }
 
     // One JsonDoc (chat or text) through the full clean -> filter -> dedup ->
-    // tokenize -> shard path. Shared verbatim by the json and parquet routes.
+    // tokenize -> shard path. PARQUET-ONLY route (Hermes lake).
     void on_doc(const JsonDoc& doc) {
         ++ctr.raw;
+        const bool is_en = (style_mode == "en");
         if (doc.is_chat) {
             if (doc.messages.empty()) return;
             // DeepSeek data rule: chat turns get the SAME clean+quality
@@ -372,16 +352,24 @@ struct ShardBuild {
                     std::string cl;
                     if (!cleaner.clean_line(m.content, cl, cs_chat)) { ++ctr.quality_dropped; return; }
                     if (cl.size() < 2) { ++ctr.quality_dropped; return; }
-                    if (!quality_check(cl).accept) { ++ctr.quality_dropped; return; }
+                    // EN profile keeps "A." multiple-choice + code/math.
+                    bool qok = is_en ? quality_check_english(cl).accept
+                                     : quality_check(cl).accept;
+                    if (!qok) { ++ctr.quality_dropped; return; }
                     cleaned_msgs.push_back(Message{m.role, cl});
                 }
             }
             std::string key;
             for (const auto& m : cleaned_msgs) key += m.content + "\n";
             for (size_t i = 0; i < cleaned_msgs.size(); ++i) {
-                const auto& m = cleaned_msgs[i];
+                auto& m = cleaned_msgs[i];
                 if (check_toxicity(m.content).toxic) { ++ctr.toxic_dropped; return; }
-                if (scan_pii(m.content).any()) { ++ctr.blocked; return; }
+                // EN: redact PII (keep the math/code doc) instead of dropping
+                // the whole conversation; Darija keeps the strict drop.
+                if (is_en) {
+                    PiiReport r = scan_pii(m.content);
+                    if (r.any()) m.content = redact_pii(m.content, nullptr);
+                } else if (scan_pii(m.content).any()) { ++ctr.blocked; return; }
                 // PRO-EN: style gate per --style-mode. darija = legacy full
                 // list; en = hard AI-disclosure only (normal English
                 // politeness like "Of course!"/"Certainly!" is KEPT).
@@ -465,43 +453,14 @@ struct ShardBuild {
     }
 };
 
-static int cmd_json(const Args& args) {
-    ShardBuild b;
-    b.init_tokenizer(args);
-    b.init_options(args);
-    std::string json_dir = args.str("dir", ".");
-
-    // ---- collect json files (RECURSIVE: datasets may be nested in subfolders)
-    std::vector<std::string> json_files;
-    std::error_code ec;
-    if (fs::is_regular_file(json_dir, ec)) {
-        json_files.push_back(json_dir);
-    } else {
-        for (const auto& e : fs::recursive_directory_iterator(json_dir, ec)) {
-            if (!e.is_regular_file()) continue;
-            std::string ext = e.path().extension().string();
-            for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (ext == ".json" || ext == ".jsonl") json_files.push_back(e.path().string());
-        }
-    }
-    std::sort(json_files.begin(), json_files.end());
-    if (json_files.empty()) {
-        log_error("no .json/.jsonl files found in: " + json_dir);
-        return 1;
-    }
-    log_info(strfmt("[json] found %zu file(s) in %s", json_files.size(), json_dir.c_str()));
-
-    JsonReaderOptions ropts;
-    ropts.verbose = false;
-
-    for (const auto& jfile : json_files) {
-        log_info("[json] processing: " + jfile);
-        size_t file_docs = read_json_docs(jfile, [&](const JsonDoc& doc) { b.on_doc(doc); }, ropts);
-        log_info(strfmt("  -> %s docs so far (this file: %zu)",
-                        human_count(b.ctr.raw).c_str(), file_docs));
-    }
-
-    return b.finish(args, "json pipeline report");
+// PARQUET-ONLY: `data_pipeline json` was REMOVED. Hermes JSON was converted
+// once via tools/convert_hermes_to_parquet.py into english_parquet/.
+// Use: data_pipeline parquet --lake english_parquet --mode chat ...
+static int cmd_json_removed(const Args& /*args*/) {
+    log_error("REMOVED: `data_pipeline json` no longer exists (parquet-only project). "
+              "Convert once: python tools/convert_hermes_to_parquet.py --input data/openhermes2_5.json --out english_parquet "
+              "then: data_pipeline parquet --lake english_parquet --mode chat --style-mode en --keep-case ...");
+    return 1;
 }
 
 static int cmd_parquet(const Args& args) {
@@ -512,16 +471,15 @@ static int cmd_parquet(const Args& args) {
             std::cout << "parquet=native\n";
             return 0;
         }
-        std::cout << "parquet=unavailable (rebuild with -DGAI_ENABLE_PARQUET=ON; JSON route works)\n";
+        std::cout << "parquet=unavailable (rebuild with -DGAI_ENABLE_PARQUET=ON; kaggle/setup.sh --with-parquet)\n";
         return 2;
     }
     // Fail BEFORE opening shard writers: without Arrow the row stream below
     // throws, and unwinding would flush header-only empty shards into the
-    // output dir (they would then masquerade as a built darija_qa domain).
+    // output dir (they would then masquerade as a built domain).
     if (!parquet_available()) {
         log_error("parquet input needs Apache Arrow: rebuild with -DGAI_ENABLE_PARQUET=ON "
-                  "(kaggle/setup.sh --with-parquet), or use the JSON route "
-                  "dataset/qa_darija/*.json which needs no extra dependency");
+                  "(kaggle/setup.sh --with-parquet). JSON file route was REMOVED (parquet-only).");
         return 1;
     }
     ShardBuild b;
@@ -680,12 +638,9 @@ static int cmd_parquet(const Args& args) {
     return b.finish(args, "parquet pipeline report");
 }
 
-static int cmd_json_inspect(const Args& args) {
-    std::string file = args.str("file");
-    GAI_CHECK(!file.empty(), "--file is required");
-    inspect_json(file);
-    return 0;
-}
+// PARQUET-ONLY: `json-inspect` REMOVED (no JSON file route).
+// Inspect the lake instead: data_pipeline parquet --lake english_parquet ...
+// (row counts + schema via the parquet report) or python pq.read_table.
 
 // Prints the ACTUAL vocabulary size stored in a .gtok file (parseable line
 // first, for scripts). This is the fail-loud gate against silently building
@@ -1170,92 +1125,10 @@ static int cmd_jsons(const Args& args) {
     return 0;
 }
 
-// ================================================================ dump-text command
-// Dumps cleaned JSON/JSONL text to a plain one-doc-per-line corpus, ready
-// for train_tokenizer (BPE needs raw text, not .gbin shards).
-static int cmd_dump_text(const Args& args) {
-    std::string json_dir = args.str("dir", ".");
-    std::string outpath     = args.str("out", "corpus.txt");
-    const int min_chars     = static_cast<int>(args.num("min-chars", 10));
-
-    if (auto pp = fs::path(outpath).parent_path(); !pp.empty())
-        fs::create_directories(pp);
-    std::ofstream out(outpath, std::ios::binary);
-    GAI_CHECK(out.good(), "cannot write: " + outpath);
-
-    Cleaner cleaner;
-    // PRO-EN: --keep-case preserves Latin case in the BPE corpus too (must
-    // match the train_tokenizer --keep-case flag for the same model).
-    if (args.flag("keep-case", false)) {
-        CleanConfig cc;
-        cc.normalizer.lowercase_latin = false;
-        cleaner = Cleaner(cc);
-        log_info("[dump] keep-case: Latin capitalization preserved");
-    }
-    CleanStats cs;
-    JsonReaderOptions opts;
-    opts.verbose = true;
-
-    u64 raw = 0, kept = 0;
-    auto on_text = [&](const std::string& text) {
-        ++raw;
-        std::string cleaned;
-        if (!cleaner.clean_line(text, cleaned, cs)) return;
-        if (static_cast<int>(cleaned.size()) < min_chars) return;
-        for (char& ch : cleaned)
-            if (ch == '\n' || ch == '\r') ch = ' ';
-        out << cleaned << '\n';
-        ++kept;
-    };
-    if (fs::is_regular_file(json_dir)) {
-        log_info("[dump] processing: " + json_dir);
-        read_json_docs(json_dir, [&](const JsonDoc& d) {
-            if (d.is_chat) {
-                for (const auto& m : d.messages) on_text(m.content);
-            } else {
-                on_text(d.text);
-            }
-        }, opts);
-    } else {
-        std::vector<std::string> json_files;
-        std::error_code ec;
-        for (const auto& e : fs::recursive_directory_iterator(json_dir, ec)) {
-            if (!e.is_regular_file()) continue;
-            std::string ext = e.path().extension().string();
-            for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (ext == ".json" || ext == ".jsonl") json_files.push_back(e.path().string());
-        }
-        std::sort(json_files.begin(), json_files.end());
-        if (json_files.empty()) {
-            log_error("no .json/.jsonl files found in: " + json_dir);
-            return 1;
-        }
-        log_info(strfmt("[dump] found %zu file(s) in %s",
-                        json_files.size(), json_dir.c_str()));
-        for (const auto& jfile : json_files) {
-            log_info("[dump] processing: " + jfile);
-            read_json_docs(jfile, [&](const JsonDoc& d) {
-                if (d.is_chat) {
-                    for (const auto& m : d.messages) on_text(m.content);
-                } else {
-                    on_text(d.text);
-                }
-            }, opts);
-        }
-    }
-    out.close();
-    GAI_CHECK(out.good(), "corpus write failed");
-
-    log_info("\n==================== dump-text report ====================");
-    log_info(strfmt("  raw strings  : %s", human_count(raw).c_str()));
-    log_info(strfmt("  kept lines   : %s", human_count(kept).c_str()));
-    log_info(strfmt("  output       : %s", outpath.c_str()));
-    log_info("  clean: " + cs.summary());
-    log_info("===========================================================");
-    log_info("  next: train_tokenizer --input " + outpath +
-             " --vocab 16000 --output artifacts/tokenizer/darija.gtok");
-    return 0;
-}
+// PARQUET-ONLY: `dump-text` (JSON->corpus) REMOVED.
+// BPE corpus comes from the lake instead:
+//   python tools/parquet_to_corpus.py --lake english_parquet --out corpus_en.txt --keep-case
+// (or data_pipeline csvs for Darija tables). No JSON file route.
 
 static std::vector<std::string> collect_files(const std::string& path) {
     std::vector<std::string> files;
@@ -1643,11 +1516,10 @@ int main(int argc, char** argv) {
     if (cmd.empty() || args.flag("help")) { usage(); return cmd.empty() ? 1 : 0; }
 
     try {
-        if (cmd == "json")            return cmd_json(args);
+        if (cmd == "json" || cmd == "json-inspect" || cmd == "dump-text")
+            return cmd_json_removed(args);
         if (cmd == "parquet")         return cmd_parquet(args);
-        if (cmd == "json-inspect")    return cmd_json_inspect(args);
         if (cmd == "tok-info")        return cmd_tok_info(args);
-        if (cmd == "dump-text")       return cmd_dump_text(args);
         if (cmd == "csvs")            return cmd_csvs(args);
         if (cmd == "csv2json")        return cmd_csv2json(args);
         if (cmd == "jsons")           return cmd_jsons(args);

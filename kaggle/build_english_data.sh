@@ -42,9 +42,13 @@ if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
         fi
     done
 fi
-# Local/vendored fallback: data shipped INSIDE the project (kaggle_upload/).
+# Local fallbacks (in order):
+#   1. ./english_parquet (output of tools/convert_hermes_to_parquet.py, 522k chat + 478k inst)
+#   2. kaggle_upload/english_parquet (vendored inside the project zip)
 if [[ -z "${EN_DIR}" || ! -d "${EN_DIR}" ]]; then
-    if [[ -n "$(find "${REPO_DIR}/kaggle_upload/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
+    if [[ -n "$(find "${REPO_DIR}/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
+        EN_DIR="${REPO_DIR}/english_parquet"
+    elif [[ -n "$(find "${REPO_DIR}/kaggle_upload/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
         EN_DIR="${REPO_DIR}/kaggle_upload/english_parquet"
     fi
 fi

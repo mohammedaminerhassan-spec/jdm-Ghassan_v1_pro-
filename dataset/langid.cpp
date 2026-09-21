@@ -75,10 +75,42 @@ struct LangId::Lexicons {
         "bonjour","merci","salut","oui","non","peut","très","bien","plus","aussi",
         "problème","travail","école","maison","voiture","argent","temps","chose"
     };
+    // PARQUET-ONLY EN: expanded from 30 to ~220 markers so Hermes English
+    // (522k chat + 478k instruction) classifies as en, not Other.
+    // Covers questions, instructions, connectors, reasoning, coding.
     std::unordered_set<std::string> english = {
         "the","and","is","are","was","were","this","that","with","from","have",
         "has","you","your","they","their","what","when","where","which","would",
-        "could","should","about","there","been","will","can","not","for","but"
+        "could","should","about","there","been","will","can","not","for","but",
+        "who","whom","whose","why","how","whether","either","neither","each",
+        "every","some","any","many","much","more","most","other","such","only",
+        "also","very","just","into","over","after","before","between","through",
+        "during","because","while","although","though","therefore","however",
+        "moreover","furthermore","otherwise","instead","unless","until","again",
+        "once","here","there","then","than","then","first","second","third",
+        "finally","next","please","write","implement","create","develop",
+        "calculate","explain","solve","convert","generate","design","debug",
+        "describe","define","list","summarize","translate","example","answer",
+        "question","problem","solution","reason","logic","step","result",
+        "function","return","code","program","python","javascript","array",
+        "string","number","object","class","method","variable","loop",
+        "recursion","algorithm","data","model","system","human","assistant",
+        "think","know","understand","believe","remember","consider","suggest",
+        "mean","include","including","using","used","often","always","never",
+        "may","might","must","shall","need","want","like","love","hate",
+        "good","bad","great","best","better","worse","big","small","large",
+        "long","short","high","low","new","old","young","same","different",
+        "own","our","we","us","he","she","him","her","his","its","my","mine",
+        "me","i","we","our","ours","your","yours","their","theirs","them",
+        "these","those","am","been","being","do","does","did","doing","done",
+        "has","having","had","having","will","shall","may","might","must",
+        "ought","need","dare","used","very","too","quite","rather","almost",
+        "enough","even","still","yet","already","today","yesterday","tomorrow",
+        "now","here","there","away","back","off","out","up","down","above",
+        "below","under","over","again","further","once","all","both","few",
+        "several","various","another","same","different","important","possible",
+        "sure","true","false","yes","no","maybe","perhaps","please","thanks",
+        "hello","hi","hey",
     };
 };
 
@@ -160,6 +192,7 @@ LangScore LangId::classify(const std::string& raw) const {
     s.darija_score  = static_cast<double>(dar_ar + dar_lt) / nw;
     s.msa_score     = static_cast<double>(msa) / nw;
     s.french_score  = static_cast<double>(fr) / nw;
+    s.english_score = static_cast<double>(en) / nw;
     s.arabizi_score = static_cast<double>(arabizi) / nw;
 
     const double arw = std::max<double>(1.0, static_cast<double>(ar_words));
@@ -194,7 +227,9 @@ LangScore LangId::classify(const std::string& raw) const {
         } else if (fr_density >= 0.15 && fr_density > en_density) {
             s.tag = LangTag::French;
             s.confidence = std::min(1.0, 0.35 + fr_density * 2.0);
-        } else if (en_density >= 0.15) {
+        } else if (en_density >= 0.08 || en >= 2) {
+            // EN threshold lowered 0.15->0.08 (+count>=2 rescue): Hermes short
+            // answers ("A. It compensates...") have few markers but are English.
             s.tag = LangTag::English;
             s.confidence = std::min(1.0, 0.35 + en_density * 2.0);
         } else {
