@@ -100,14 +100,17 @@ ParquetTableInfo inspect_parquet(const std::string& path) {
     // Result-based OpenFile: the Status out-param overload was REMOVED in
     // Arrow 25 (and the old num_rows()/ReadRowGroup-out-param went with it).
     // The Result spelling below compiles on old AND new Arrow alike.
-    auto maybe_reader = parquet::arrow::OpenFile(file);
+    // Arrow 25: OpenFile needs the pool passed explicitly (no default arg),
+    // and row counts come from the file metadata (FileReader::num_rows and
+    // ParquetFileReader::num_rows/num_row_groups are all gone).
+    auto maybe_reader = parquet::arrow::OpenFile(file, arrow::default_memory_pool());
     if (!maybe_reader.ok()) return info;
     std::unique_ptr<parquet::arrow::FileReader> reader = std::move(maybe_reader).ValueOrDie();
     std::shared_ptr<arrow::Schema> schema;
     if (!reader->GetSchema(&schema).ok()) return info;
     for (int i = 0; i < schema->num_fields(); ++i)
         info.columns.push_back(schema->field(i)->name());
-    info.rows = reader->parquet_reader()->num_rows();
+    info.rows = reader->parquet_reader()->metadata()->num_rows();
     return info;
 }
 
@@ -123,7 +126,7 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
             continue;
         }
         std::shared_ptr<arrow::io::RandomAccessFile> file = maybe_file.ValueOrDie();
-        auto maybe_reader = parquet::arrow::OpenFile(file);
+        auto maybe_reader = parquet::arrow::OpenFile(file, arrow::default_memory_pool());
         if (!maybe_reader.ok()) {
             log_warn("parquet: cannot read footer of " + path + "; skipped");
             continue;
@@ -136,10 +139,11 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
         }
         std::vector<std::string> cols;
         for (int i = 0; i < schema->num_fields(); ++i) cols.push_back(schema->field(i)->name());
-        // Row counts via the embedded ParquetFileReader: FileReader::num_rows()
-        // was removed in Arrow 25, this spelling is version-stable.
-        const int64_t file_rows = reader->parquet_reader()->num_rows();
-        const int file_groups = reader->parquet_reader()->num_row_groups();
+        // Row counts via the file metadata: FileReader::num_rows() and the
+        // ParquetFileReader direct counters are gone in Arrow 25, while
+        // FileMetaData::num_rows()/num_row_groups() are long-stable.
+        const int64_t file_rows = reader->parquet_reader()->metadata()->num_rows();
+        const int file_groups = reader->parquet_reader()->metadata()->num_row_groups();
         if (opts.verbose) {
             std::string cl;
             for (size_t i = 0; i < cols.size(); ++i) cl += (i ? "," : "") + cols[i];
