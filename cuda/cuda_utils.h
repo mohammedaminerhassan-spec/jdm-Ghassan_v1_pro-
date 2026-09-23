@@ -20,6 +20,9 @@ void  free_device(void* ptr);
 void  memset_zero(void* ptr, size_t nbytes);
 void  copy(void* dst, bool dst_is_device, const void* src, bool src_is_device, size_t nbytes);
 void  synchronize();
+// FIX P2-1: live free-VRAM query (device.cpp OOM guard used stale startup
+// free_mem and false-passed after GBs of weights). Returns 0 if unavailable.
+size_t free_bytes_live();
 
 // cuBLAS handle, created lazily on first use.
 void* cublas_handle();

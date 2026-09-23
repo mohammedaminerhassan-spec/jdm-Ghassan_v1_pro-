@@ -164,6 +164,8 @@ struct Activations {
     // refills act.pos only when (B,T) changed since the last fill.
     int pos_cached_B = -1;
     int pos_cached_T = -1;
+    int pos_offset = 0;
+    int pos_cached_offset = -1;
     int ce_chunks = 1; // loss chunking used by forward_backward (>=1)
     i64 ce_rows = 0;   // rows per chunk (== N when ce_chunks == 1)
 

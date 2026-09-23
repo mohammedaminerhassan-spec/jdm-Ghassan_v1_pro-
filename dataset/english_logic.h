@@ -53,5 +53,16 @@ const std::vector<const char*>& sequence_connectors();  // first, second, then, 
 //   4. multiple-choice: single letter + short justification
 bool obeys_answer_discipline(const std::string& reply);
 
+struct ReplyReport {
+    DialogAct act = DialogAct::Unknown;
+    bool disciplined = false;
+    std::string reason;
+};
+
+ReplyReport check_english_reply(const std::string& user_text, const std::string& reply);
+bool is_multiple_choice_prompt(const std::string& user_text);
+bool meets_multiple_choice_discipline(const std::string& reply);
+bool contains_code(const std::string& reply);
+
 } // namespace english_logic
 } // namespace gai

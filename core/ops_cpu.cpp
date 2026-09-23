@@ -297,7 +297,10 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
         order.emplace_back(id, t);
     }
     if (order.empty()) return;
-    std::sort(order.begin(), order.end(),
+    // FIX P2 (bit-identical claim): std::sort is unstable so positions within
+    // the same id reorder nondeterministically and intra-row add order differs
+    // vs the serial path (~ulp drift). stable_sort keeps (id,t) order exact.
+    std::stable_sort(order.begin(), order.end(),
               [](const std::pair<i32, i64>& a, const std::pair<i32, i64>& b) {
                   return a.first < b.first;
               });
@@ -445,8 +448,8 @@ static void rope_apply(float* q, float* k, const i32* pos,
                        float sign) {
     if (!q && !k) return;
     int half = head_dim / 2;
-    // Precompute YaRN-scaled freqs once (half pow-free when scale==1 path uses cache).
-    std::vector<float> fbuf(static_cast<size_t>(half));
+    thread_local std::vector<float> fbuf;
+    fbuf.resize(static_cast<size_t>(half));
     if (yarn_scale > 1.0f) {
         for (int i = 0; i < half; ++i)
             fbuf[static_cast<size_t>(i)] = yarn_freq_single(i, head_dim, theta, yarn_scale, yarn_low, yarn_high);
@@ -966,19 +969,16 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
     const bool use_freq = freq != 0.0f;
     const bool use_pres = pres != 0.0f;
     if (!use_rep && !use_freq && !use_pres) return;
-    // counts per token id (mirrors Sampler::apply_penalties windowing done
-    // by the caller, which passes exactly the window slice)
+    thread_local std::vector<int> counts;
+    if (counts.size() < static_cast<size_t>(V)) counts.resize(static_cast<size_t>(V));
+    std::fill(counts.begin(), counts.end(), 0);
     for (int i = 0; i < hist_n; ++i) {
-        i32 tok = hist[i];
-        if (tok < 0 || tok >= V) continue;
-        // count occurrences of tok in hist[i..] — O(n^2) worst case but
-        // hist_n <= 2048 and this is the CPU path; CUDA uses per-id atomics.
-        int n = 0;
-        for (int j = i; j < hist_n; ++j) if (hist[j] == tok) ++n;
-        // skip duplicates: apply once per distinct id (first occurrence)
-        bool first = true;
-        for (int j = 0; j < i; ++j) if (hist[j] == tok) { first = false; break; }
-        if (!first) continue;
+        const i32 tok = hist[i];
+        if (tok >= 0 && tok < V) ++counts[static_cast<size_t>(tok)];
+    }
+    for (int tok = 0; tok < V; ++tok) {
+        const int n = counts[static_cast<size_t>(tok)];
+        if (n == 0) continue;
         float& l = logits[tok];
         if (use_rep) l = (l > 0.0f) ? l / rep : l * rep;
         if (use_freq) l -= freq * static_cast<float>(n);

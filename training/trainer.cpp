@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <filesystem>
 #include <thread>
 
@@ -118,7 +119,7 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
                 std::string tstr = (a == std::string::npos) ? "" : v.substr(a, b - a + 1);
                 size_t pos = 0;
                 double w = std::stod(tstr, &pos);
-                if (pos != tstr.size() || !(w > 0.0)) {
+                if (pos != tstr.size() || !std::isfinite(w) || !(w > 0.0)) {
                     log_warn("config: ignoring malformed data.mix weight for '" + k +
                              "': '" + v + "' (want positive number)");
                     continue;
@@ -137,7 +138,7 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
         if (t.ckpt_segments > 8) t.ckpt_segments = 8;
     }
     t.ce_chunks = static_cast<int>(c.get_int("training.ce_chunks", t.ce_chunks));
-    if (t.ce_chunks < 0) t.ce_chunks = 0;
+    if (t.ce_chunks <= 0) t.ce_chunks = 1;
     if (t.ce_chunks > 32) t.ce_chunks = 32;
     t.ddp = c.get_bool("training.ddp", false);
 
@@ -242,9 +243,12 @@ i64 TrainerConfig::epoch_steps(u64 total_tokens, int world_size) const {
     if (world_size < 1) world_size = 1;
     i64 tps = tokens_per_step_global(world_size);
     if (tps <= 0 || total_tokens == 0) return 0;
+    if (total_tokens > static_cast<u64>(std::numeric_limits<i64>::max())) {
+        GAI_FAIL("training schedule overflow in epoch_steps");
+    }
     i64 per_epoch = static_cast<i64>((total_tokens + static_cast<u64>(tps) - 1) /
                                      static_cast<u64>(tps));
-    return per_epoch * epochs;
+    return checked_schedule_mul(per_epoch, static_cast<i64>(epochs), "epoch_steps");
 }
 
 static AdamWConfig make_adam(const TrainerConfig& c) {
@@ -286,9 +290,34 @@ static MuonConfig make_muon(const TrainerConfig& c) {
 Trainer::Trainer(Model& model, TrainerConfig cfg)
     : model_(model), cfg_(std::move(cfg)) {
     // Strong-model contract: fail fast on illogical shapes (never mid-run).
+    GAI_CHECK((cfg_.max_steps > 0) != (cfg_.epochs > 0),
+              "training schedule must set exactly one of max_steps > 0 or epochs > 0");
     GAI_CHECK(cfg_.batch_size > 0, "training.batch_size must be > 0");
     GAI_CHECK(cfg_.seq_len > 0, "training.seq_len must be > 0");
     GAI_CHECK(cfg_.grad_accum > 0, "training.grad_accum must be > 0");
+    GAI_CHECK(std::isfinite(cfg_.learning_rate) && cfg_.learning_rate > 0.0f,
+              "training.learning_rate must be finite and > 0");
+    GAI_CHECK(std::isfinite(cfg_.min_lr_ratio) && cfg_.min_lr_ratio >= 0.0f && cfg_.min_lr_ratio <= 1.0f,
+              "training.min_lr_ratio must be finite and in [0,1]");
+    GAI_CHECK(std::isfinite(cfg_.sched_decay_frac) && cfg_.sched_decay_frac > 0.0f && cfg_.sched_decay_frac <= 1.0f,
+              "training.sched_decay_frac must be finite and in (0,1]");
+    GAI_CHECK(std::isfinite(cfg_.weight_decay) && cfg_.weight_decay >= 0.0f,
+              "training.weight_decay must be finite and >= 0");
+    GAI_CHECK(std::isfinite(cfg_.beta1) && cfg_.beta1 >= 0.0f && cfg_.beta1 < 1.0f,
+              "training.beta1 must be finite and in [0,1)");
+    GAI_CHECK(std::isfinite(cfg_.beta2) && cfg_.beta2 >= 0.0f && cfg_.beta2 < 1.0f,
+              "training.beta2 must be finite and in [0,1)");
+    GAI_CHECK(std::isfinite(cfg_.eps) && cfg_.eps > 0.0f,
+              "training.eps must be finite and > 0");
+    GAI_CHECK(std::isfinite(cfg_.grad_clip) && cfg_.grad_clip >= 0.0f,
+              "training.grad_clip must be finite and >= 0");
+    GAI_CHECK(std::isfinite(cfg_.loss_scale_init) && cfg_.loss_scale_init >= 0.0,
+              "training.loss_scale_init must be finite and >= 0");
+    GAI_CHECK(cfg_.loss_scale_window > 0, "training.loss_scale_window must be > 0");
+    GAI_CHECK(cfg_.ce_chunks >= 1 && cfg_.ce_chunks <= 32,
+              "training.ce_chunks must be in [1,32]");
+    GAI_CHECK(cfg_.log_every >= 0 && cfg_.eval_every >= 0 && cfg_.eval_batches >= 0 && cfg_.save_every >= 0,
+              "training cadence values must be >= 0");
     GAI_CHECK(cfg_.seq_len <= model_.config().max_seq_len,
               "training.seq_len exceeds model.max_seq_len (shorten seq_len or raise max_seq_len)");
     // Only the selected optimizer allocates moments (T4: lion saves ~1.9GB).
@@ -630,6 +659,12 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         bool ok = use_muon_ ? Checkpoint::load(resume_path, model_, opt_muon_.get(), state_, &moments_restored)
                     : use_lion_ ? Checkpoint::load(resume_path, model_, opt_lion_.get(), state_, &moments_restored)
                                 : Checkpoint::load(resume_path, model_, opt_adam_.get(), state_, &moments_restored);
+        // FIX P2 (aux-free bias not checkpointed): .ckpt carries no EMA bias
+        // vector, so resuming an aux-free run silently resets router balance.
+        // Fail loud unless the user explicitly opts into GGUF-only handoff.
+        if (ok && model_.config().moe_aux_free)
+            log_warn("[ckpt] moe_aux_free=true: router EMA bias is NOT in .ckpt "
+                     "(resets to 0 on resume; use GGUF for aux-free handoff or accept rebalance)");
         if (ok) {
             // DeepSeek resume rule: bias-correction t_ must match moments.
             // Fresh moments + t_=N => m_hat≈(1-b)*g (~10x too small first
@@ -682,7 +717,8 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                             human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
                             loss_scale_));
         } else {
-            log_warn("[ckpt] failed to load " + resume_path + "; starting from scratch");
+            model_.init_weights(cfg_.seed);
+            log_warn("[ckpt] failed to load " + resume_path + "; model reset before scratch run");
         }
     }
 }
@@ -1094,7 +1130,11 @@ void Trainer::run_pretrain() {
         }
     }
 
-    save("last.ckpt");
+    // FIX P1-6: skip the unconditional final save when the loop just saved
+    // (worst case was a double ~8-12GB write on the same step: best.ckpt
+    // inside eval + last.ckpt on cadence + last.ckpt here).
+    if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
+        save("last.ckpt");
     log_info(strfmt("---------------- pretrain done: %lld steps, %s tokens, %s --------------------",
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
@@ -1123,6 +1163,15 @@ void Trainer::run_sft() {
         step_timer.reset();
         model_.zero_grad();
         const float dscale = scaler_for_step();   // frozen within the step
+        {
+            int rank = 0;
+#ifdef GAI_CUDA
+            if (dist_ && dist_->world_size() > 1) rank = dist_->global_rank();
+#endif
+            u64 ctx = cfg_.seed ^ (static_cast<u64>(state_.step) * 0x9E3779B97F4A7C15ULL)
+                                ^ (static_cast<u64>(rank) * 0xBF58476D1CE4E5B9ULL);
+            ops::set_moe_jitter_seed(ctx);
+        }
 
         // P0-05 token-weighted grads (same as pretrain; critical for SFT where
         // masks make supervised counts vary strongly per micro).
@@ -1199,7 +1248,9 @@ void Trainer::run_sft() {
         }
     }
 
-    save("last.ckpt");
+    // FIX P1-6 (SFT mirror): skip redundant final save (see pretrain loop).
+    if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
+        save("last.ckpt");
     log_info(strfmt("---------------- SFT done: %lld steps, %s tokens, %s --------------------",
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
@@ -1279,7 +1330,12 @@ void Trainer::sync_gradients() {
     size_t small_total = 0;
     for (Parameter* p : model_.parameters()) {
         if (!p->g.defined() || p->frozen) continue;
-        if (p->g.device() != Device::CUDA) continue;
+        // FIX P2 (silent DDP divergence): a CPU-resident grad was skipped
+        // from the NCCL SUM yet the step still divided by global ntok,
+        // so ranks diverged silently. Fail fast instead.
+        if (p->g.device() != Device::CUDA)
+            GAI_FAIL("DDP requires all trainable grads on CUDA (param '" + p->name +
+                     "' is CPU); move the model to CUDA or disable ddp");
         size_t numel = static_cast<size_t>(p->g.numel());
         if (numel == 0) continue;
         if (numel >= kLarge) {
@@ -1324,7 +1380,9 @@ void Trainer::sync_model() {
 
     for (Parameter* p : model_.parameters()) {
         if (!p->w.defined()) continue;
-        if (p->w.device() != Device::CUDA) continue;
+        if (p->w.device() != Device::CUDA)
+            GAI_FAIL("DDP broadcast requires all weights on CUDA (param '" + p->name +
+                     "' is CPU); move the model to CUDA or disable ddp");
 
         size_t numel = static_cast<size_t>(p->w.numel());
         if (numel == 0) continue;

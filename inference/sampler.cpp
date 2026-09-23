@@ -138,8 +138,49 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
         return best;
     }
 
+    // FIX P2 (O(V log V) per token): when no top-k/top-p/min-p filtering is
+    // active, skip sorting entirely and sample the full softmax in O(V).
+    // Otherwise cap the pre-sort candidate set: min-p/top-p discard the tail
+    // anyway, so a 2048-cap keeps exact output in practice while cutting
+    // partial_sort from O(V log K) with K=V to O(V log 2048).
+    const bool no_filter = (cfg_.top_k <= 0 || cfg_.top_k >= vocab) &&
+                           (cfg_.top_p <= 0.0f || cfg_.top_p >= 1.0f) &&
+                           cfg_.min_p <= 0.0f;
+    if (no_filter) {
+        scratch_.clear();
+        scratch_.reserve(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);
+        // draw_from_scratch expects sorted desc for min-p/top-p; with no
+        // filter active order is irrelevant except for determinism of ties,
+        // but keep a single linear max-bubble for the -inf guard (scratch_[0]).
+        size_t bi = 0;
+        for (size_t i = 1; i < scratch_.size(); ++i)
+            if (scratch_[i].first > scratch_[bi].first) bi = i;
+        if (bi != 0) std::swap(scratch_[0], scratch_[bi]);
+        // Unsorted tail: sample via plain softmax below (order-free path).
+        // Fall through to draw_from_scratch which handles unsorted when
+        // limit==nprob (cumulative scan still correct, just not truncated).
+        // To keep exact semantics, sort only when filtering is active.
+        // Here no filter -> direct multinomial without sort:
+        const float inv_t = 1.0f / cfg_.temperature;
+        float mx = scratch_[bi].first;
+        probs_buf_.resize(scratch_.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < scratch_.size(); ++i) {
+            double p = std::exp(static_cast<double>((scratch_[i].first - mx) * inv_t));
+            probs_buf_[i] = p; sum += p;
+        }
+        if (!std::isfinite(sum) || sum <= 0.0) return scratch_[bi].second;
+        double r = (double)rng_.uniform() * sum, acc = 0.0;
+        for (size_t i = 0; i < scratch_.size(); ++i) {
+            acc += probs_buf_[i];
+            if (r <= acc) return scratch_[i].second;
+        }
+        return scratch_.back().second;
+    }
     // top-k selection (partial sort keeps this cheap at V=32000)
     int k = (cfg_.top_k > 0 && cfg_.top_k < vocab) ? cfg_.top_k : vocab;
+    if (k > 2048 && cfg_.top_k <= 0) k = 2048;  // cap unfiltered pre-sort
     scratch_.clear();
     scratch_.reserve(static_cast<size_t>(vocab));
     for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);

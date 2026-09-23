@@ -1,9 +1,9 @@
-# Ghassan v1 Flash - 4x T4 Training Config (FP16 tensor cores + DDP)
+# Ghassan v1 Pro English — 4x T4 SFT recipe (FP16 tensor cores + DDP).
 # T4 = Turing sm_75: FP16 tensor cores YES, BF16 tensor cores NO.
 # So: fp32 masters + gemm_fp16=true + loss scaling (NOT bf16).
-# NOTE: اسم الملف يحمل bf16 تاريخيا لكن المحتوى fp32+gemm_fp16 وهو الصحيح
-# لـT4 (لا تعيد تسميته: سكربتات Kaggle تشير إليه بهذا الاسم).
-# Effective batch: 4 GPUs * 2 batch * 1024 seq * 16 accum = 131072 tokens/step
+# Stage 2 after a 4xT4 pretrain run (or en_pro base for short runs).
+# Effective batch: 4 GPUs * 2 batch * 1024 seq * 16 accum = 131072 tokens/step.
+# DATA: shared English lake shards (artifacts/shards_en, english32k keep-case).
 
 model:
   vocab_size: 32000
@@ -26,7 +26,7 @@ model:
   moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -34,6 +34,8 @@ training:
   device: cuda
   precision: fp32              # fp32 masters; T4 has no BF16 tensor cores
   gemm_fp16: true              # T4 FP16 tensor cores for large GEMMs
+  loss_scale_init: 16384
+  loss_scale_window: 2000
   batch_size: 2                # Per-GPU micro-batch
   seq_len: 1024
   grad_accum: 16               # 16 micro-batches = effective batch 32 per GPU
@@ -56,22 +58,20 @@ training:
   eval_every: 100
   eval_batches: 10
   save_every: 500
-  data_dir: artifacts/shards_sft
-  checkpoint_dir: artifacts/checkpoints/flash_sft_4xT4
+  data_dir: artifacts/shards_en
+  checkpoint_dir: artifacts/checkpoints/en_pro_sft_4xT4
   resume: auto
-  pretrained_checkpoint: artifacts/checkpoints/flash/last.ckpt
-  allow_no_pretrained: false  # P0 guard: fail loudly without pretrained (was true)
+  pretrained_checkpoint: artifacts/checkpoints/en_pro/last.ckpt
+  allow_no_pretrained: false  # P0 guard: fail loudly without pretrained
   freeze_embeddings: false
   activation_checkpointing: true
   ckpt_segments: 2
   ddp: true                    # Enable multi-GPU DDP
 
 data:
-  data_dir: artifacts/shards_sft
+  data_dir: artifacts/shards_en
   train_prefix: train_
   val_prefix: val_
   mix:
-    darija_instructions: 0.45
-    darija_chat: 0.30
-    arabizi_chat: 0.15
-    code_switch_chat: 0.10
+    english_chat: 0.65
+    english_instruction: 0.35

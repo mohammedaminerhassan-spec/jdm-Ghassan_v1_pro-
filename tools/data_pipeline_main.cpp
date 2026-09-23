@@ -6,6 +6,7 @@
 #include "tools/cli_common.h"
 #include "dataset/cleaner.h"
 #include "dataset/dedup.h"
+#include "dataset/english_logic.h"
 #include "dataset/langid.h"
 #include "dataset/synth.h"
 #include "dataset/corpus_stats.h"
@@ -17,11 +18,13 @@
 #include "tokenizer/normalizer.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
 #include <map>
+#include <sstream>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
@@ -30,9 +33,7 @@ using namespace gai;
 static void usage() {
     std::cout <<
     "data_pipeline - dataset construction for Ghassan AI (PARQUET-ONLY)\n\n"
-    "Hermes JSON was converted once:\n"
-    "  python tools/convert_hermes_to_parquet.py --input data/openhermes2_5.json --out english_parquet\n"
-    "Training reads ONLY the lake (no JSON file route):\n"
+    "The prebuilt Hermes Parquet lake is the only training input:\n"
     "  data_pipeline parquet --lake english_parquet --tokenizer tok.gtok --out artifacts/shards_en\n\n"
     "usage:\n"
     "  data_pipeline parquet  --lake <parquet-dir> --tokenizer tok.gtok --out artifacts/shards\n"
@@ -42,8 +43,9 @@ static void usage() {
     "  data_pipeline inspect  --shards artifacts/shards --tokenizer tok.gtok\n"
     "  data_pipeline tok-info --tokenizer tok.gtok\n\n"
   "  data_pipeline csvs --dir <csv-root> --out corpus_csv.txt\n"
-  "  data_pipeline parquet --lake dataset/parquet/by_domain --tokenizer tok.gtok\n"
-  "                         --out artifacts/shards --domain darija_qa\n"
+    "  data_pipeline parquet --lake dataset/parquet/by_domain --tokenizer tok.gtok\n"
+    "                         --out artifacts/shards --domain darija_qa\n"
+    "  data_pipeline parquet-corpus --lake english_parquet --out corpus_en.txt [--limit 400000]\n"
   "  data_pipeline csv2json --dir <csv-root> --out json_shards\n"
     "  data_pipeline jsons --dir <json-root> --out corpus_json.txt\n"
     "  data_pipeline retrieve --index <json-file|dir> --query \"salam labas\" [--top 3]\n\n"
@@ -68,7 +70,7 @@ static void usage() {
   "parquet options (THE training-data path: .parquet lake -> .gbin shards):\n"
   "  Hermes lake: english_parquet/english_chat_part*.parquet +\n"
   "               english_parquet/english_instruction_part*.parquet\n"
-  "               (built once by tools/convert_hermes_to_parquet.py)\n"
+  "               (supplied lake format)\n"
   "  --lake <dir>           lake dir or single .parquet file [dataset/parquet/by_domain]\n"
   "  --dir <dir>            alias for --lake\n"
   "  --match <substr>       only files whose NAME contains substr (per-domain\n"
@@ -131,9 +133,11 @@ struct PipelineCounters {
 
 static int cmd_synth(const Args& args) {
     SynthConfig cfg;
-    cfg.seed = static_cast<u64>(args.num("seed", 1234));
-    cfg.num_conversations = static_cast<int>(args.num("n", 20000));
-    cfg.max_template_uses = static_cast<int>(args.num("max-template-uses", 40));
+    cfg.seed = args.num_u64("seed", 1234);
+    cfg.num_conversations = args.num_int("n", 20000);
+    cfg.max_template_uses = args.num_int("max-template-uses", 40);
+    GAI_CHECK(cfg.num_conversations >= 0, "--n must be >= 0");
+    GAI_CHECK(cfg.max_template_uses > 0, "--max-template-uses must be > 0");
 
     std::string out = args.str("out", "data/synth.jsonl");
     fs::create_directories(fs::path(out).has_parent_path() ? fs::path(out).parent_path() : ".");
@@ -203,6 +207,7 @@ struct ShardBuild {
     Deduplicator dedup;
     LangId lid;
     PipelineCounters ctr;
+    std::map<std::string, u64> act_counts;
     u64 total_tokens = 0;
     u64 chat_docs = 0, text_docs = 0;
     CleanStats cs;  // text-path cleaning stats (chat turns use a local one)
@@ -214,7 +219,8 @@ struct ShardBuild {
         log_info(strfmt("[tok ] vocab=%d", tok.vocab_size()));
         // Fail-loud gate: a 16k legacy file must never silently encode shards
         // for a 32k model (half the embedding rows would train on nothing).
-        const int expect_vocab = static_cast<int>(args.num("expect-vocab", 0));
+        const int expect_vocab = args.num_int("expect-vocab", 0);
+        GAI_CHECK(expect_vocab >= 0, "--expect-vocab must be >= 0");
         GAI_CHECK(expect_vocab <= 0 || tok.vocab_size() == expect_vocab,
                   strfmt("tokenizer vocab %d != expected %d (%s): refusing to encode shards",
                          tok.vocab_size(), expect_vocab, tokpath.c_str()));
@@ -222,8 +228,18 @@ struct ShardBuild {
 
     void init_options(const Args& args) {
         val_ratio    = args.real("val-ratio", 0.005);
-        shard_tokens = static_cast<u64>(args.num("shard-tokens", 50000000));
-        seq_cap      = static_cast<int>(args.num("seq-len", 4096));
+        shard_tokens = args.num_u64("shard-tokens", 50000000);
+        GAI_CHECK(std::isfinite(val_ratio) && val_ratio >= 0.0 && val_ratio <= 1.0,
+                  "--val-ratio must be finite and in [0,1]");
+        GAI_CHECK(shard_tokens > 0, "--shard-tokens must be > 0");
+        seq_cap      = args.num_int("seq-len", 4096);
+        // FIX P2 (silent misconfig): --seq-len<=0 previously disabled
+        // splitting silently; empty --out wrote to a root path.
+        GAI_CHECK(seq_cap > 0, "--seq-len must be > 0 (splitting is mandatory)");
+        {
+            std::string out0 = args.str("out", "artifacts/shards");
+            GAI_CHECK(!out0.empty(), "--out must be non-empty");
+        }
         do_dedup     = !args.flag("no-dedup");
         style_filter = !args.flag("keep-robotic");
         // PRO-EN: --style-mode darija|en|off (default darija = legacy behavior).
@@ -235,12 +251,13 @@ struct ShardBuild {
         // PRO-EN: --keep-case preserves Latin case in cleaning (default
         // lowercases for Darija). MUST match the tokenizer's --keep-case or
         // shards/train/infer disagree on casing. No-op for Arabic script.
-        if (args.flag("keep-case", false)) {
-            CleanConfig cc;
-            cc.normalizer.lowercase_latin = false;
-            cleaner = Cleaner(cc);
+        CleanConfig cc;
+        cc.drop_pii_lines = style_mode != "en";
+        cc.redact_instead_drop = style_mode == "en";
+        if (args.flag("keep-case", false)) cc.normalizer.lowercase_latin = false;
+        if (cc.redact_instead_drop || args.flag("keep-case", false)) cleaner = Cleaner(cc);
+        if (args.flag("keep-case", false))
             log_info("[clean] keep-case: Latin capitalization preserved (English corpus)");
-        }
         // Optional domain label: shards become train_<domain>_*.gbin so the
         // trainer's data.mix weights can sample domains (empty = legacy names).
         domain = args.str("domain", "");
@@ -248,9 +265,12 @@ struct ShardBuild {
             if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
         }
         outdir = args.str("out", "artifacts/shards");
+        GAI_CHECK(!outdir.empty(), "--out must be non-empty");
         fs::create_directories(outdir);
-        open_train();
-        open_val();
+        // FIX P2 (empty shards): writers were opened before any input was
+        // validated, leaving empty train_*.gbin that passed later preflight.
+        // Now lazy: first emit opens the writer (see ensure_train/ensure_val).
+        train_w.reset(); val_w.reset();
         // DeepSeek eval-hygiene: every training-data path honors the eval
         // blocklist — otherwise eval prompts leak into train shards silently.
         if (args.has("eval-blocklist")) dedup.load_blocklist(args.str("eval-blocklist"));
@@ -272,6 +292,8 @@ struct ShardBuild {
         val_shard_tok = 0;
         log_info("[shard] opened " + p);
     }
+    void ensure_train() { if (!train_w) open_train(); }
+    void ensure_val() { if (!val_w) open_val(); }
 
     // DeepSeek split rule: hash CANONICAL text, not raw. Near-dups
     // (paraphrases, same canonical, different raw hash) previously landed
@@ -296,12 +318,14 @@ struct ShardBuild {
                     const std::string& key, const std::string& lang, bool val) {
         if (ids.empty()) return;
         if (val) {
+            ensure_val();
             if (val_shard_tok >= shard_tokens) { val_w->close(); open_val(); }
             val_w->add_document(ids, &mask);
             val_shard_tok += ids.size();
             ctr.tokens_val += ids.size();
             ++ctr.docs_val;
         } else {
+            ensure_train();
             if (train_shard_tok >= shard_tokens) { train_w->close(); open_train(); }
             train_w->add_document(ids, &mask);
             train_shard_tok += ids.size();
@@ -320,8 +344,7 @@ struct ShardBuild {
         }
         const bool val = is_val(key);
         const size_t step = static_cast<size_t>(seq_cap);
-        size_t w = 0;
-        for (size_t off = 0; off < ids.size(); off += step, ++w) {
+        for (size_t off = 0; off < ids.size(); off += step) {
             const size_t n = std::min(step, ids.size() - off);
             std::vector<i32> wid(ids.begin() + off, ids.begin() + off + n);
             std::vector<u8> wmask(mask.begin() + off, mask.begin() + off + n);
@@ -354,10 +377,21 @@ struct ShardBuild {
                     cleaned_msgs.push_back(Message{m.role, cl});
                 }
             }
+            if (is_en) {
+                std::string first_user;
+                for (const auto& m : cleaned_msgs) {
+                    if (m.role == Role::User) { first_user = m.content; break; }
+                }
+                if (first_user.empty()) first_user = cleaned_msgs.front().content;
+                ++act_counts[english_logic::dialog_act_name(
+                    english_logic::classify_dialog_act(first_user))];
+            }
             std::string key;
             for (const auto& m : cleaned_msgs) key += m.content + "\n";
+            std::string last_user;
             for (size_t i = 0; i < cleaned_msgs.size(); ++i) {
                 auto& m = cleaned_msgs[i];
+                if (m.role == Role::User) last_user = m.content;
                 if (check_toxicity(m.content).toxic) { ++ctr.toxic_dropped; return; }
                 // EN: redact PII (keep the math/code doc) instead of dropping
                 // the whole conversation; Darija keeps the strict drop.
@@ -372,6 +406,10 @@ struct ShardBuild {
                     bool drop = false;
                     if (style_mode == "en") {
                         drop = has_hard_ai_boilerplate(m.content);
+                        if (!drop) {
+                            const auto rep = english_logic::check_english_reply(last_user, m.content);
+                            drop = !rep.disciplined && rep.reason == "bad-mc-format";
+                        }
                     } else {
                         std::string prev = i > 0 ? cleaned_msgs[i - 1].content : "";
                         drop = check_assistant_style(m.content, prev, lid).robotic();
@@ -395,9 +433,16 @@ struct ShardBuild {
             std::string cleaned;
             if (!cleaner.clean_line(doc.text, cleaned, cs)) return;
             ++ctr.cleaned;
-            if (!quality_check(cleaned).accept) { ++ctr.quality_dropped; return; }
+            if (!(is_en ? quality_check_english(cleaned).accept : quality_check(cleaned).accept)) {
+                ++ctr.quality_dropped;
+                return;
+            }
             if (check_toxicity(cleaned).toxic) { ++ctr.toxic_dropped; return; }
             if (do_dedup && !dedup.add(cleaned)) { ++ctr.dup_dropped; return; }
+            if (is_en) {
+                ++act_counts[english_logic::dialog_act_name(
+                    english_logic::classify_dialog_act(cleaned))];
+            }
             LangScore ls = lid.classify(cleaned);
             std::vector<i32> ids = tok.encode(cleaned, true, true);
             if (ids.empty()) return;
@@ -411,34 +456,49 @@ struct ShardBuild {
 
     // Close writers, print the standard report, enforce the quality gate.
     int finish(const Args& args, const char* title) {
-        train_w->close();
-        val_w->close();
-        log_info(strfmt("\n==================== %s ====================", title));
-        log_info(strfmt("  total docs        : %s  (chat %s / text %s)",
-                        human_count(ctr.raw).c_str(), human_count(chat_docs).c_str(),
-                        human_count(text_docs).c_str()));
-        log_info(strfmt("  cleaned           : %s", human_count(ctr.cleaned).c_str()));
-        log_info(strfmt("  quality dropped   : %s", human_count(ctr.quality_dropped).c_str()));
-        log_info(strfmt("  toxic dropped     : %s", human_count(ctr.toxic_dropped).c_str()));
-        log_info(strfmt("  pii blocked       : %s", human_count(ctr.blocked).c_str()));
-        log_info(strfmt("  robotic dropped   : %s", human_count(ctr.robotic_dropped).c_str()));
-        log_info(strfmt("  duplicates        : %s", human_count(ctr.dup_dropped).c_str()));
-        log_info(strfmt("  split windows     : %s docs exceeded seq_cap (kept as windows, not truncated)",
-                        human_count(ctr.split_docs).c_str()));
-        log_info(strfmt("  total tokens      : %s", human_count(total_tokens).c_str()));
-        log_info(strfmt("  train docs/tokens : %s / %s  (%d shards)",
-                        human_count(ctr.docs_train).c_str(), human_count(ctr.tokens_train).c_str(), train_idx));
-        log_info(strfmt("  val   docs/tokens : %s / %s  (%d shards)",
-                        human_count(ctr.docs_val).c_str(), human_count(ctr.tokens_val).c_str(), val_idx));
-        log_info("  -- by language --");
+        if (train_w) train_w->close();
+        if (val_w) val_w->close();
+        std::ostringstream rep;
+        rep << "\n==================== " << title << " ====================\n";
+        rep << strfmt("  total docs        : %s  (chat %s / text %s)\n",
+                      human_count(ctr.raw).c_str(), human_count(chat_docs).c_str(),
+                      human_count(text_docs).c_str());
+        rep << strfmt("  cleaned           : %s\n", human_count(ctr.cleaned).c_str());
+        rep << strfmt("  quality dropped   : %s\n", human_count(ctr.quality_dropped).c_str());
+        rep << strfmt("  toxic dropped     : %s\n", human_count(ctr.toxic_dropped).c_str());
+        rep << strfmt("  pii blocked       : %s\n", human_count(ctr.blocked).c_str());
+        rep << strfmt("  robotic dropped   : %s\n", human_count(ctr.robotic_dropped).c_str());
+        rep << strfmt("  duplicates        : %s\n", human_count(ctr.dup_dropped).c_str());
+        rep << strfmt("  split windows     : %s source docs exceeded seq_cap (not truncated)\n",
+                      human_count(ctr.split_docs).c_str());
+        rep << strfmt("  total tokens      : %s\n", human_count(total_tokens).c_str());
+        rep << strfmt("  train windows/tokens: %s / %s  (%d shards)\n",
+                      human_count(ctr.docs_train).c_str(), human_count(ctr.tokens_train).c_str(), train_idx);
+        rep << strfmt("  val   windows/tokens: %s / %s  (%d shards)\n",
+                      human_count(ctr.docs_val).c_str(), human_count(ctr.tokens_val).c_str(), val_idx);
+        rep << "  -- by language --\n";
         for (const auto& [l, n] : ctr.lang_kept)
-            log_info(strfmt("    %-12s %s", l.c_str(), human_count(n).c_str()));
-        log_info("================================================================");
+            rep << strfmt("    %-12s %s\n", l.c_str(), human_count(n).c_str());
+        if (!act_counts.empty()) {
+            rep << "  -- English dialog acts --\n";
+            for (const auto& [a, n] : act_counts)
+                rep << strfmt("    %-12s %s\n", a.c_str(), human_count(n).c_str());
+        }
+        rep << "================================================================\n";
+        log_info(rep.str());
+        if (args.has("report")) {
+            std::ofstream rf(args.str("report"), std::ios::binary);
+            GAI_CHECK(rf.good(), "cannot write report: " + args.str("report"));
+            rf << rep.str();
+            rf.close();
+            GAI_CHECK(rf.good(), "report write failed: " + args.str("report"));
+            log_info("[report] wrote " + args.str("report"));
+        }
         // ---- quality gate: never let an empty or fully-duplicate corpus through
         const u64 kept = ctr.docs_train + ctr.docs_val;
-        const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+        const u64 min_keep = args.num_u64("min-keep", 1);
         if (kept < min_keep) {
-            log_error(strfmt("quality gate FAILED: kept %s docs (< min-keep %s)",
+            log_error(strfmt("quality gate FAILED: kept %s windows (< min-keep %s)",
                              human_count(kept).c_str(), human_count(min_keep).c_str()));
             return 1;
         }
@@ -448,13 +508,11 @@ struct ShardBuild {
     }
 };
 
-// PARQUET-ONLY: `data_pipeline json` was REMOVED. Hermes JSON was converted
-// once via tools/convert_hermes_to_parquet.py into english_parquet/.
-// Use: data_pipeline parquet --lake english_parquet --mode chat ...
+// PARQUET-ONLY: `data_pipeline json` was REMOVED. The supplied lake is read
+// with data_pipeline parquet --lake english_parquet --mode chat ...
 static int cmd_json_removed(const Args& /*args*/) {
     log_error("REMOVED: `data_pipeline json` no longer exists (parquet-only project). "
-              "Convert once: python tools/convert_hermes_to_parquet.py --input data/openhermes2_5.json --out english_parquet "
-              "then: data_pipeline parquet --lake english_parquet --mode chat --style-mode en --keep-case ...");
+              "Use the supplied English Parquet lake with data_pipeline parquet --lake english_parquet --mode chat --style-mode en --keep-case ...");
     return 1;
 }
 
@@ -633,6 +691,99 @@ static int cmd_parquet(const Args& args) {
     return b.finish(args, "parquet pipeline report");
 }
 
+static int cmd_parquet_corpus(const Args& args) {
+    if (!parquet_available()) {
+        log_error("parquet-corpus needs Apache Arrow: rebuild with -DGAI_ENABLE_PARQUET=ON "
+                  "(kaggle/setup.sh --with-parquet)");
+        return 1;
+    }
+    const std::string lake = args.str("lake", args.str("dir", "english_parquet"));
+    std::vector<std::string> files = list_parquet_files(lake);
+    if (args.has("match")) {
+        const std::string match = args.str("match");
+        std::vector<std::string> kept;
+        for (const auto& file : files)
+            if (fs::path(file).filename().string().find(match) != std::string::npos)
+                kept.push_back(file);
+        files.swap(kept);
+    }
+    if (files.empty()) {
+        log_error("no .parquet files found in: " + lake);
+        return 1;
+    }
+
+    const i64 requested_limit = args.num("limit", 0);
+    GAI_CHECK(requested_limit >= 0, "parquet-corpus --limit must be >= 0");
+    const size_t limit = static_cast<size_t>(requested_limit);
+    const std::string outpath = args.str("out", "artifacts/corpus/corpus_en.txt");
+    if (fs::path(outpath).has_parent_path())
+        fs::create_directories(fs::path(outpath).parent_path());
+    std::ofstream out(outpath, std::ios::binary);
+    GAI_CHECK(out.good(), "cannot write corpus: " + outpath);
+
+    ParquetOptions popts;
+    popts.max_rows = limit;
+    popts.verbose = true;
+    JsonReaderOptions jopts;
+    jopts.verbose = false;
+    u64 rows = 0;
+    u64 lines = 0;
+    auto emit = [&](const std::string& value) {
+        std::string line;
+        line.reserve(value.size());
+        for (char ch : value) line.push_back((ch == '\r' || ch == '\n') ? ' ' : ch);
+        if (line.find_first_not_of(" \t") == std::string::npos) return;
+        out << line << '\n';
+        ++lines;
+    };
+
+    read_parquet_docs(files, [&](const std::map<std::string, std::string>& row) {
+        ++rows;
+        auto get = [&](const char* key) {
+            const auto it = row.find(key);
+            return it == row.end() ? std::string() : it->second;
+        };
+        const std::string messages = get("messages_json");
+        if (!messages.empty()) {
+            JsonDoc doc;
+            if (doc_from_json_text("{\"messages\":" + messages + "}", doc, jopts)) {
+                for (const auto& message : doc.messages) emit(message.content);
+                return;
+            }
+        }
+        const std::string question = get("question");
+        const std::string answer = get("answer");
+        if (!question.empty() || !answer.empty()) {
+            emit(question + "\n" + answer);
+            return;
+        }
+        const std::string user = get("user");
+        const std::string assistant = get("assistant");
+        if (!user.empty() || !assistant.empty()) {
+            emit(user + "\n" + assistant);
+            return;
+        }
+        std::string line;
+        for (const auto& [key, value] : row) {
+            if (value.empty() || key.empty() || key[0] == '_' ||
+                key == "messages_json" || key == "uuid" || key == "id" ||
+                key == "source" || key == "category") continue;
+            if (!line.empty()) line += " / ";
+            line += value;
+        }
+        emit(line);
+    }, popts);
+
+    GAI_CHECK(out.good(), "corpus write failed: " + outpath);
+    if (rows == 0 || lines == 0) {
+        log_error("parquet-corpus produced no corpus lines: " + outpath);
+        return 1;
+    }
+    log_info(strfmt("[parquet-corpus] %s rows -> %s lines: %s",
+                    human_count(rows).c_str(), outpath.c_str(), human_count(lines).c_str()));
+    return 0;
+}
+
 // PARQUET-ONLY: `json-inspect` REMOVED (no JSON file route).
 // Inspect the lake instead: data_pipeline parquet --lake english_parquet ...
 // (row counts + schema via the parquet report) or python pq.read_table.
@@ -734,13 +885,16 @@ std::string csv_flat(std::string s) {
 static int cmd_csvs(const Args& args) {
     std::string root    = args.str("dir", ".");
     std::string outpath = args.str("out", "corpus_csv.txt");
-    const int min_chars = static_cast<int>(args.num("min-chars", 2));
+    const int min_chars = args.num_int("min-chars", 2);
+    GAI_CHECK(min_chars >= 0, "--min-chars must be >= 0");
     const bool with_eng = args.flag("with-english", false);
 
     std::vector<std::string> csv_files;
     std::error_code ec;
     for (const auto& e : fs::recursive_directory_iterator(root, ec)) {
-        if (!e.is_regular_file()) continue;
+        if (ec) break;
+        std::error_code file_ec;
+        if (!e.is_regular_file(file_ec) || file_ec) continue;
         if (e.path().extension().string() == ".csv")
             csv_files.push_back(e.path().string());
     }
@@ -860,7 +1014,7 @@ static int cmd_csvs(const Args& args) {
                     human_count(align_out).c_str()));
     log_info(strfmt("  output          : %s", outpath.c_str()));
     log_info("===============================================================");
-    const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+    const u64 min_keep = args.num_u64("min-keep", 1);
     if (lines_out < min_keep) {
         log_error("quality gate FAILED: kept too few lines");
         return 1;
@@ -916,15 +1070,19 @@ std::string json_escape(const std::string& s) {
 static int cmd_csv2json(const Args& args) {
     std::string root     = args.str("dir", ".");
     std::string outdir   = args.str("out", "json_shards");
-    const int per_file   = static_cast<int>(args.num("docs-per-file", 20000));
+    const int per_file   = args.num_int("docs-per-file", 20000);
     long long next_id    = args.num("id-start", 1000000);
-    const int min_chars  = static_cast<int>(args.num("min-chars", 2));
+    GAI_CHECK(next_id >= 0, "--id-start must be >= 0");
+    const int min_chars  = args.num_int("min-chars", 2);
+    GAI_CHECK(min_chars >= 0, "--min-chars must be >= 0");
     GAI_CHECK(per_file > 0, "--docs-per-file must be > 0");
 
     std::vector<std::string> csv_files;
     std::error_code ec;
     for (const auto& e : fs::recursive_directory_iterator(root, ec)) {
-        if (!e.is_regular_file()) continue;
+        if (ec) break;
+        std::error_code file_ec;
+        if (!e.is_regular_file(file_ec) || file_ec) continue;
         if (e.path().extension().string() == ".csv")
             csv_files.push_back(e.path().string());
     }
@@ -1042,7 +1200,7 @@ static int cmd_csv2json(const Args& args) {
     log_info(strfmt("  skipped dup Q   : %s", human_count(skipped_dup).c_str()));
     log_info(strfmt("  output dir      : %s", outdir.c_str()));
     log_info("==========================================================");
-    const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+    const u64 min_keep = args.num_u64("min-keep", 1);
     if (pairs_out < min_keep) {
         log_error("quality gate FAILED: kept too few pairs");
         return 1;
@@ -1058,7 +1216,8 @@ static int cmd_csv2json(const Args& args) {
 static int cmd_jsons(const Args& args) {
     std::string root    = args.str("dir", ".");
     std::string outpath = args.str("out", "corpus_json.txt");
-    const int min_chars = static_cast<int>(args.num("min-chars", 2));
+    const int min_chars = args.num_int("min-chars", 2);
+    GAI_CHECK(min_chars >= 0, "--min-chars must be >= 0");
 
     std::vector<std::string> json_files;
     std::error_code ec;
@@ -1066,8 +1225,12 @@ static int cmd_jsons(const Args& args) {
         json_files.push_back(root);
     } else {
         for (const auto& e : fs::recursive_directory_iterator(root, ec)) {
-            if (!e.is_regular_file()) continue;
-            if (e.path().extension().string() == ".json")
+            if (ec) break;
+            std::error_code file_ec;
+            if (!e.is_regular_file(file_ec) || file_ec) continue;
+            std::string ext = e.path().extension().string();
+            for (char& ch : ext) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+            if (ext == ".json" || ext == ".jsonl")
                 json_files.push_back(e.path().string());
         }
     }
@@ -1112,7 +1275,7 @@ static int cmd_jsons(const Args& args) {
     log_info(strfmt("  corpus lines    : %s", human_count(lines_out).c_str()));
     log_info(strfmt("  output          : %s", outpath.c_str()));
     log_info("===============================================================");
-    const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+    const u64 min_keep = args.num_u64("min-keep", 1);
     if (lines_out < min_keep) {
         log_error("quality gate FAILED: kept too few lines");
         return 1;
@@ -1122,7 +1285,7 @@ static int cmd_jsons(const Args& args) {
 
 // PARQUET-ONLY: `dump-text` (JSON->corpus) REMOVED.
 // BPE corpus comes from the lake instead:
-//   python tools/parquet_to_corpus.py --lake english_parquet --out corpus_en.txt --keep-case
+//   data_pipeline parquet-corpus --lake english_parquet --out corpus_en.txt
 // (or data_pipeline csvs for Darija tables). No JSON file route.
 
 static std::vector<std::string> collect_files(const std::string& path) {
@@ -1130,8 +1293,11 @@ static std::vector<std::string> collect_files(const std::string& path) {
     std::error_code ec;
     if (path.empty()) return files;
     if (fs::is_directory(path, ec)) {
-        for (const auto& e : fs::recursive_directory_iterator(path, ec))
-            if (e.is_regular_file()) files.push_back(e.path().string());
+        for (const auto& e : fs::recursive_directory_iterator(path, ec)) {
+            if (ec) break;
+            std::error_code file_ec;
+            if (e.is_regular_file(file_ec) && !file_ec) files.push_back(e.path().string());
+        }
     } else if (fs::exists(path, ec)) {
         files.push_back(path);
     }
@@ -1146,18 +1312,24 @@ static int cmd_build(const Args& args) {
     GAI_CHECK(tok.load(tokpath), "cannot load tokenizer: " + tokpath);
     log_info(strfmt("[tok] vocab=%d", tok.vocab_size()));
     {
-        const int expect_vocab = static_cast<int>(args.num("expect-vocab", 0));
+        const int expect_vocab = args.num_int("expect-vocab", 0);
+        GAI_CHECK(expect_vocab >= 0, "--expect-vocab must be >= 0");
         GAI_CHECK(expect_vocab <= 0 || tok.vocab_size() == expect_vocab,
                   strfmt("tokenizer vocab %d != expected %d (%s): refusing to encode shards",
                          tok.vocab_size(), expect_vocab, tokpath.c_str()));
     }
 
     std::string outdir = args.str("out", "artifacts/shards");
+    GAI_CHECK(!outdir.empty(), "--out must be non-empty");
     fs::create_directories(outdir);
 
     const double val_ratio  = args.real("val-ratio", 0.005);
-    const u64 shard_tokens  = static_cast<u64>(args.num("shard-tokens", 50000000));
-    const int  seq_cap      = static_cast<int>(args.num("seq-len", 4096));
+    const u64 shard_tokens  = args.num_u64("shard-tokens", 50000000);
+    GAI_CHECK(std::isfinite(val_ratio) && val_ratio >= 0.0 && val_ratio <= 1.0,
+              "--val-ratio must be finite and in [0,1]");
+    GAI_CHECK(shard_tokens > 0, "--shard-tokens must be > 0");
+    const int  seq_cap      = args.num_int("seq-len", 4096);
+    GAI_CHECK(seq_cap > 0, "--seq-len must be > 0 (splitting is mandatory)");
     const bool do_dedup     = !args.flag("no-dedup");
     const bool style_filter_in = !args.flag("keep-robotic");
     // PRO-EN: same --style-mode/--keep-case contract as the ShardBuild route
@@ -1173,13 +1345,11 @@ static int cmd_build(const Args& args) {
         if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
     }
 
-    Cleaner cleaner;
-    if (args.flag("keep-case", false)) {
-        CleanConfig cc;
-        cc.normalizer.lowercase_latin = false;
-        cleaner = Cleaner(cc);
-        log_info("[clean] keep-case: Latin capitalization preserved (English corpus)");
-    }
+    CleanConfig cc;
+    cc.drop_pii_lines = style_mode != "en";
+    cc.redact_instead_drop = style_mode == "en";
+    if (args.flag("keep-case", false)) cc.normalizer.lowercase_latin = false;
+    Cleaner cleaner(cc);
     Deduplicator dedup;
     LangId lid;
     PipelineCounters ctr;
@@ -1207,8 +1377,9 @@ static int cmd_build(const Args& args) {
         val_shard_tokens = 0;
         log_info("[shard] opened " + p);
     };
-    open_train();
-    open_val();
+    auto ensure_train = [&]() { if (!train_w) open_train(); };
+    auto ensure_val = [&]() { if (!val_w) open_val(); };
+    // FIX P2: lazy writers (was: empty shards written before input validation).
 
     // Deterministic split by CANONICAL hash: the same document always lands
     // on the same side, and near-dups (same canonical) stay together —
@@ -1225,12 +1396,14 @@ static int cmd_build(const Args& args) {
                     const std::string& key, const std::string& lang, bool val) {
         if (ids.empty()) return;
         if (val) {
+            ensure_val();
             if (val_shard_tokens >= shard_tokens) { val_w->close(); open_val(); }
             val_w->add_document(ids, &mask);
             val_shard_tokens += ids.size();
             ctr.tokens_val += ids.size();
             ++ctr.docs_val;
         } else {
+            ensure_train();
             if (train_shard_tokens >= shard_tokens) { train_w->close(); open_train(); }
             train_w->add_document(ids, &mask);
             train_shard_tokens += ids.size();
@@ -1252,6 +1425,7 @@ static int cmd_build(const Args& args) {
             emit(ids, mask, key, lang);
             return;
         }
+        ++ctr.split_docs;
         const bool val = is_val(key);
         const size_t step = static_cast<size_t>(seq_cap);
         for (size_t off = 0; off < ids.size(); off += step) {
@@ -1275,7 +1449,11 @@ static int cmd_build(const Args& args) {
             if (!cleaner.clean_line(line, cleaned, cs)) continue;
             ++ctr.cleaned;
 
-            if (!quality_check(cleaned).accept) { ++ctr.quality_dropped; continue; }
+            if (!(style_mode == "en" ? quality_check_english(cleaned).accept
+                                    : quality_check(cleaned).accept)) {
+                ++ctr.quality_dropped;
+                continue;
+            }
             if (check_toxicity(cleaned).toxic)  { ++ctr.toxic_dropped; continue; }
             if (do_dedup && !dedup.add(cleaned)) { ++ctr.dup_dropped; continue; }
 
@@ -1307,7 +1485,11 @@ static int cmd_build(const Args& args) {
             if (!cleaner.clean_line(pr.answer, a, cs)) continue;
             std::string doc = q + "\n" + a;
             ++ctr.cleaned;
-            if (!quality_check(doc).accept) { ++ctr.quality_dropped; continue; }
+            if (!(style_mode == "en" ? quality_check_english(doc).accept
+                                    : quality_check(doc).accept)) {
+                ++ctr.quality_dropped;
+                continue;
+            }
             if (check_toxicity(doc).toxic)  { ++ctr.toxic_dropped; continue; }
             if (do_dedup && !dedup.add(doc)) { ++ctr.dup_dropped; continue; }
             LangScore ls = lid.classify(doc);
@@ -1325,13 +1507,14 @@ static int cmd_build(const Args& args) {
         log_info(strfmt("[chat] %s: %s conversations", path.c_str(), human_count(c.size()).c_str()));
         convs.insert(convs.end(), c.begin(), c.end());
     }
-    i64 nsynth = args.num("synth", 0);
+    const int nsynth = args.num_int("synth", 0);
+    GAI_CHECK(nsynth >= 0, "--synth must be >= 0");
     if (nsynth > 0) {
         SynthConfig sc;
-        sc.seed = static_cast<u64>(args.num("seed", 1234));
-        sc.num_conversations = static_cast<int>(nsynth);
+        sc.seed = args.num_u64("seed", 1234);
+        sc.num_conversations = nsynth;
         SynthGenerator gen(sc);
-        auto c = gen.generate_many(static_cast<int>(nsynth));
+        auto c = gen.generate_many(nsynth);
         log_info("[synth] " + gen.stats().summary());
         convs.insert(convs.end(), c.begin(), c.end());
     }
@@ -1350,7 +1533,13 @@ static int cmd_build(const Args& args) {
             for (const auto& m : c.messages) {
                 std::string cl;
                 if (!cleaner.clean_line(m.content, cl, cs_chat)) { ++ctr.quality_dropped; bad = true; break; }
-                if (cl.size() < 2 || !quality_check(cl).accept) { ++ctr.quality_dropped; bad = true; break; }
+                if (cl.size() < 2 ||
+                    !(style_mode == "en" ? quality_check_english(cl).accept
+                                        : quality_check(cl).accept)) {
+                    ++ctr.quality_dropped;
+                    bad = true;
+                    break;
+                }
                 cleaned_msgs.push_back(Message{m.role, cl});
             }
             if (bad) continue;
@@ -1388,8 +1577,8 @@ static int cmd_build(const Args& args) {
         emit_windowed(ids, mask, key, lang_name(ls.tag));
     }
 
-    train_w->close();
-    val_w->close();
+    if (train_w) train_w->close();
+    if (val_w) val_w->close();
 
     // ---------------- report ----------------
     std::ostringstream rep;
@@ -1401,14 +1590,14 @@ static int cmd_build(const Args& args) {
     rep << strfmt("  dropped robotic    : %s\n", human_count(ctr.robotic_dropped).c_str());
     rep << strfmt("  dropped pii        : %s\n", human_count(ctr.blocked).c_str());
     rep << strfmt("  dropped duplicate  : %s\n", human_count(ctr.dup_dropped).c_str());
-    rep << strfmt("  split windows      : %s docs exceeded seq_cap (kept as windows)\n", human_count(ctr.split_docs).c_str());
-    rep << strfmt("  kept               : %s\n", human_count(ctr.kept).c_str());
+    rep << strfmt("  split windows      : %s source docs exceeded seq_cap\n", human_count(ctr.split_docs).c_str());
+    rep << strfmt("  kept windows       : %s\n", human_count(ctr.kept).c_str());
     rep << "\n";
-    rep << strfmt("  train docs/tokens  : %s / %s  (%d shards)\n",
+    rep << strfmt("  train windows/tokens: %s / %s  (%d shards)\n",
                   human_count(ctr.docs_train).c_str(), human_count(ctr.tokens_train).c_str(), train_idx);
-    rep << strfmt("  val   docs/tokens  : %s / %s  (%d shards)\n",
+    rep << strfmt("  val   windows/tokens: %s / %s  (%d shards)\n",
                   human_count(ctr.docs_val).c_str(), human_count(ctr.tokens_val).c_str(), val_idx);
-    rep << "\n  -- language mix of kept documents --\n";
+    rep << "\n  -- language mix of kept windows --\n";
     u64 tot = ctr.kept ? ctr.kept : 1;
     for (const auto& [l, n] : ctr.lang_kept)
         rep << strfmt("    %-14s %8s  %6.2f%%\n", l.c_str(), human_count(n).c_str(),
@@ -1423,9 +1612,9 @@ static int cmd_build(const Args& args) {
         log_info("[report] wrote " + args.str("report"));
     }
     // ---- quality gate
-    const u64 min_keep = static_cast<u64>(args.num("min-keep", 1));
+    const u64 min_keep = args.num_u64("min-keep", 1);
     if (ctr.kept < min_keep) {
-        log_error(strfmt("quality gate FAILED: kept %s docs (< min-keep %s)",
+        log_error(strfmt("quality gate FAILED: kept %s windows (< min-keep %s)",
                          human_count(ctr.kept).c_str(), human_count(min_keep).c_str()));
         return 1;
     }
@@ -1438,7 +1627,7 @@ static int cmd_retrieve(const Args& args) {
     if (query.empty() && args.positional().size() > 1) query = args.positional()[1];
     GAI_CHECK(!index.empty(), "--index <train-*.json file|dir> is required");
     GAI_CHECK(!query.empty(), "--query <text> is required");
-    const int top = static_cast<int>(args.num("top", 3));
+    const int top = args.num_int("top", 3);
     const double min_score = args.real("min-score", 0.0);
 
     std::vector<QaEntry> docs;
@@ -1475,7 +1664,7 @@ static int cmd_inspect(const Args& args) {
         log_info(strfmt("---- %s: %zu shards ----", prefix.c_str(), files.size()));
         for (const auto& p : files) {
             Shard s;
-            if (!s.load(p)) { log_warn("  cannot read " + p); continue; }
+            if (!s.load_header(p) && !s.load(p)) { log_warn("  cannot read " + p); continue; }
             total += s.n_tokens();
             log_info(strfmt("  %-40s %10s tokens  %8s docs  mask=%s",
                             fs::path(p).filename().string().c_str(),
@@ -1514,6 +1703,7 @@ int main(int argc, char** argv) {
         if (cmd == "json" || cmd == "json-inspect" || cmd == "dump-text")
             return cmd_json_removed(args);
         if (cmd == "parquet")         return cmd_parquet(args);
+        if (cmd == "parquet-corpus")  return cmd_parquet_corpus(args);
         if (cmd == "tok-info")        return cmd_tok_info(args);
         if (cmd == "csvs")            return cmd_csvs(args);
         if (cmd == "csv2json")        return cmd_csv2json(args);

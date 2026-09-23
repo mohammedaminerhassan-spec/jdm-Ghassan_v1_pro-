@@ -1,8 +1,12 @@
-# Ghassan Pro Aux-Free — DeepSeek-V3 §3.2 aux-loss-free MoE (EMA bias, no aux grad).
+# Ghassan v1 Pro Aux-Free — research recipe (English).
+# DeepSeek-V3 §3.2 aux-loss-free MoE (EMA bias, no aux grad).
 # Requires moe_aux_scale 0.0. Bias lives in Model (host+device), persists in
 # native GGUF as layers.{L}.moe_bias (F32). Missing on load = init 0.
+# NOTE: training .ckpt resume does NOT yet persist the EMA bias (see
+# PROJECT_ANALYSIS.md) — use native GGUF for exact aux-free handoff.
 # Kernels: CPU+CUDA moe_forward_bias (selection on probs+bias, weights pure softmax).
-# Use for research runs; flagship ultra_1b keeps classic aux 0.01 for stability.
+# Research only; the flagship en_pro keeps classic aux 0.01 for stability.
+# DATA: shared English lake shards (artifacts/shards_en, english32k keep-case).
 
 model:
   vocab_size: 32000
@@ -34,7 +38,7 @@ model:
   rope_type: 0
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -66,20 +70,17 @@ training:
   eval_batches: 20
   save_every: 500
   checkpoint_dir: artifacts/checkpoints/pro_auxfree
-  data_dir: artifacts/shards_1b
+  data_dir: artifacts/shards_en
   resume: auto
   activation_checkpointing: false
   ckpt_segments: 1
 
 # inference sampling (CLI only): --temp 0.7 --top-k 40 --top-p 0.92 --min-p 0.05
-# --repeat 1.12 --no-repeat-ngram 3 (Darija anti-loop)
+# --repeat 1.12 --no-repeat-ngram 0 (English: keep connectors/steps repeatable)
 
 data:
-  train_glob: artifacts/shards_1b/train_*.gbin
-  val_glob: artifacts/shards_1b/val_*.gbin
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
   mix:
-    darija_conversational: 0.40
-    darija_vocab: 0.20
-    darija_speak: 0.15
-    educational_science: 0.15
-    darija_qa: 0.10
+    english_chat: 0.80
+    english_instruction: 0.20

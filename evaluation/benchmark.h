@@ -53,18 +53,21 @@ struct ItemResult {
     bool         length_ok = true;
     bool         robotic = false;
     bool         toxic = false;
+    bool         discipline_ok = true;
     double       distinct1 = 0, distinct2 = 0;
     int          max_ngram_repeat = 0;
     double       darija_ratio = 0, msa_ratio = 0;
     int          words = 0;
     double       seconds = 0;
     double       score = 0;   // 0..1 automatic score
+    double       tokens_per_sec = 0;  // FIX P2: was never filled; now estimated
 };
 
 struct CategoryScore {
     int    items = 0;
     double score_sum = 0;
     int    matched = 0, robotic = 0, toxic = 0, lang_fail = 0, length_fail = 0;
+    int    discipline_fail = 0;
     double avg() const { return items ? score_sum / items : 0.0; }
 };
 
@@ -72,7 +75,7 @@ struct BenchmarkReport {
     std::vector<ItemResult> results;
     std::map<std::string, CategoryScore> by_category;
     double overall = 0;
-    double robotic_rate = 0, toxicity_rate = 0, repetition_rate = 0;
+    double robotic_rate = 0, toxicity_rate = 0, repetition_rate = 0, discipline_rate = 0;
     double avg_distinct1 = 0, avg_distinct2 = 0;
     double avg_darija_ratio = 0, avg_msa_leak = 0;
     double avg_words = 0, tokens_per_sec = 0;

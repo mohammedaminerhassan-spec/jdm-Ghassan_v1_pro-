@@ -1,5 +1,15 @@
-# Ghassan v1 English-Pro — SFT stage (matches en_pro.yaml architecture exactly).
-# Stage 2 after en_pro pretrain. Same shards, heavier instruction weight.
+# Ghassan v1 Pro — English SFT stage (matches en_pro.yaml architecture exactly).
+# Stage 2 after en_pro pretrain. Same shards, heavier instruction weight, so
+# the model learns task obedience, direct answers, and honest refusals.
+# Assistant-only loss masks: only assistant spans train (see ChatTemplate).
+#
+# DATA: same artifacts/shards_en as pretrain (train_english_chat_*
+#   + train_english_instruction_*). No separate SFT shards needed.
+# CONTEXT: same window contract as en_pro (max_seq_len 4096, train/data seq
+#   1024, inference --ctx N). Keep this file's model.* block byte-identical
+#   to en_pro.yaml or resume fails the architecture gate.
+#
+# TRAIN: see the en_pro.yaml header command (CONFIG_SFT=configs/sft_en_pro.yaml).
 
 model:
   vocab_size: 32000

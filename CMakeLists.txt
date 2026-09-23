@@ -149,10 +149,8 @@ endif()
 # Native .parquet reading needs Apache Arrow C++ (large dependency, absent on
 # most machines). OFF by default for local CPU builds; Kaggle training MUST
 # use kaggle/setup.sh --with-parquet which installs Arrow and turns this ON.
-# There is NO JSON file route anymore (parquet-only project): Hermes was
-# converted once via tools/convert_hermes_to_parquet.py into
-# english_parquet/english_chat_part*.parquet + english_instruction_part*.parquet.
-# Without Arrow, `data_pipeline parquet` fails loudly (never silent).
+# There is NO JSON file route anymore (parquet-only project): the supplied
+# english_parquet lake is read directly into .gbin shards.
 set(GAI_HAVE_PARQUET OFF)
 if(GAI_ENABLE_PARQUET)
     find_package(Arrow QUIET)
@@ -218,10 +216,13 @@ if(GAI_BUILD_TESTS)
     file(GLOB GAI_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
     foreach(tsrc ${GAI_TEST_SOURCES})
         get_filename_component(tname ${tsrc} NAME_WE)
-        add_executable(${tname} ${tsrc})
+        add_executable(${tname} ${tsrc} ${CMAKE_SOURCE_DIR}/tools/cli_common.cpp)
         target_link_libraries(${tname} PRIVATE gai_core)
         gai_apply_cxx_flags(${tname})
-        add_test(NAME ${tname} COMMAND ${tname})
+        add_test(NAME ${tname} COMMAND ${tname} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        # FIX P2 (hang blocks Kaggle ctest): no TIMEOUT meant a hung test
+        # stalled the whole cell forever. 120s is generous for CPU unit tests.
+        set_tests_properties(${tname} PROPERTIES TIMEOUT 120)
     endforeach()
 endif()
 

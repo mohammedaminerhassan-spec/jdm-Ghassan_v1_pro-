@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# kaggle/train_full.sh — Ghassan v1 Flash two-stage training (Kaggle GPU, one session).
+# kaggle/train_full.sh — Ghassan v1 Pro English two-stage training (Kaggle GPU, one session).
 #
-#   Stage A (pretrain, ~55% of budget): raw Darija LM on artifacts/shards_pt
-#   Stage B (SFT,      ~45% of budget): chat tuning on artifacts/shards_sft
-#   -> GGUF export -> Darija smoke test. Fits inside ONE Kaggle session.
+#   Stage A (pretrain, ~55% of budget): English LM on artifacts/shards_en
+#   Stage B (SFT,      ~45% of budget): chat tuning on artifacts/shards_en
+#   -> GGUF export -> English smoke test. Fits inside ONE Kaggle session.
 #
 # Usage:
 #   bash kaggle/train_full.sh                                   # 6h budget (default)
@@ -17,8 +17,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MODE="full"
-CONFIG_PT="${REPO_DIR}/configs/flash_moe.yaml"
-CONFIG_SFT="${REPO_DIR}/configs/sft.yaml"
+CONFIG_PT="${REPO_DIR}/configs/en_pro.yaml"
+CONFIG_SFT="${REPO_DIR}/configs/sft_en_pro.yaml"
 CONFIG_PILOT="${REPO_DIR}/kaggle/configs/pilot_moe.yaml"
 TIME_BUDGET_MIN=360
 EXPORT_GGUF=1
@@ -40,16 +40,30 @@ done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
-TOK="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
-if [[ ! -f "${TOK}" ]]; then TOK="${REPO_DIR}/artifacts/tokenizer/darija.gtok"; fi
-PT_DIR="${REPO_DIR}/artifacts/shards_pt"
-SFT_DIR="${REPO_DIR}/artifacts/shards_sft"
-CKPT_PT="${REPO_DIR}/artifacts/checkpoints/flash"
-GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-flash_${EXPORT_PROFILE}.gguf"
+TOK="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
+PT_DIR="${REPO_DIR}/artifacts/shards_en"
+SFT_DIR="${REPO_DIR}/artifacts/shards_en"
+CKPT_PT="${REPO_DIR}/artifacts/checkpoints/en_pro"
+CKPT_SFT="${REPO_DIR}/artifacts/checkpoints/en_pro_sft"
+GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
+
+# FIX P2 (6h run lost on preemption): train_full.sh had no persist trap while
+# train_1b.sh does. Copy the same snapshot-on-exit so Kaggle preemption keeps
+# checkpoints + GGUF (mirrors train_1b.sh:74-83).
+persist_output() {
+    if [[ -d "/kaggle/working" ]]; then
+        mkdir -p /kaggle/working/output 2>/dev/null || true
+        cp -r "${CKPT_PT}" /kaggle/working/output/ 2>/dev/null || true
+        cp -r "${CKPT_SFT}" /kaggle/working/output/ 2>/dev/null || true
+        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
+        echo "[persist] snapshot copied to /kaggle/working/output"
+    fi
+}
+trap persist_output EXIT INT TERM
 
 echo "============================================================"
-echo "  Ghassan v1 Flash — Two-Stage Kaggle Training [${MODE}]"
-echo "  A: pretrain  B: sft  -> GGUF export -> Darija smoke test"
+echo "  Ghassan v1 Pro English — Two-Stage Kaggle Training [${MODE}]"
+echo "  A: pretrain  B: sft  -> GGUF export -> English smoke test"
 echo "============================================================"
 
 [[ -f "${BINARY}" ]] || { echo "[ERROR] gai_train missing. Run setup.sh first."; exit 1; }
@@ -85,7 +99,7 @@ fi
 
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-mkdir -p "${CKPT_PT}" "${REPO_DIR}/artifacts/checkpoints/flash_sft"
+mkdir -p "${CKPT_PT}" "${REPO_DIR}/artifacts/checkpoints/en_pro_sft"
 
 # ---------------------------------------------------------------- pilot: measure tok/s
 echo ""
@@ -127,7 +141,7 @@ echo "[plan] ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens this session"
 
 # ---------------------------------------------------------------- Stage A: pretrain
 echo ""
-echo "[stage-A] Pretraining on raw Darija (${PT_STEPS} steps)..."
+echo "[stage-A] Pretraining Pro English (${PT_STEPS} steps)..."
 T0=$(date +%s)
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
     --data "${PT_DIR}" --max-steps "${PT_STEPS}" --warmup "${PT_WARM}" \
@@ -137,7 +151,7 @@ echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 
 # ---------------------------------------------------------------- Stage B: SFT
 echo ""
-echo "[stage-B] Instruction tuning on Darija chat (${SFT_STEPS} steps)..."
+echo "[stage-B] Instruction tuning on English chat (${SFT_STEPS} steps)..."
 T0=$(date +%s)
 if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
@@ -153,21 +167,21 @@ else
 fi
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 
-# ---------------------------------------------------------------- smoke test (Darija!)
+# ---------------------------------------------------------------- smoke test (English!)
 # SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
 # must carry its own tokenizer) and no swallowed failure — a broken export
 # must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
-    echo "[smoke] Darija generation test (no sidecar)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
-        --prompt "labas, kidayer? chno smitk?" --max-tokens 40 || \
+    echo "[smoke] English generation test (no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" --persona en \
+        --prompt "Hello, who are you? What can you help me with?" --max-tokens 60 || \
         { echo "[smoke] FAIL: self-contained GGUF generation failed"; exit 1; }
     echo ""
-    echo "[smoke] Second prompt (Arabic script, no sidecar)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
-        --prompt "شنو هي العاصمة ديال المغرب؟" --max-tokens 60 || \
-        { echo "[smoke] FAIL: self-contained GGUF generation failed (arabic)"; exit 1; }
+    echo "[smoke] Second prompt (factual, no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" --persona en \
+        --prompt "What is the capital of Morocco?" --max-tokens 60 || \
+        { echo "[smoke] FAIL: self-contained GGUF generation failed (factual)"; exit 1; }
     echo "[smoke] OK: GGUF runs standalone, no sidecar needed"
 fi
 

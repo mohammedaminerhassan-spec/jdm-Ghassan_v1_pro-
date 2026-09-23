@@ -1,11 +1,15 @@
-# Ghassan Darija Ollama — MoE without shared expert for llama.cpp / Ollama / LM Studio.
-# Native flagship uses moe_shared=true (full quality in ghassan-ai only).
-# This variant sets moe_shared=false so `--compat llama_moe` export maps to
-# Mixtral-style tensors (ffn_gate_exps/up_exps/down_exps + gate_inp transposed).
-# Export: gai_train --config configs/darija_ollama.yaml --export model-ollama.gguf
-#         --export-profile q4_k_m --compat llama_moe --tokenizer artifacts/tokenizer/darija32k.gtok
-# Verify: ghassan-ai logits --model model-ollama.gguf --prompt "salam" vs llama.cpp
+# Ghassan v1 Pro English (Ollama variant) — MoE without shared expert for
+# llama.cpp / Ollama / LM Studio.
+# Native flagship (en_pro) uses moe_shared=true (full quality in ghassan-ai
+# only). This variant sets moe_shared=false so `--compat llama_moe` export
+# maps to Mixtral-style tensors (ffn_gate_exps/up_exps/down_exps + gate_inp).
+# NOTE: moe_shared=false changes the architecture, so this recipe can NOT
+# resume en_pro checkpoints — train it as its own base, then export.
+# Export: gai_train --config configs/en_ollama.yaml --export model-ollama.gguf
+#         --export-profile q4_0 --compat llama_moe --tokenizer artifacts/tokenizer/english32k.gtok
+# Verify: ghassan-ai logits --model model-ollama.gguf --prompt "Hello" vs llama.cpp
 # GGUF-only: no .gai files anywhere.
+# DATA: shared English lake shards (artifacts/shards_en, english32k keep-case).
 
 model:
   vocab_size: 32000
@@ -37,7 +41,7 @@ model:
   rope_type: 0              # REQUIRED 0 for Ollama
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -68,21 +72,18 @@ training:
   eval_every: 250
   eval_batches: 20
   save_every: 500
-  checkpoint_dir: artifacts/checkpoints/darija_ollama
-  data_dir: artifacts/shards_1b
+  checkpoint_dir: artifacts/checkpoints/en_ollama
+  data_dir: artifacts/shards_en
   resume: auto
   activation_checkpointing: false
   ckpt_segments: 1
 
 # inference sampling (CLI only): --temp 0.7 --top-k 40 --top-p 0.92 --min-p 0.05
-# --repeat 1.12 --no-repeat-ngram 3 (Darija anti-loop)
+# --repeat 1.12 --no-repeat-ngram 0 (English: keep connectors/steps repeatable)
 
 data:
-  train_glob: artifacts/shards_1b/train_*.gbin
-  val_glob: artifacts/shards_1b/val_*.gbin
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
   mix:
-    darija_conversational: 0.40
-    darija_vocab: 0.20
-    darija_speak: 0.15
-    educational_science: 0.15
-    darija_qa: 0.10
+    english_chat: 0.80
+    english_instruction: 0.20

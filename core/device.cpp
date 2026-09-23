@@ -94,13 +94,17 @@ void* device_alloc(size_t nbytes, Device dev, DType /*dt*/) {
     if (nbytes == 0) return nullptr;
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
-        // PRO-HARDEN: فحص VRAM الحرة قبل cudaMalloc يعطي رسالة عملية
-        // (أي B/T تخفض) بدل GAI_FAIL غامض وسط step يضيع ساعة T4.
-        const DeviceInfo& di = device_info();
-        if (di.cuda_available && di.free_mem > 0 && nbytes > di.free_mem) {
-            GAI_FAIL(strfmt("CUDA OOM guard: need %s but only %s free. "
-                            "Lower batch_size/seq_len/max_context (see dry-run).",
-                            human_bytes(nbytes).c_str(), human_bytes(di.free_mem).c_str()));
+        // FIX P2-1: old guard compared against stale startup free_mem
+        // (device_info() is cached once). Query live VRAM so the guard
+        // stays correct after GBs of weights/workspaces.
+        // Only guard huge allocs (>64MB) to avoid a MemGetInfo per tiny tensor.
+        if (nbytes > (64ull << 20)) {
+            size_t live_free = cuda::free_bytes_live();
+            if (live_free > 0 && nbytes > live_free) {
+                GAI_FAIL(strfmt("CUDA OOM guard: need %s but only %s free live. "
+                                "Lower batch_size/seq_len/max_context (see dry-run).",
+                                human_bytes(nbytes).c_str(), human_bytes(live_free).c_str()));
+            }
         }
         return cuda::malloc_device(nbytes);
 #else

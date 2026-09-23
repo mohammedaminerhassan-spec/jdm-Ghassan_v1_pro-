@@ -62,22 +62,30 @@ double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
         }
         // fall through to CPU path if the GPU helper is unavailable
     }
-    std::vector<i32> h_idx(static_cast<size_t>(N) * K);
-    device_copy(h_idx.data(), Device::CPU, idx, dev,
-                sizeof(i32) * h_idx.size());
-    std::vector<float> h_probs(static_cast<size_t>(N) * ne);
-    device_copy(h_probs.data(), Device::CPU, probs, dev,
-                sizeof(float) * h_probs.size());
+    std::vector<i32> h_idx;
+    std::vector<float> h_probs;
+    const i32* idx_h = idx;
+    const float* probs_h = probs;
+    if (dev != Device::CPU) {
+        h_idx.resize(static_cast<size_t>(N) * K);
+        device_copy(h_idx.data(), Device::CPU, idx, dev,
+                    sizeof(i32) * h_idx.size());
+        h_probs.resize(static_cast<size_t>(N) * ne);
+        device_copy(h_probs.data(), Device::CPU, probs, dev,
+                    sizeof(float) * h_probs.size());
+        idx_h = h_idx.data();
+        probs_h = h_probs.data();
+    }
 
     std::vector<double> cnt(ne, 0.0), psum(ne, 0.0);
     for (i64 t = 0; t < N; ++t)
         for (int k = 0; k < K; ++k) {
-            int e = h_idx[static_cast<size_t>(t) * K + k];
+            int e = idx_h[static_cast<size_t>(t) * K + k];
             if (e >= 0 && e < ne) cnt[e] += 1.0;
         }
     for (i64 t = 0; t < N; ++t)
         for (int e = 0; e < ne; ++e)
-            psum[e] += h_probs[static_cast<size_t>(t) * ne + e];
+            psum[e] += probs_h[static_cast<size_t>(t) * ne + e];
 
     std::vector<float> frac(ne);
     double raw = 0.0;
@@ -192,22 +200,29 @@ void ModelConfig::validate() const {
     GAI_CHECK(head_dim() % 2 == 0, "head_dim must be even (RoPE pairs)");
     GAI_CHECK(intermediate_size > 0, "intermediate_size must be > 0");
     GAI_CHECK(max_seq_len > 0, "max_seq_len must be > 0");
-    GAI_CHECK(rope_theta > 0.0f, "rope_theta must be > 0");
+    GAI_CHECK(std::isfinite(rope_theta) && rope_theta > 0.0f, "rope_theta must be finite and > 0");
     // DeepSeek stability contract: rms_eps/init_std silently break norms/init
     // when <= 0 (inf/NaN or zero-init dead model). Aux weight > 1 drowns CE.
-    GAI_CHECK(rms_eps >= 1e-12f && rms_eps <= 1e-2f, "rms_eps must be in [1e-12,1e-2]");
-    GAI_CHECK(init_std > 0.0f && init_std <= 0.1f, "init_std must be in (0,0.1]");
-    GAI_CHECK(rope_scale >= 1.0f, "rope_scale must be >= 1.0 (1.0 = off)");
+    GAI_CHECK(std::isfinite(rms_eps) && rms_eps >= 1e-12f && rms_eps <= 1e-2f,
+              "rms_eps must be finite and in [1e-12,1e-2]");
+    GAI_CHECK(std::isfinite(init_std) && init_std > 0.0f && init_std <= 0.1f,
+              "init_std must be finite and in (0,0.1]");
+    GAI_CHECK(std::isfinite(rope_scale) && rope_scale >= 1.0f, "rope_scale must be finite and >= 1.0 (1.0 = off)");
     // YaRN is approximate NTK extrapolation: small scales (2x) are routine,
     // large scales are unvalidated here. Bound it so a typo (e.g. 20 instead
     // of 2.0) fails fast instead of training with garbage positions.
     GAI_CHECK(rope_scale <= 8.0f, "rope_scale must be <= 8.0 (larger is unvalidated extrapolation)");
-    GAI_CHECK(z_loss_scale >= 0.0f && z_loss_scale <= 0.01f, "z_loss_scale must be in [0,0.01]");
-    GAI_CHECK(moe_jitter >= 0.0f && moe_jitter <= 0.5f, "moe_jitter must be in [0,0.5]");
-    GAI_CHECK(rope_yarn_mscale >= 0.0f && rope_yarn_mscale <= 2.0f, "rope_yarn_mscale must be in [0,2]");
+    GAI_CHECK(std::isfinite(z_loss_scale) && z_loss_scale >= 0.0f && z_loss_scale <= 0.01f,
+              "z_loss_scale must be finite and in [0,0.01]");
+    GAI_CHECK(std::isfinite(moe_jitter) && moe_jitter >= 0.0f && moe_jitter <= 0.5f,
+              "moe_jitter must be finite and in [0,0.5]");
+    GAI_CHECK(std::isfinite(rope_yarn_mscale) && rope_yarn_mscale >= 0.0f && rope_yarn_mscale <= 2.0f,
+              "rope_yarn_mscale must be finite and in [0,2]");
     // ---- Pro fields (default OFF = bit-identical legacy; فعلها فقط لـPro جديد)
-    GAI_CHECK(rope_yarn_low >= 1.0f && rope_yarn_low <= 128.0f, "rope_yarn_low must be in [1,128]");
-    GAI_CHECK(rope_yarn_high >= 1.0f && rope_yarn_high <= 128.0f, "rope_yarn_high must be in [1,128]");
+    GAI_CHECK(std::isfinite(rope_yarn_low) && rope_yarn_low >= 1.0f && rope_yarn_low <= 128.0f,
+              "rope_yarn_low must be finite and in [1,128]");
+    GAI_CHECK(std::isfinite(rope_yarn_high) && rope_yarn_high >= 1.0f && rope_yarn_high <= 128.0f,
+              "rope_yarn_high must be finite and in [1,128]");
     GAI_CHECK(rope_yarn_high >= rope_yarn_low, "rope_yarn_high must be >= rope_yarn_low");
     GAI_CHECK(sliding_window >= 0 && sliding_window <= 16384, "sliding_window must be in [0,16384]");
     GAI_CHECK(rope_type == 0 || rope_type == 1, "rope_type must be 0 (interleaved) or 1 (neox)");
@@ -230,8 +245,8 @@ void ModelConfig::validate() const {
                   "moe_top_k must be <= num_experts/2 (sparse MoE; dense routing OOMs T4 and removes the MoE advantage; "
                   "set model.moe_allow_dense=true only for short research runs)");
         GAI_CHECK(moe_expert_dim > 0, "moe_expert_dim must be > 0");
-        GAI_CHECK(moe_aux_scale >= 0.0f && moe_aux_scale <= 1.0f,
-                  "moe_aux_scale must be in [0,1] (larger drowns CE loss)");
+        GAI_CHECK(std::isfinite(moe_aux_scale) && moe_aux_scale >= 0.0f && moe_aux_scale <= 1.0f,
+                  "moe_aux_scale must be finite and in [0,1] (larger drowns CE loss)");
     }
     // Attention kernel shared memory limit (T4: 48KB). The flash-style kernel
     // uses shared memory: sQ[hd] + sK[KV_TILE*hd] + sV[KV_TILE*hd] + sS[KV_TILE] + sAcc[hd]
@@ -509,10 +524,6 @@ ParamReport Model::parameter_report() const {
 
 void Model::to(Device dev) {
     if (device_ == dev) return;
-    // PRO-HARDEN: نقل الأوزان فقط يترك Trainer::act_/ckpt_act_ و
-    // Generator::cache_/scratch على الجهاز القديم فيكون التالي cross-device
-    // GEMM/copies -> illegal access. لا يمكن للـModel إعادة بناء arenas
-    // خارجية، لذا نحذر بصوت عال: بعد to() يجب إعادة بناء Trainer/Generator.
     log_warn("[model] Model::to() moved weights; REBUILD Trainer activations and "
              "Generator cache/scratch on the new device before next step "
              "(cross-device use-after-move crashes T4).");
@@ -521,6 +532,21 @@ void Model::to(Device dev) {
         if (p->g.defined()) p->g = p->g.to(dev);
     }
     device_ = dev;
+    if (cfg_.use_moe && cfg_.moe_aux_free) {
+        const size_t L = static_cast<size_t>(cfg_.num_layers);
+        if (moe_bias_.size() != L)
+            moe_bias_.assign(L, std::vector<float>(static_cast<size_t>(cfg_.num_experts), 0.0f));
+        moe_bias_dev_.clear();
+        if (dev == Device::CUDA) {
+            moe_bias_dev_.reserve(L);
+            for (size_t l = 0; l < L; ++l) {
+                Tensor t({cfg_.num_experts}, DType::F32, dev);
+                device_copy(t.data_ptr(), dev, moe_bias_[l].data(), Device::CPU,
+                            sizeof(float) * moe_bias_[l].size());
+                moe_bias_dev_.push_back(std::move(t));
+            }
+        }
+    }
 }
 
 std::string ParamReport::to_string(const ModelConfig& cfg) const {
@@ -569,6 +595,9 @@ void Model::print_parameter_report() const {
 // ---------------------------------------------------------------- init
 void Model::init_weights(u64 seed) {
     Rng rng(seed);
+    if (cfg_.use_moe && cfg_.moe_aux_free) {
+        for (auto& bias : moe_bias_) std::fill(bias.begin(), bias.end(), 0.0f);
+    }
     const float std_base = cfg_.init_std;
     // scaled init for residual projections (GPT-2 style depth scaling)
     const float std_res = std_base / std::sqrt(2.0f * static_cast<float>(cfg_.num_layers));
@@ -898,6 +927,14 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
 // including) the final norm. The lm_head GEMM is left to the caller so the
 // training path can chunk it (roadmap item 6) instead of materializing a
 // full [N,V] logits matrix.
+static void check_act_device(Device dev, const char* name, const Tensor& t) {
+    if (t.defined() && t.device() != dev) {
+        GAI_FAIL(std::string("stale activations: ") + name +
+                 " is on " + device_name(t.device()) + ", model is on " +
+                 device_name(dev) + " (rebuild activations after Model::to)");
+    }
+}
+
 void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
     // FIX: fail-fast guards (training/inference crash + T4/low-PC OOM safety).
     // Old code accepted B/T<=0 -> N<=0 cast to size_t = huge alloc -> OOM,
@@ -948,6 +985,14 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
         GAI_CHECK(static_cast<int>(act.saved_moe_probs.size()) == cfg_.num_layers,
                   "forward: MoE training needs with_grad Activations");
     }
+    check_act_device(dev, "act.x", act.x);
+    check_act_device(dev, "act.xb", act.xb);
+    check_act_device(dev, "act.logits", act.logits);
+    check_act_device(dev, "act.pos", act.pos);
+    if (train) {
+        check_act_device(dev, "act.saved_hnorm", act.saved_hnorm);
+        check_act_device(dev, "act.dx", act.dx);
+    }
 
     // position ids (repeated per batch element)
     // FIX (T4 perf/fragmentation): old code allocated a std::vector + a CPU
@@ -963,21 +1008,33 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
         act.bytes += act.pos.nbytes();
         act.pos_cached_B = -1;
         act.pos_cached_T = -1;
+        act.pos_cached_offset = -1;
     }
-    if (act.pos_cached_B != B || act.pos_cached_T != T) {
+    if (act.pos_cached_B != B || act.pos_cached_T != T || act.pos_cached_offset != act.pos_offset) {
         thread_local std::vector<i32> pos_staging;
         if (pos_staging.size() < static_cast<size_t>(N))
             pos_staging.resize(static_cast<size_t>(N));
         for (int b = 0; b < B; ++b)
-            for (int t = 0; t < T; ++t) pos_staging[static_cast<size_t>(b) * T + t] = t;
+            for (int t = 0; t < T; ++t)
+                pos_staging[static_cast<size_t>(b) * T + t] = act.pos_offset + t;
         device_copy(act.pos.data_ptr(), device_, pos_staging.data(), Device::CPU,
                     static_cast<size_t>(N) * sizeof(i32));
         act.pos_cached_B = B;
         act.pos_cached_T = T;
+        act.pos_cached_offset = act.pos_offset;
     }
 
     // ---- embeddings
     ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
+
+    // FIX P2 (RoPE cache): theta_eff/mscale involve pow+log and were
+    // recomputed per layer (26-36x per forward) plus per-token pow inside
+    // kernels. Hoist to locals once per forward (bit-identical math).
+    const float theta_eff_fwd = rope_theta_eff(cfg_);
+    const int rope_type_fwd = cfg_.rope_type;
+    const float yarn_low_fwd = cfg_.rope_yarn_low;
+    const float yarn_high_fwd = cfg_.rope_yarn_high;
+    const float yarn_scale_fwd = cfg_.rope_scale;
 
     for (int l = 0; l < cfg_.num_layers; ++l) {
         LayerParams& L = layers_[static_cast<size_t>(l)];
@@ -1013,11 +1070,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
                                  rrms_k, N * KV, hd, cfg_.rms_eps);
         }
 
-        const float theta_eff = rope_theta_eff(cfg_);
         // Pro kernels: NeoX + full YaRN ramp + SWA (DeepSeek-V3 / LLaMA-3 class).
         // Legacy path (rope_type 0, scale 1, window 0) is bit-identical to old calls.
-        ops::rope_forward_ex(dev, act.q.f32(), act.k.f32(), act.pos.i32p(), N, H, KV, hd, theta_eff,
-                             cfg_.rope_type, cfg_.rope_yarn_low, cfg_.rope_yarn_high, cfg_.rope_scale);
+        ops::rope_forward_ex(dev, act.q.f32(), act.k.f32(), act.pos.i32p(), N, H, KV, hd, theta_eff_fwd,
+                             rope_type_fwd, yarn_low_fwd, yarn_high_fwd, yarn_scale_fwd);
 
         if (train) {
             ops::copy(dev, act.saved_q[sl].f32(), act.q.f32(), N * qd);
@@ -1324,6 +1380,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     // On CUDA the hot path folded raws into the device accumulator: single
     // sync read here replaces 2x ne-float copies per layer (72/microbatch).
     if (use_dev_aux) aux_total = ops::moe_aux_end(dev);
+    if (cfg_.moe_aux_free) moe_aux_loss(act, B, T);
     // FIX (10/10): old code SUMMED over layers, so a 36L model got stronger
     // aux than a 26L model with the same scale. Average over layers so
     // moe_aux_scale means the same at any depth.

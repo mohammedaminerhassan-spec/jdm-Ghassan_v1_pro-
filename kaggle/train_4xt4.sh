@@ -52,11 +52,13 @@ PIDS=()
 cleanup_ranks() {
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
 }
-trap cleanup_ranks EXIT INT TERM
-for i in 0 1 2 3; do
+# FIX P2: loop was hardcoded 0..3 while WORLD_SIZE is overridable above,
+# so WORLD_SIZE=2 still spawned 4 ranks -> OOM. Honor WORLD_SIZE.
+trap cleanup_ranks INT TERM
+for i in $(seq 0 $((WORLD_SIZE - 1))); do
     LOCAL_RANK=$i RANK=$i "${BIN}" --config "$CONFIG" &
     PIDS[$i]=$!
-    echo "Started rank $i (pid ${PIDS[$i]})"
+    echo "Started rank $i/$WORLD_SIZE (pid ${PIDS[$i]})"
 done
 
 FAIL=0

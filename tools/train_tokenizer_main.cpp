@@ -15,14 +15,14 @@ using namespace gai;
 
 static void usage() {
     std::cout <<
-    "train_tokenizer - Arabic/Darija BPE tokenizer trainer\n\n"
+    "train_tokenizer - BPE tokenizer trainer (English default: --keep-case)\n\n"
     "usage:\n"
     "  train_tokenizer --input <file|dir> [--output tok.gtok] [--vocab 32000]\n"
     "  train_tokenizer --study --input <file|dir>        # compare 16k/24k/32k\n"
     "  train_tokenizer --synth 20000 --output tok.gtok   # train on generated darija\n\n"
     "options:\n"
     "  --input <path>      corpus file or directory of .txt/.jsonl (one doc per line)\n"
-    "  --output <path>     output .gtok file            [artifacts/tokenizer/darija32k.gtok]\n"
+    "  --output <path>     output .gtok file            [artifacts/tokenizer/english32k.gtok]\n"
     "  --vocab <n>         vocabulary size              [32000]\n"
     "  --min-freq <n>      minimum pair frequency       [2]\n"
     "  --synth <n>         add n synthetic darija conversations to the corpus\n"
@@ -139,15 +139,16 @@ int main(int argc, char** argv) {
             corpus_lines.insert(corpus_lines.end(), l.begin(), l.end());
         }
 
-        i64 nsynth = args.num("synth", 0);
+        const int nsynth = args.num_int("synth", 0);
+        GAI_CHECK(nsynth >= 0, "--synth must be >= 0");
         if (nsynth > 0) {
-            log_info(strfmt("[synth] generating %lld darija conversations for tokenizer training",
-                            static_cast<long long>(nsynth)));
+            log_info(strfmt("[synth] generating %d darija conversations for tokenizer training",
+                            nsynth));
             SynthConfig sc;
-            sc.num_conversations = static_cast<int>(nsynth);
+            sc.num_conversations = nsynth;
             sc.max_template_uses = 100000;   // tokenizer wants coverage, not novelty
             SynthGenerator gen(sc);
-            auto convs = gen.generate_many(static_cast<int>(nsynth));
+            auto convs = gen.generate_many(nsynth);
             for (const auto& c : convs)
                 for (const auto& m : c.messages) corpus_lines.push_back(m.content);
             log_info("[synth] " + gen.stats().summary());
@@ -186,7 +187,7 @@ int main(int argc, char** argv) {
                 log_info(strfmt("\n[study] training vocab=%d ...", v));
                 BpeTrainerConfig cfg;
                 cfg.vocab_size = v;
-                cfg.min_frequency = static_cast<int>(args.num("min-freq", 2));
+                cfg.min_frequency = args.num_int("min-freq", 2);
                 cfg.normalizer = ncfg;
                 cfg.verbose = false;
                 BpeTrainer tr(cfg);
@@ -233,8 +234,10 @@ int main(int argc, char** argv) {
 
         // ---------------- normal training
         BpeTrainerConfig cfg;
-        cfg.vocab_size = static_cast<int>(args.num("vocab", 32000));
-        cfg.min_frequency = static_cast<int>(args.num("min-freq", 2));
+        cfg.vocab_size = args.num_int("vocab", 32000);
+        cfg.min_frequency = args.num_int("min-freq", 2);
+        GAI_CHECK(cfg.vocab_size > 0 && cfg.vocab_size <= 10000000, "--vocab is out of range");
+        GAI_CHECK(cfg.min_frequency >= 0, "--min-freq must be >= 0");
         cfg.normalizer = ncfg;
         cfg.verbose = true;
 
@@ -247,16 +250,17 @@ int main(int argc, char** argv) {
 
         report_fertility(tk, "final");
 
-        std::string out = args.str("output", "artifacts/tokenizer/darija.gtok");
+        std::string out = args.str("output", "artifacts/tokenizer/english32k.gtok");
         fs::create_directories(fs::path(out).has_parent_path()
                                ? fs::path(out).parent_path() : fs::path("."));
         tk.save(out);
         log_info("[bpe] saved " + out);
 
-        // round-trip sanity on real Darija
+        // round-trip sanity on real English
         const char* probes[] = {
-            "شنو خبارك؟", "chno khbark a sahbi", "3lach ma jiti",
-            "بغيت نdownloadi هاد الفيديو", "السلام عليكم ورحمة الله",
+            "How are you today?", "Write a Python function that counts vowels",
+            "Explain why the sky is blue", "Pick one:\nA. Red\nB. Blue",
+            "Summarize this paragraph in one sentence",
         };
         log_info("  ---- sample encodings ----");
         for (const char* p : probes) {

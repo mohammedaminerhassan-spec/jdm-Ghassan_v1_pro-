@@ -3,6 +3,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace gai {
 
@@ -178,8 +180,32 @@ static bool full_number(const std::string& s, bool allow_float, i64& oi, double&
             return true;
         }
         od = std::stod(s, &pos);
+        if (pos != s.size() || !std::isfinite(od)) return false;
+        if (od >= static_cast<double>(std::numeric_limits<i64>::min()) &&
+            od <= static_cast<double>(std::numeric_limits<i64>::max()))
+            oi = static_cast<i64>(od);
+        else
+            oi = 0;
+        return true;
+    } catch (...) { return false; }
+}
+
+static bool full_integer_number(const std::string& s, i64& out) {
+    try {
+        size_t pos = 0;
+        const long long v = std::stoll(s, &pos);
         if (pos != s.size()) return false;
-        oi = static_cast<i64>(od);
+        out = static_cast<i64>(v);
+        return true;
+    } catch (...) {}
+    try {
+        size_t pos = 0;
+        const double v = std::stod(s, &pos);
+        if (pos != s.size() || !std::isfinite(v) || std::trunc(v) != v ||
+            v < static_cast<double>(std::numeric_limits<i64>::min()) ||
+            v > static_cast<double>(std::numeric_limits<i64>::max()))
+            return false;
+        out = static_cast<i64>(v);
         return true;
     } catch (...) { return false; }
 }
@@ -188,10 +214,8 @@ i64 Config::get_int(const std::string& key, i64 def) const {
     auto it = kv_.find(key);
     if (it == kv_.end() || it->second.empty()) return def;
     // Strict trailing check: "0.01abc" or "3e-4x" must not parse as 0.01.
-    i64 oi = 0; double od = 0.0;
-    if (full_number(trim(it->second), false, oi, od)) return oi;
-    // Accept float spelling for ints ("1e4") only when fully consumed.
-    if (full_number(trim(it->second), true, oi, od)) return oi;
+    i64 value = 0;
+    if (full_integer_number(trim(it->second), value)) return value;
     log_warn("config: ignoring malformed int for '" + key + "': '" + it->second + "'");
     return def;
 }
@@ -224,9 +248,8 @@ i64 Config::get_int_strict(const std::string& key) const {
     auto it = kv_.find(key);
     if (it == kv_.end() || it->second.empty())
         GAI_FAIL("config: missing required int '" + key + "'");
-    i64 oi = 0; double od = 0.0;
-    if (full_number(trim(it->second), false, oi, od)) return oi;
-    if (full_number(trim(it->second), true, oi, od)) return oi;
+    i64 value = 0;
+    if (full_integer_number(trim(it->second), value)) return value;
     GAI_FAIL("config: malformed int for '" + key + "': '" + it->second + "' (refusing silent default)");
     return 0;
 }

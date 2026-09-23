@@ -14,6 +14,8 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <atomic>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using namespace gai;
@@ -28,7 +30,7 @@ static void usage() {
     "  ghassan-ai quantize  --model in.gguf --out out.gguf --profile q4_0\n"
     "  ghassan-ai bench     --model model.gguf [--tokens 128]\n"
     "  ghassan-ai tokenize  --model model.gguf --text \"شنو خبارك\"\n"
-    "  ghassan-ai eval      --model model.gguf --suite evaluation/datasets\n"
+    "  ghassan-ai eval      --model model.gguf --suite evaluation/en\n"
     "  ghassan-ai export    --checkpoint last.ckpt --tokenizer tok.gtok --out model.gguf [--profile fp16|q8_k|q4_0] [--compat native|llama|llama_moe]\n"
     "  ghassan-ai devices\n"
     "  ghassan-ai logits    --model model.gguf --prompt \"salam\" [--out logits.f32]\n\n"
@@ -48,6 +50,7 @@ static void usage() {
   "  --no-fast-sample  disable GPU fast sampling (legacy full-vocab path)\n"
     "  --system <text>   system prompt\n"
     "  --persona <name>  darija (default, ScriptRouter) | en (English persona)\n"
+    "  --no-adaptive     disable English dialog-act sampling presets\n"
     "  --no-stream       print the reply at once\n"
     "  --device auto|cpu|cuda  (metal/vulkan fall back to portable CPU)\n"
     "  --gemm-fp16 0|1        CUDA tensor-core GEMMs (default 1; 0 = pure fp32)\n"
@@ -163,12 +166,13 @@ static LoadedModel load_model(const Args& args) {
             log_info("[load] using tokenizer embedded in GGUF (no sidecar needed)");
         } else {
             // Legacy files (pre-embedding export): sidecar .gtok next to model.
-            std::string def = (fs::path(path).parent_path() / "tokenizer" / "darija.gtok").string();
-            if (!fs::exists(def)) def = "artifacts/tokenizer/darija.gtok";
+            std::string def = (fs::path(path).parent_path() / "tokenizer" / "english32k.gtok").string();
+            if (!fs::exists(def)) def = "artifacts/tokenizer/english32k.gtok";
             if (!fs::exists(def)) def = "artifacts/tokenizer/darija32k.gtok";
+            if (!fs::exists(def)) def = "artifacts/tokenizer/darija.gtok";
             GAI_CHECK(lm.tokenizer.load(def),
                       "legacy GGUF without embedded tokenizer; pass --tokenizer "
-                      "(e.g. artifacts/tokenizer/darija32k.gtok) or re-export");
+                      "(e.g. artifacts/tokenizer/english32k.gtok) or re-export");
         }
         GAI_CHECK(lm.tokenizer.vocab_size() == lm.cfg.vocab_size,
                   strfmt("tokenizer/model vocab mismatch: %d vs %d",
@@ -234,13 +238,15 @@ static LoadedModel load_model(const Args& args) {
 
 static GenerationConfig make_gen_config(const Args& a) {
     GenerationConfig g;
-    g.max_new_tokens = static_cast<int>(a.num("max-tokens", 256));
+    g.max_new_tokens = a.num_int("max-tokens", 256);
+    GAI_CHECK(g.max_new_tokens >= 0 && g.max_new_tokens <= 1000000,
+              "--max-tokens must be in [0,1000000]");
     g.sampling.temperature = static_cast<float>(a.real("temp", 0.8));
-    g.sampling.top_k = static_cast<int>(a.num("top-k", 40));
+    g.sampling.top_k = a.num_int("top-k", 40);
     g.sampling.top_p = static_cast<float>(a.real("top-p", 0.92));
     g.sampling.min_p = static_cast<float>(a.real("min-p", 0.05));
     g.sampling.repetition_penalty = static_cast<float>(a.real("repeat", 1.12));
-    g.sampling.no_repeat_ngram = static_cast<int>(a.num("no-repeat-ngram", 0));
+    g.sampling.no_repeat_ngram = a.num_int("no-repeat-ngram", 0);
     g.sampling.seed = static_cast<u64>(a.num("seed", 0));
     g.sampling.greedy = a.flag("greedy", false);
     g.sampling.gpu_fast_sample = !a.flag("no-fast-sample", false);
@@ -251,10 +257,12 @@ static GenerationConfig make_gen_config(const Args& a) {
 // ---------------------------------------------------------------- commands
 static int cmd_chat(const Args& args) {
     LoadedModel lm = load_model(args);
-    Generator gen(*lm.model, lm.tokenizer, static_cast<int>(args.num("ctx", 0)));
-
     ChatOptions opts;
     opts.gen = make_gen_config(args);
+    opts.adaptive_dialog = !args.flag("no-adaptive", false);
+    opts.gen.max_context = args.num_int("ctx", 0);
+    GAI_CHECK(opts.gen.max_context >= 0, "--ctx must be >= 0");
+    Generator gen(*lm.model, lm.tokenizer, opts.gen.max_context);
     opts.stream = !args.flag("no-stream");
     opts.show_stats = args.flag("stats");
     if (args.has("system")) opts.system = args.str("system");
@@ -296,7 +304,10 @@ static int cmd_generate(const Args& args) {
         // no hit -> fall through to generative path
     }
     LoadedModel lm = load_model(args);
-    Generator gen(*lm.model, lm.tokenizer, static_cast<int>(args.num("ctx", 0)));
+    GenerationConfig g = make_gen_config(args);
+    g.max_context = args.num_int("ctx", 0);
+    GAI_CHECK(g.max_context >= 0, "--ctx must be >= 0");
+    Generator gen(*lm.model, lm.tokenizer, g.max_context);
 
     std::string prompt = args.str("prompt");
     if (prompt.empty() && !args.positional().empty() && args.positional().size() > 1) {
@@ -304,7 +315,6 @@ static int cmd_generate(const Args& args) {
     }
     GAI_CHECK(!prompt.empty(), "--prompt is required");
 
-    GenerationConfig g = make_gen_config(args);
     bool stream = !args.flag("no-stream");
 
     std::string out;
@@ -468,7 +478,12 @@ static int cmd_quantize(const Args& args) {
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             GAI_CHECK(r.load_tokenizer(tk), "GGUF tokenizer payload corrupt; pass --tokenizer");
-            fs::path tmp = fs::temp_directory_path() / "gguf_requant.gtok";
+            // FIX P2 (temp collision): fixed name collided when two quantize
+            // processes ran concurrently. Unique per-process name instead.
+            static std::atomic<unsigned> quant_tmp_ctr{0};
+            std::string uniq = "gguf_requant_" +
+                std::to_string((unsigned long long)::rand() ^ (unsigned long long)quant_tmp_ctr++) + ".gtok";
+            fs::path tmp = fs::temp_directory_path() / uniq;
             tk.save(tmp.string());
             tmp_tok = tmp.string();
             tok_path = tmp_tok;
@@ -481,7 +496,10 @@ static int cmd_quantize(const Args& args) {
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             if (r.load_tokenizer(tk)) {
-                fs::path tmp = fs::temp_directory_path() / "gai_to_gguf.gtok";
+                static std::atomic<unsigned> gai_tmp_ctr{0};
+                std::string uniq = "gai_to_gguf_" +
+                    std::to_string((unsigned long long)::rand() ^ (unsigned long long)gai_tmp_ctr++) + ".gtok";
+                fs::path tmp = fs::temp_directory_path() / uniq;
                 tk.save(tmp.string());
                 tmp_tok = tmp.string();
                 tok_path = tmp_tok;
@@ -528,14 +546,18 @@ static int cmd_quantize(const Args& args) {
 
 static int cmd_bench(const Args& args) {
     LoadedModel lm = load_model(args);
-    Generator gen(*lm.model, lm.tokenizer, static_cast<int>(args.num("ctx", 512)));
+    const int bench_ctx = args.num_int("ctx", 512);
+    const int ntok = args.num_int("tokens", 64);
+    const int nprompt = args.num_int("prompt-tokens", 32);
+    GAI_CHECK(bench_ctx >= 0, "--ctx must be >= 0");
+    GAI_CHECK(ntok >= 0 && ntok <= 1000000, "--tokens must be in [0,1000000]");
+    GAI_CHECK(nprompt > 0, "--prompt-tokens must be > 0");
+    Generator gen(*lm.model, lm.tokenizer, bench_ctx);
 
-    const int ntok = static_cast<int>(args.num("tokens", 64));
-    const int nprompt = static_cast<int>(args.num("prompt-tokens", 32));
-
+    const int vocab = lm.model->config().vocab_size;
     std::vector<i32> prompt;
     prompt.push_back(special::BOS);
-    for (int i = 1; i < nprompt; ++i) prompt.push_back(300 + (i * 37) % 2000);
+    for (int i = 1; i < nprompt; ++i) prompt.push_back((300 + (i * 37)) % vocab);
 
     log_info(strfmt("[bench] prefill %d tokens, decode %d tokens on %s",
                     nprompt, ntok, device_name(lm.model->device())));
@@ -545,6 +567,7 @@ static int cmd_bench(const Args& args) {
 
     GenerationConfig g;
     g.max_new_tokens = ntok;
+    g.max_context = bench_ctx;
     g.stop_tokens.clear();
     g.sampling.greedy = true;
     gen.generate(g);
@@ -642,15 +665,17 @@ static int cmd_export(const Args& args) {
 
 static int cmd_eval(const Args& args) {
     LoadedModel lm = load_model(args);
-    Generator gen(*lm.model, lm.tokenizer, static_cast<int>(args.num("ctx", 1024)));
-
     BenchmarkConfig bc;
-    bc.suite_dir = args.str("suite", "evaluation/datasets");
-    bc.max_prompts = static_cast<int>(args.num("limit", 0));
+    bc.suite_dir = args.str("suite", "evaluation/en");
+    bc.max_prompts = args.num_int("limit", 0);
+    GAI_CHECK(bc.max_prompts >= 0, "--limit must be >= 0");
+    bc.gen = make_gen_config(args);
+    bc.gen.max_context = args.num_int("ctx", 1024);
+    GAI_CHECK(bc.gen.max_context >= 0, "--ctx must be >= 0");
+    Generator gen(*lm.model, lm.tokenizer, bc.gen.max_context);
     bc.categories = args.str("categories");
     bc.output_path = args.str("out");
     bc.verbose = args.flag("show", false);
-    bc.gen = make_gen_config(args);
 
     Benchmark bench(gen, lm.tokenizer, bc);
     BenchmarkReport rep = bench.run();
@@ -681,6 +706,10 @@ static int cmd_logits(const Args& args) {
     std::vector<i32> ids = lm.tokenizer.encode(prompt, true, false); // BOS, no EOS
     const int T = static_cast<int>(ids.size());
     GAI_CHECK(T > 0, "prompt encodes to zero tokens");
+    // FIX P2 (OOM): [T,V] f32 logits (T=4096,V=32k = 512MB) blew weak PCs.
+    // Cap single-shot logits; score long prompts via generate/score_tokens.
+    GAI_CHECK(T <= 512, "logits prompt too long (T>512 would materialize >64MB); "
+                        "split the prompt or use score_tokens/bench instead");
     std::cout << strfmt("  tokens: %d  ids:", T);
     for (i32 id : ids) std::cout << " " << id;
     std::cout << "\n";

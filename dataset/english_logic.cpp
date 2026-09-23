@@ -32,11 +32,19 @@ static std::string low_trim(const std::string& s) {
     return o;
 }
 
-static bool starts_with(const std::string& s, const char* pre) {
+static bool is_word_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static bool starts_word(const std::string& s, const char* pre) {
     size_t n = 0;
     while (pre[n]) ++n;
-    return s.size() >= n && s.compare(0, n, pre) == 0;
+    if (s.size() < n || s.compare(0, n, pre) != 0) return false;
+    return s.size() == n || !is_word_char(s[n]);
 }
+
+
 
 bool is_greeting(const std::string& user_text) {
     std::string l = low_trim(user_text);
@@ -45,13 +53,19 @@ bool is_greeting(const std::string& user_text) {
         "how are you", "what's up", "whats up", "how is it going", "nice to meet",
     };
     for (const char* g : kGreet) {
-        if (l == g || starts_with(l, g)) {
-            // "hi" must not match "history": require word boundary
-            size_t n = 0;
-            while (g[n]) ++n;
-            if (l.size() == n || l[n] == ' ' || l[n] == ',' || l[n] == '!' || l[n] == '?')
-                return true;
-        }
+        if (starts_word(l, g)) return true;
+    }
+    return false;
+}
+
+static bool has_word(const std::string& l, const char* w) {
+    size_t n = 0;
+    while (w[n]) ++n;
+    for (size_t i = 0; i + n <= l.size(); ++i) {
+        if (l.compare(i, n, w) != 0) continue;
+        const bool left_ok = (i == 0) || !is_word_char(l[i - 1]);
+        const bool right_ok = (i + n == l.size()) || !is_word_char(l[i + n]);
+        if (left_ok && right_ok) return true;
     }
     return false;
 }
@@ -59,11 +73,15 @@ bool is_greeting(const std::string& user_text) {
 bool is_coding(const std::string& user_text) {
     std::string l = low_trim(user_text);
     if (l.find("```") != std::string::npos) return true;
-    if (l.find("def ") != std::string::npos) return true;
-    if (l.find("function ") != std::string::npos) return true;
-    if (l.find("plainformat") != std::string::npos) return true;
     if (l.find("#include") != std::string::npos) return true;
-    if (l.find("import ") != std::string::npos && l.find("python") != std::string::npos) return true;
+    static const char* kCodeWords[] = {
+        "python", "javascript", "java", "code", "function", "class", "def",
+        "return", "import", "script", "program", "debug", "compile",
+        "algorithm", "plainformat",
+    };
+    for (const char* w : kCodeWords) {
+        if (has_word(l, w)) return true;
+    }
     return false;
 }
 
@@ -75,11 +93,7 @@ bool is_instruction(const std::string& user_text) {
         "summarize", "translate", "classify", "list",
     };
     for (const char* v : kVerbs) {
-        if (starts_with(l, v)) {
-            size_t n = 0;
-            while (v[n]) ++n;
-            if (l.size() == n || l[n] == ' ' || l[n] == ':') return true;
-        }
+        if (starts_word(l, v)) return true;
     }
     return false;
 }
@@ -94,12 +108,12 @@ bool is_question(const std::string& user_text) {
     std::string l = low_trim(user_text);
     static const char* kQ[] = {
         "who", "whom", "whose", "what", "when", "where", "why", "how",
-        "which", "whether", "is ", "are ", "was ", "were ", "do ", "does ",
-        "did ", "can ", "could ", "would ", "should ", "will ", "have ",
-        "has ", "had ",
+        "which", "whether", "is", "are", "was", "were", "do", "does",
+        "did", "can", "could", "would", "should", "will", "have",
+        "has", "had",
     };
     for (const char* q : kQ) {
-        if (starts_with(l, q)) return true;
+        if (starts_word(l, q)) return true;
     }
     return false;
 }
@@ -139,17 +153,75 @@ const std::vector<const char*>& sequence_connectors() {
     return v;
 }
 
-bool obeys_answer_discipline(const std::string& reply) {
-    if (reply.empty() || reply.size() < 2) return false;
-    // must not break character
+bool is_multiple_choice_prompt(const std::string& user_text) {
+    std::string l = low_trim(user_text);
+    int options = 0;
+    for (size_t i = 0; i < l.size(); ++i) {
+        const char c = l[i];
+        if (c < 'a' || c > 'd') continue;
+        const bool left_ok = (i == 0) || !is_word_char(l[i - 1]);
+        const bool right_ok = (i + 1 < l.size()) &&
+                              (l[i + 1] == '.' || l[i + 1] == ')' || l[i + 1] == ':');
+        if (left_ok && right_ok) ++options;
+    }
+    return options >= 2;
+}
+
+bool meets_multiple_choice_discipline(const std::string& reply) {
+    std::string l = low_trim(reply);
+    if (l.size() < 3) return false;
+    const char c = l[0];
+    if (c < 'a' || c > 'd') return false;
+    if (l[1] != '.' && l[1] != ')' && l[1] != ':' && l[1] != ' ') return false;
+    return true;
+}
+
+bool contains_code(const std::string& reply) {
+    std::string l = low_trim(reply);
+    if (l.find("```") != std::string::npos) return true;
+    if (l.find("#include") != std::string::npos) return true;
+    if (l.find("plainformat") != std::string::npos) return true;
+    static const char* kCode[] = {
+        "def ", "function ", "return ", "import ", "class ", "for (", "while (",
+        "if (", "=>", "{", "}", ";",
+    };
+    for (const char* k : kCode) {
+        if (l.find(k) != std::string::npos) return true;
+    }
+    return false;
+}
+
+ReplyReport check_english_reply(const std::string& user_text, const std::string& reply) {
+    ReplyReport r;
+    r.act = classify_dialog_act(user_text);
+    if (reply.empty() || low_trim(reply).size() < 2) {
+        r.reason = "empty";
+        return r;
+    }
     std::string low = low_trim(reply);
     static const char* kBad[] = {
         "as an ai", "as a language model", "as an ai language model",
     };
     for (const char* b : kBad) {
-        if (low.find(b) != std::string::npos) return false;
+        if (low.find(b) != std::string::npos) {
+            r.reason = "ai-disclosure";
+            return r;
+        }
     }
-    return true;
+    if (is_multiple_choice_prompt(user_text) && !meets_multiple_choice_discipline(reply)) {
+        r.reason = "bad-mc-format";
+        return r;
+    }
+    if (r.act == DialogAct::Coding && !contains_code(reply)) {
+        r.reason = "no-code";
+        return r;
+    }
+    r.disciplined = true;
+    return r;
+}
+
+bool obeys_answer_discipline(const std::string& reply) {
+    return check_english_reply("", reply).disciplined;
 }
 
 } // namespace english_logic

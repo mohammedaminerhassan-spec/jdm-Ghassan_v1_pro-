@@ -12,8 +12,7 @@
 //   * recursive .parquet discovery, sorted (deterministic order)
 //   * row-group streaming (bounded RAM, never whole-file materialization)
 //   * only UTF-8 string columns are read (String/Binary/LargeString +
-//     dictionary-encoded strings, i.e. exactly what
-//     tools/convert_hermes_to_parquet.py emits with pyarrow+zstd).
+//     dictionary-encoded strings, i.e. the supplied lake format).
 //     Anything else is skipped with a warning, never fatal.
 //   * per-value byte cap + row cap, malformed rows skipped loudly
 // Narrow on purpose: this reads OUR lake files, not arbitrary parquet.

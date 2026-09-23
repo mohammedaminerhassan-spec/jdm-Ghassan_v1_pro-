@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 
@@ -36,21 +37,19 @@ std::string retrieval_normalize(const std::string& s) {
     bool space = true; // collapse + trim
     for (size_t i = 0; i < s.size();) {
         unsigned char c = static_cast<unsigned char>(s[i]);
-        if (c >= 'A' && c <= 'Z') {
+        if (c == 0xD9 && i + 1 < s.size()) {
+            unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
+            if (c2 >= 0x8B && c2 <= 0x92) {
+                i += 2;
+                continue;
+            }
+            o += s[i++];
+            space = false;
+        } else if (c >= 'A' && c <= 'Z') {
             o += static_cast<char>(c - 'A' + 'a');
             space = false;
             ++i;
         } else if ((c >= 'a' && c <= 'z') || c >= 0x80) {
-            // a-z and UTF-8 bytes kept (Arabic). Multi-byte UTF-8 passes
-            // through byte by byte; we never split or reorder bytes.
-            o += s[i];
-            space = false;
-            ++i;
-        } else if (c == 0xD9 && i + 1 < s.size()) {
-            // Strip Arabic diacritics (tashkeel U+064B..U+0652, D9 8B..D9 92):
-            // "مَرحَبًا" == "مرحبا". Keeps letters, drops marks.
-            unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
-            if (c2 >= 0x8B && c2 <= 0x92) { i += 2; continue; }
             o += s[i];
             space = false;
             ++i;
@@ -196,14 +195,22 @@ static bool parse_int(Cursor& c, long long& out) {
     bool neg = false;
     if (!c.eof() && *c.p == '-') { neg = true; ++c.p; }
     if (c.eof() || *c.p < '0' || *c.p > '9') return false;
-    long long v = 0;
-    while (!c.eof() && *c.p >= '0' && *c.p <= '9') v = v * 10 + (*c.p++ - '0');
-    out = neg ? -v : v;
+    unsigned long long v = 0;
+    while (!c.eof() && *c.p >= '0' && *c.p <= '9') {
+        const unsigned digit = static_cast<unsigned>(*c.p - '0');
+        if (v > (std::numeric_limits<unsigned long long>::max() - digit) / 10u) return false;
+        v = v * 10u + digit;
+        ++c.p;
+    }
+    if (!neg && v > static_cast<unsigned long long>(std::numeric_limits<long long>::max())) return false;
+    if (neg && v > static_cast<unsigned long long>(std::numeric_limits<long long>::max()) + 1u) return false;
+    out = neg ? -static_cast<long long>(v - 1u) - 1 : static_cast<long long>(v);
     return true;
 }
 
 // Skips one JSON value of any shape (used for unknown keys).
-static bool skip_value(Cursor& c) {
+static bool skip_value(Cursor& c, int depth = 0) {
+    if (depth > 64) return false;
     skip_ws(c);
     if (c.eof()) return false;
     if (*c.p == '"') {
@@ -221,7 +228,7 @@ static bool skip_value(Cursor& c) {
             skip_ws(c);
             if (c.eof() || *c.p != ':') return false;
             ++c.p;
-            if (!skip_value(c)) return false;
+            if (!skip_value(c, depth + 1)) return false;
             skip_ws(c);
             if (c.eof()) return false;
             if (*c.p == ',') { ++c.p; continue; }
@@ -234,7 +241,7 @@ static bool skip_value(Cursor& c) {
         skip_ws(c);
         if (!c.eof() && *c.p == ']') { ++c.p; return true; }
         while (true) {
-            if (!skip_value(c)) return false;
+            if (!skip_value(c, depth + 1)) return false;
             skip_ws(c);
             if (c.eof()) return false;
             if (*c.p == ',') { ++c.p; continue; }
@@ -399,7 +406,9 @@ size_t load_qa_dir(const std::string& dir, std::vector<QaEntry>& out) {
     std::vector<std::string> files;
     auto push_from = [&](const std::string& d) {
         for (const auto& e : fs::recursive_directory_iterator(d, ec)) {
-            if (!e.is_regular_file()) continue;
+            if (ec) break;
+            std::error_code file_ec;
+            if (!e.is_regular_file(file_ec) || file_ec) continue;
             std::string ext = e.path().extension().string();
             for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             if (ext == ".json" || ext == ".jsonl") files.push_back(e.path().string());
@@ -575,8 +584,8 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
         if (score >= min_score) cand.push_back({d, score});
     }
     if (cand.empty()) return out;
-    if ((int)cand.size() > top_k) {
-        std::nth_element(cand.begin(), cand.begin() + top_k, cand.end(),
+    if (static_cast<int>(cand.size()) > top_k) {
+        std::nth_element(cand.begin(), cand.begin() + (top_k - 1), cand.end(),
                          [](const RetrievalHit& a, const RetrievalHit& b) {
                              return a.score > b.score;
                          });

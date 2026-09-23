@@ -8,8 +8,20 @@
 #   artifacts/tokenizer/darija.gtok
 #   artifacts/shards_pt/train_*.gbin   (optional: rebuilt thin if missing)
 #   artifacts/shards_sft/train_*.gbin  (optional: rebuilt if missing)
+#
+# RETIRED Darija route: its configs were removed (English-only pack).
+# English flow: EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh
 # ----------------------------------------------------------------
 set -euo pipefail
+
+# Fail fast: running this Darija script by accident would burn a Kaggle
+# session and then die on the deleted configs. Override (unsupported):
+#   LEGACY_DARIJA=1 bash kaggle/convert_final.sh
+if [[ "${LEGACY_DARIJA:-0}" != "1" ]]; then
+    echo "[ERROR] convert_final.sh is the retired Darija data route (configs removed)."
+    echo "[ERROR] English flow: EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh"
+    exit 1
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${REPO_DIR}/build/bin/data_pipeline"

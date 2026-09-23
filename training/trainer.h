@@ -6,6 +6,7 @@
 #include "training/dataloader.h"
 #include "training/checkpoint.h"
 #include "training/distributed.h"
+#include <limits>
 #include <map>
 #include <memory>
 
@@ -101,12 +102,24 @@ struct TrainerConfig {
     static TrainerConfig from_config(const Config& c, bool strict = false);
     // Per-rank micro throughput (one process). Global throughput multiplies by
     // world_size — DeepSeek budgeting rule: scheduler/steps must use GLOBAL.
+    static i64 checked_schedule_mul(i64 a, i64 b, const char* what) {
+        const __int128 p = static_cast<__int128>(a) * static_cast<__int128>(b);
+        if (p < static_cast<__int128>(std::numeric_limits<i64>::min()) ||
+            p > static_cast<__int128>(std::numeric_limits<i64>::max())) {
+            GAI_FAIL(std::string("training schedule overflow in ") + what);
+        }
+        return static_cast<i64>(p);
+    }
     i64 tokens_per_step() const {
-        return static_cast<i64>(batch_size) * seq_len * grad_accum;
+        return checked_schedule_mul(
+            checked_schedule_mul(static_cast<i64>(batch_size), static_cast<i64>(seq_len),
+                                 "tokens_per_step"),
+            static_cast<i64>(grad_accum), "tokens_per_step");
     }
     i64 tokens_per_step_global(int world_size) const {
         if (world_size < 1) world_size = 1;
-        return tokens_per_step() * static_cast<i64>(world_size);
+        return checked_schedule_mul(tokens_per_step(), static_cast<i64>(world_size),
+                                    "tokens_per_step_global");
     }
     bool is_sft() const { return stage == "sft" || stage == "cpt"; }
     // total planned optimizer steps given the corpus size (epochs mode).

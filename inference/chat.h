@@ -14,6 +14,7 @@ struct ChatOptions {
     // script-independent). Set from CLI --persona.
     std::string      persona = "darija";
     GenerationConfig gen;
+    bool             adaptive_dialog = true;
     bool             stream = true;
     bool             show_stats = false;
     int              max_history_turns = 24;

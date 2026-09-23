@@ -12,6 +12,7 @@
 #include <sstream>
 #include <filesystem>
 #include <cstring>
+#include <cmath>
 #include <cassert>
 #include <algorithm>
 
@@ -27,6 +28,13 @@ static void write_pod(std::ostream& os, const T& v) {
 
 static inline uint64_t align_up(uint64_t x, uint64_t alignment) {
     return (x + alignment - 1) & ~(alignment - 1);
+}
+
+static uint64_t checked_stream_pos(std::ostream& os, const std::string& what) {
+    if (!os.good()) GAI_FAIL("gguf_format: bad stream before " + what);
+    const std::ostream::pos_type p = os.tellp();
+    if (p == std::ostream::pos_type(-1)) GAI_FAIL("gguf_format: tell failed before " + what);
+    return static_cast<uint64_t>(p);
 }
 
 // DeepSeek merge-escaping: pieces may contain ' ' (leading-space gluing), so
@@ -390,11 +398,17 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             // compute absmax
             float amax = 0.f;
             for (size_t i = start; i < end; ++i) amax = std::max(amax, std::abs(src[i]));
+            uint8_t* block = out.data() + b * 34;
+            if (!std::isfinite(amax)) {
+                uint16_t zero_scale = fp32_to_fp16(0.0f);
+                memcpy(block, &zero_scale, 2);
+                std::memset(block + 2, 0, 32);
+                continue;
+            }
             float scale = amax / 127.f;
             float inv   = (scale != 0.f) ? (1.f / scale) : 0.f;
             // write f16 scale
             uint16_t sh = fp32_to_fp16(scale);
-            uint8_t* block = out.data() + b * 34;
             memcpy(block, &sh, 2);
             for (size_t i = 0; i < 32; ++i) {
                 float fv = (start + i < end) ? src[start + i] : 0.f;
@@ -414,10 +428,16 @@ static std::vector<uint8_t> tensor_to_ggml_bytes(const Tensor& t, GGMLType targe
             size_t end   = std::min(start + 32, n);
             float amax = 0.f;
             for (size_t i = start; i < end; ++i) amax = std::max(amax, std::abs(src[i]));
+            uint8_t* block = out.data() + b * 18;
+            if (!std::isfinite(amax)) {
+                uint16_t zero_scale = fp32_to_fp16(0.0f);
+                memcpy(block, &zero_scale, 2);
+                std::memset(block + 2, 0, 16);
+                continue;
+            }
             float scale = amax / 7.f;
             float inv   = (scale != 0.f) ? (1.f / scale) : 0.f;
             uint16_t sh = fp32_to_fp16(scale);
-            uint8_t* block = out.data() + b * 18;
             memcpy(block, &sh, 2);
             for (size_t i = 0; i < 16; ++i) {
                 float f0 = (start + 2*i     < end) ? src[start + 2*i]     : 0.f;
@@ -506,9 +526,9 @@ void GGUFWriter::write() {
             info_size += 8;                     // u64 offset
         }
 
-        // The tensor data section starts right after the info section (aligned to 32)
-        uint64_t data_section_start = static_cast<uint64_t>(f.tellp()) + info_size;
-        data_section_start = align_up(data_section_start, 32);
+        // Tensor offsets below are relative to the aligned data section; the
+        // reader independently captures that start after the info block.
+        const uint64_t info_start = checked_stream_pos(f, "tensor info");
 
         // Assign offsets
         uint64_t running_offset = 0;
@@ -528,9 +548,12 @@ void GGUFWriter::write() {
             write_pod(f, dtype_u32);
             write_pod(f, td.offset);
         }
+        const uint64_t info_end = checked_stream_pos(f, "tensor info");
+        GAI_CHECK(info_end >= info_start && info_end - info_start == info_size,
+                  "gguf_format: tensor info size mismatch");
 
         // Pad to alignment
-        uint64_t cur = static_cast<uint64_t>(f.tellp());
+        uint64_t cur = checked_stream_pos(f, "tensor data padding");
         uint64_t pad_to = align_up(cur, 32);
         for (uint64_t i = cur; i < pad_to; ++i) f.put('\0');
 
@@ -544,10 +567,10 @@ void GGUFWriter::write() {
             if (cpu.dtype() != DType::F32) cpu = quant::dequantize(cpu, DType::F32);
             std::vector<uint8_t> payload = tensor_to_ggml_bytes(cpu, td.type);
             GAI_CHECK(payload.size() == td.nbytes, "gguf_format: payload size drift for " + td.name);
-            uint64_t before = static_cast<uint64_t>(f.tellp());
+            uint64_t before = checked_stream_pos(f, "tensor write for " + td.name);
             f.write(reinterpret_cast<const char*>(payload.data()),
                     static_cast<std::streamsize>(payload.size()));
-            uint64_t after = static_cast<uint64_t>(f.tellp());
+            uint64_t after = checked_stream_pos(f, "tensor padding for " + td.name);
             uint64_t padded = align_up(after, 32);
             for (uint64_t i = after; i < padded; ++i) f.put('\0');
             (void)before;
@@ -1466,6 +1489,16 @@ void export_model_gguf(const std::string& path, Model& model,
         size_t est = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
         total_bytes += static_cast<u64>(est);
         w.add_tensor(wname, cpu, dt);
+        // FIX P2 (tied embeddings): parameters() holds ONE tensor when tied,
+        // so llama compat exported no output.weight and external llama.cpp
+        // failed to find it despite tie_word_embeddings metadata. Duplicate
+        // the embedding bytes as output.weight for compat exports (same
+        // values, shared content) instead of failing downstream.
+        if ((want_llama || want_moe) && p->name == "tok_embeddings" && cfg.tie_embeddings) {
+            size_t est2 = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
+            total_bytes += static_cast<u64>(est2);
+            w.add_tensor("output.weight", cpu, dt);
+        }
     }
 
     // Aux-loss-free bias (native only, F32 exact): layers.{L}.moe_bias [ne].

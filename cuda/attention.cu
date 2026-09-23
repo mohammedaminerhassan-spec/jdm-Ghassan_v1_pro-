@@ -136,6 +136,8 @@ void attention_forward(const float* q, const float* k, const float* v,
                        float* out, float* probs,
                        int B, int T, int H, int KV, int hd, float scale) {
     if (B <= 0 || T <= 0) return;
+    GAI_CHECK(H > 0 && H <= 65535 && B <= 65535,
+              "cuda attention_forward: grid dimensions out of range");
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_forward: H must be a multiple of KV");
     dim3 grid(T, H, B);
@@ -182,6 +184,10 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
 #pragma unroll
     for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o2));
+    // FIX P0-2 (SWA 32x overcount): every lane computes the SAME full sum
+    // (j loop is not strided, sAcc partition is over c not j), so a warp
+    // reduction would multiply sum by 32 and produce 1/32 outputs.
+    // All lanes already hold identical sum -> use directly, no reduction.
     float sum = 0.0f;
     for (int j = j0; j <= t; ++j) {
         const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
@@ -194,9 +200,7 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
         for (int c = lane; c < hd; c += WARP_A) sAcc[c] += p * vh[c];
         if (probs) probs[((size_t(b) * H + h) * T + t) * T + j] = p;
     }
-#pragma unroll
-    for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
-        sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+    __syncwarp();  // ensure all sAcc partitions visible before normalize
     float inv = 1.0f / sum;
     for (int c = lane; c < hd; c += WARP_A) o[c] = sAcc[c] * inv;
     if (probs) {
@@ -212,6 +216,8 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
                           int B, int T, int H, int KV, int hd, float scale, int window) {
     if (window <= 0) { attention_forward(q, k, v, out, probs, B, T, H, KV, hd, scale); return; }
     if (B <= 0 || T <= 0) return;
+    GAI_CHECK(H > 0 && H <= 65535 && B <= 65535,
+              "cuda attention_ex: grid dimensions out of range");
     GAI_CHECK(hd <= MAX_HD, "cuda attention_ex: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_ex: H must be a multiple of KV");
     dim3 grid(T, H, B);
@@ -331,10 +337,12 @@ __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict_
 }
 
 void attention_backward(const float* q, const float* k, const float* v,
-                        const float* probs, const float* dout,
-                        float* dq, float* dk, float* dv,
-                        int B, int T, int H, int KV, int hd, float scale) {
+                           const float* probs, const float* dout,
+                           float* dq, float* dk, float* dv,
+                           int B, int T, int H, int KV, int hd, float scale) {
     if (B <= 0 || T <= 0) return;
+    GAI_CHECK(KV > 0 && KV <= 65535 && B <= 65535,
+              "cuda attention_backward: grid dimensions out of range");
     GAI_CHECK(probs != nullptr, "cuda attention_backward requires cached probs");
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_backward: H must be a multiple of KV");
@@ -417,7 +425,11 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
 void attention_decode(const float* q, const float* kc, const float* vc,
                       float* out, int H, int KV, int hd, int cur_len, int max_len,
                       float scale, float* scratch) {
-    (void)max_len;
+    // FIX P2 (OOB read): cur_len was never checked against the KV allocation
+    // (max_len). An undersized cache silently read past K/V. Fail fast.
+    GAI_CHECK(cur_len <= max_len,
+              "cuda attention_decode: cur_len exceeds KV cache max_len (increase max_context)");
+    GAI_CHECK(cur_len >= 0 && max_len >= 0, "cuda attention_decode: negative length");
     if (H <= 0 || cur_len <= 0) return;
     int block = 128;
     size_t sh = sizeof(float) * 40;
@@ -501,7 +513,9 @@ __global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __res
 void attention_decode_ex(const float* q, const float* kc, const float* vc,
                          float* out, int H, int KV, int hd, int cur_len, int max_len,
                          float scale, float* scratch, int window) {
-    (void)max_len;
+    GAI_CHECK(cur_len <= max_len,
+              "cuda attention_decode_ex: cur_len exceeds KV cache max_len (increase max_context)");
+    GAI_CHECK(cur_len >= 0 && max_len >= 0, "cuda attention_decode_ex: negative length");
     if (H <= 0 || cur_len <= 0) return;
     if (window <= 0) { attention_decode(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch); return; }
     int j0 = (cur_len > window) ? cur_len - window : 0;

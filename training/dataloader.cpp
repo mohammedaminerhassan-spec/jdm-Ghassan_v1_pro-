@@ -5,24 +5,83 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace fs = std::filesystem;
 
 namespace gai {
 
+namespace {
+bool checked_mul_u64(u64 a, u64 b, u64& out) {
+    if (b != 0 && a > std::numeric_limits<u64>::max() / b) return false;
+    out = a * b;
+    return true;
+}
+
+bool checked_add_u64(u64 a, u64 b, u64& out) {
+    if (a > std::numeric_limits<u64>::max() - b) return false;
+    out = a + b;
+    return true;
+}
+
+bool valid_shard_size(const std::string& path, const ShardHeader& h) {
+    if (h.magic != GBIN_MAGIC || h.version != GBIN_VERSION || h.dtype > 1 ||
+        (h.flags & ~GBIN_FLAG_MASK) != 0 || h.n_docs > h.n_tokens)
+        return false;
+    if (h.n_tokens > (8ull << 30) / 2 || h.n_docs > (1ull << 30)) return false;
+
+    u64 token_bytes = 0;
+    u64 doc_bytes = 0;
+    u64 mask_bytes = 0;
+    if (!checked_mul_u64(h.n_tokens, h.dtype == 0 ? 2ull : 4ull, token_bytes) ||
+        !checked_mul_u64(h.n_docs, sizeof(u64), doc_bytes))
+        return false;
+    if ((h.flags & GBIN_FLAG_MASK) != 0 &&
+        !checked_mul_u64(h.n_tokens, 1ull, mask_bytes))
+        return false;
+    u64 need = sizeof(ShardHeader);
+    if (!checked_add_u64(need, token_bytes, need) ||
+        !checked_add_u64(need, doc_bytes, need) ||
+        !checked_add_u64(need, mask_bytes, need))
+        return false;
+
+    std::error_code ec;
+    const auto fsize = fs::file_size(path, ec);
+    if (ec || fsize > std::numeric_limits<u64>::max()) return false;
+    return static_cast<u64>(fsize) >= need;
+}
+
+bool valid_doc_offsets(const std::vector<u64>& offsets, u64 n_tokens) {
+    if (offsets.empty()) return n_tokens == 0;
+    if (offsets.front() != 0 || offsets.front() >= n_tokens) return false;
+    for (size_t i = 1; i < offsets.size(); ++i) {
+        if (offsets[i] <= offsets[i - 1] || offsets[i] >= n_tokens) return false;
+    }
+    return true;
+}
+}
+
 // ================================================================ writer
 ShardWriter::ShardWriter(const std::string& path, int vocab_size, bool with_loss_mask)
     : path_(path), u16_mode_(vocab_size <= 65535), with_mask_(with_loss_mask),
-      vocab_size_(vocab_size) {}
+      vocab_size_(vocab_size) {
+    GAI_CHECK(vocab_size > 0, "shard writer needs a positive vocabulary size");
+}
 
 ShardWriter::~ShardWriter() {
-    if (!closed_) {
-        try { close(); } catch (...) {}
-    }
+    closed_ = true;
 }
 
 void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector<u8>* mask) {
     if (tokens.empty()) return;
+    if (!with_mask_ && mask) {
+        GAI_CHECK(false, "loss mask supplied to a shard writer created without a mask");
+    }
+    if (mask) {
+        GAI_CHECK(mask->size() == tokens.size(),
+                  strfmt("loss mask length %zu != token length %zu", mask->size(), tokens.size()));
+    }
     doc_offsets_.push_back(static_cast<u64>(tokens_.size()));
     for (size_t i = 0; i < tokens.size(); ++i) {
         // Fail-loud token range: an id outside the writing vocabulary (or a
@@ -75,34 +134,17 @@ void ShardWriter::close() {
 bool Shard::load(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
+    tokens_.clear();
+    mask_.clear();
+    doc_offsets_.clear();
+    header_ = ShardHeader{};
+    path_.clear();
+    streaming_ = false;
     ShardHeader h{};
     if (!f.read(reinterpret_cast<char*>(&h), sizeof(h))) return false;
     if (h.magic != GBIN_MAGIC || h.version != GBIN_VERSION) return false;
-    // FIX: corrupt/truncated .gbin with garbage dtype or huge n_tokens/n_docs
-    // caused unbounded resize -> bad_alloc/OOM + garbage offsets -> later OOB
-    // (CPU/Kaggle crash). Validate BEFORE allocating + cross-check file size.
-    if (h.dtype > 1) return false;
-    {
-        std::error_code ec;
-        const auto fsize = fs::file_size(path, ec);
-        if (!ec) {
-            const uint64_t tok_bytes = h.n_tokens * (h.dtype == 0 ? 2ull : 4ull);
-            const uint64_t need_min = sizeof(ShardHeader) + tok_bytes
-                + h.n_docs * 8ull;
-            // allow trailing mask byte per token, but never accept a header
-            // claiming MORE bytes than the file actually holds.
-            if (need_min > static_cast<uint64_t>(fsize)) return false;
-            // hard cap: single shard > 8GiB tokens is corrupt for this project.
-            if (h.n_tokens > (8ull << 30) / 2 || h.n_docs > (1ull << 30)) return false;
-            // RAM guard for FULL load (3GB+ corpora): a 50M-token shard is
-            // ~100-200MB RAM (safe). Anything above 128M tokens (~512MB u32)
-            // must use the streaming header-only path, never full RAM load,
-            // or Kaggle 30GB RAM + model weights OOM mid-run.
-            if (h.n_tokens > (128ull << 20)) return false;
-        } else if (h.n_tokens > (4ull << 30) || h.n_docs > (1ull << 30)) {
-            return false;
-        }
-    }
+    if (!valid_shard_size(path, h)) return false;
+    if (h.n_tokens > (128ull << 20)) return false;
 
     tokens_.resize(static_cast<size_t>(h.n_tokens));
     if (h.dtype == 0) {
@@ -124,6 +166,7 @@ bool Shard::load(const std::string& path) {
         if (h.n_tokens && !f.read(reinterpret_cast<char*>(mask_.data()),
                                   static_cast<std::streamsize>(mask_.size()))) return false;
     }
+    if (!valid_doc_offsets(doc_offsets_, h.n_tokens)) return false;
     header_ = h;
     path_ = path;
     streaming_ = false;
@@ -133,28 +176,28 @@ bool Shard::load(const std::string& path) {
 bool Shard::load_header(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
+    tokens_.clear();
+    mask_.clear();
+    doc_offsets_.clear();
+    header_ = ShardHeader{};
+    path_.clear();
+    streaming_ = false;
     ShardHeader h{};
     if (!f.read(reinterpret_cast<char*>(&h), sizeof(h))) return false;
-    if (h.magic != GBIN_MAGIC || h.version != GBIN_VERSION) return false;
-    if (h.n_tokens == 0) return false;
-    // Same corruption guard as load(): reject bad dtype / impossible sizes.
-    if (h.dtype > 1) return false;
-    if (h.n_tokens > (8ull << 30) / 2 || h.n_docs > (1ull << 30)) return false;
+    if (h.n_tokens == 0 || !valid_shard_size(path, h)) return false;
 
-    // Seek to the doc table: header + token stream.
-    size_t tok_bytes = static_cast<size_t>(h.n_tokens) * (h.dtype == 0 ? sizeof(u16) : sizeof(u32));
-    f.seekg(static_cast<std::streamoff>(sizeof(h) + tok_bytes), std::ios::beg);
+    u64 tok_bytes = 0;
+    if (!checked_mul_u64(h.n_tokens, h.dtype == 0 ? 2ull : 4ull, tok_bytes))
+        return false;
+    f.seekg(static_cast<std::streamoff>(sizeof(h) + static_cast<std::streamoff>(tok_bytes)), std::ios::beg);
     if (!f.good()) return false;
     std::vector<u64> offs(static_cast<size_t>(h.n_docs));
     if (h.n_docs && !f.read(reinterpret_cast<char*>(offs.data()),
                             static_cast<std::streamsize>(offs.size() * sizeof(u64)))) return false;
+    if (!valid_doc_offsets(offs, h.n_tokens)) return false;
 
     header_ = h;
     doc_offsets_ = std::move(offs);
-    tokens_.clear();
-    tokens_.shrink_to_fit();
-    mask_.clear();
-    mask_.shrink_to_fit();
     path_ = path;
     streaming_ = true;
     return true;
@@ -189,10 +232,11 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
 
     // PRO-HARDEN: مسار RAM كان يقرأ tokens_[start+len] بلا فحص فينهار heap
     // على offsets فاسدة؛ مسار streaming كان يرجع false فقط. نوحد الفشل السريع.
-    GAI_CHECK(start + len <= n_tokens(),
+    const u64 total = n_tokens();
+    GAI_CHECK(start <= total && len <= total - start,
               strfmt("Shard::read_window OOB (start=%llu len=%llu ntok=%llu)",
                      (unsigned long long)start, (unsigned long long)len,
-                     (unsigned long long)n_tokens()));
+                     (unsigned long long)total));
     if (!streaming_) {
         // RAM path: memcpy from loaded vectors.
         for (u64 i = 0; i < len; ++i) {
@@ -257,7 +301,9 @@ std::vector<std::string> list_shards(const std::string& dir, const std::string& 
     std::error_code ec;
     if (!fs::exists(dir, ec)) return out;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file()) continue;
+        if (ec) break;
+        std::error_code file_ec;
+        if (!e.is_regular_file(file_ec) || file_ec) continue;
         std::string name = e.path().filename().string();
         if (name.size() < 5 || name.substr(name.size() - 5) != ".gbin") continue;
         if (!prefix.empty() && name.rfind(prefix, 0) != 0) continue;
@@ -268,6 +314,7 @@ std::vector<std::string> list_shards(const std::string& dir, const std::string& 
 }
 
 bool DataLoader::open(const std::vector<std::string>& paths, BatchSpec spec, u64 seed) {
+    if (spec.batch_size <= 0 || spec.seq_len <= 0) return false;
     spec_ = spec;
     rng_.seed_with(seed);
     shards_.clear();
@@ -288,7 +335,9 @@ bool DataLoader::open(const std::vector<std::string>& paths, BatchSpec spec, u64
             log_warn("dataloader: shard too small, skipped: " + p);
             continue;
         }
-        total_tokens_ += s.n_tokens();
+        u64 next_total = 0;
+        if (!checked_add_u64(total_tokens_, s.n_tokens(), next_total)) return false;
+        total_tokens_ = next_total;
         shards_.push_back(std::move(s));
     }
     return !shards_.empty();
@@ -300,7 +349,8 @@ bool DataLoader::open_glob(const std::string& dir, const std::string& prefix,
 }
 
 bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, double>& mix,
-                          BatchSpec spec, u64 seed) {
+                           BatchSpec spec, u64 seed) {
+    if (spec.batch_size <= 0 || spec.seq_len <= 0) return false;
     spec_ = spec;
     rng_.seed_with(seed);
     shards_.clear();
@@ -312,10 +362,15 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
 
     double wsum = 0.0;
     for (const auto& [domain, w] : mix) {
-        if (!(w > 0.0)) continue;
+        if (!std::isfinite(w) || !(w > 0.0)) continue;
         // Domain shards are train_<domain>_*.gbin (see data_pipeline --domain).
         std::string prefix = std::string("train_") + domain;
         std::vector<std::string> paths = list_shards(dir, prefix);
+        const std::string exact_prefix = prefix + "_";
+        paths.erase(std::remove_if(paths.begin(), paths.end(), [&](const std::string& path) {
+            const std::string name = fs::path(path).filename().string();
+            return name.rfind(exact_prefix, 0) != 0;
+        }), paths.end());
         if (paths.empty()) {
             log_warn("dataloader: mix domain '" + domain + "' has no shards (" + prefix + "*.gbin), skipped");
             continue;
@@ -330,12 +385,16 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
                 log_warn("dataloader: shard too small, skipped: " + p);
                 continue;
             }
-            g.total_tokens += s.n_tokens();
+            u64 next_group_total = 0;
+            if (!checked_add_u64(g.total_tokens, s.n_tokens(), next_group_total)) return false;
+            g.total_tokens = next_group_total;
             g.shards.push_back(std::move(s));
         }
         if (g.shards.empty()) continue;
         wsum += w;
-        total_tokens_ += g.total_tokens;
+        u64 next_total = 0;
+        if (!checked_add_u64(total_tokens_, g.total_tokens, next_total)) return false;
+        total_tokens_ = next_total;
         groups_.push_back(std::move(g));
     }
     if (groups_.empty()) {
@@ -495,9 +554,67 @@ bool DataLoader::next(Batch& out) {
 }
 
 void DataLoader::skip_batches(i64 n) {
-    Batch discard;
-    for (i64 i = 0; i < n; ++i) {
-        if (!next(discard)) break;
+    // Prefer the O(1)-I/O fast path (identical RNG stream, no disk reads).
+    fast_forward(n);
+}
+
+void DataLoader::fast_forward(i64 n) {
+    if (n <= 0) return;
+    if (use_mix_ ? groups_.empty() : shards_.empty()) return;
+    const int B = spec_.batch_size;
+    const int T = spec_.seq_len;
+    for (i64 step = 0; step < n; ++step) {
+        for (int b = 0; b < B; ++b) {
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                const Shard* shp = nullptr;
+                if (use_mix_) {
+                    double r = (double)rng_.uniform();
+                    double acc = 0.0;
+                    size_t gi = groups_.size() - 1;
+                    for (size_t i = 0; i < groups_.size(); ++i) {
+                        acc += groups_[i].weight;
+                        if (r < acc) { gi = i; break; }
+                    }
+                    const DomainGroup& g = groups_[gi];
+                    u64 pick = rng_.below(g.total_tokens);
+                    size_t si = 0;
+                    for (; si + 1 < g.shards.size(); ++si) {
+                        if (pick < g.shards[si].n_tokens()) break;
+                        pick -= g.shards[si].n_tokens();
+                    }
+                    shp = &g.shards[si];
+                } else {
+                    u64 pick = rng_.below(total_tokens_);
+                    size_t si = 0;
+                    for (; si + 1 < shards_.size(); ++si) {
+                        if (pick < shards_[si].n_tokens()) break;
+                        pick -= shards_[si].n_tokens();
+                    }
+                    shp = &shards_[si];
+                }
+                // Bit-exact replica of fill_from_shard RNG draws (metadata
+                // only: doc_end/doc_start_at are in-RAM, no read_window).
+                u64 best_avail = 0;
+                for (int fa = 0; fa < 4; ++fa) {
+                    u64 max_start = shp->n_tokens() > 0 ? shp->n_tokens() - 1 : 0;
+                    u64 start = max_start > 0 ? rng_.below(max_start + 1) : 0;
+                    u64 doc_end_idx = shp->doc_end(start);
+                    u64 avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
+                    if (avail == 0) {
+                        u64 nd = shp->n_docs();
+                        start = (nd > 0) ? shp->doc_start_at(rng_.below(nd)) : 0;
+                        doc_end_idx = shp->doc_end(start);
+                        avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
+                    }
+                    if (avail > best_avail) {
+                        best_avail = avail;
+                        if (best_avail >= static_cast<u64>(T) + 1) break;
+                    }
+                }
+                break;  // fill_from_shard always returns true here (row PAD ok)
+            }
+        }
+        ++batches_;
     }
 }
 

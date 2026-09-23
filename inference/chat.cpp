@@ -1,13 +1,18 @@
 #include "inference/chat.h"
+#include "dataset/english_logic.h"
 
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 namespace gai {
 
 ChatSession::ChatSession(Generator& gen, ChatOptions opts)
     : gen_(gen), opts_(std::move(opts)) {
+    GAI_CHECK(opts_.max_history_turns >= 0, "chat history turns must be >= 0");
+    GAI_CHECK(opts_.retrieve_top_k >= 0, "retrieve top_k must be >= 0");
+    GAI_CHECK(opts_.gen.max_new_tokens >= 0, "chat max tokens must be >= 0");
     if (opts_.system.empty()) {
         // PRO-EN: English persona is script-independent (never swapped by the
         // ScriptRouter); Darija keeps the legacy Arabic-default routing.
@@ -97,6 +102,52 @@ bool ChatSession::try_retrieve(const std::string& user_message, std::string& out
     return true;
 }
 
+static void adapt_english_generation(GenerationConfig& cfg, const std::string& user_message) {
+    using namespace english_logic;
+    const DialogAct act = classify_dialog_act(user_message);
+    auto& s = cfg.sampling;
+    switch (act) {
+        case DialogAct::Greeting:
+            cfg.max_new_tokens = std::min(cfg.max_new_tokens, 96);
+            s.temperature = std::min(s.temperature, 0.8f);
+            s.top_p = 0.90f;
+            s.min_p = 0.02f;
+            s.no_repeat_ngram = 0;
+            break;
+        case DialogAct::Coding:
+            s.temperature = std::min(s.temperature, 0.4f);
+            s.top_k = 40;
+            s.top_p = 1.0f;
+            s.min_p = 0.0f;
+            s.no_repeat_ngram = 0;
+            break;
+        case DialogAct::Reasoning:
+            s.temperature = std::min(s.temperature, 0.6f);
+            s.top_k = 40;
+            s.top_p = 0.95f;
+            s.min_p = 0.02f;
+            s.no_repeat_ngram = 0;
+            break;
+        case DialogAct::Instruction:
+            s.temperature = std::min(s.temperature, 0.6f);
+            s.top_k = 40;
+            s.top_p = 0.90f;
+            s.min_p = 0.05f;
+            s.no_repeat_ngram = 0;
+            break;
+        case DialogAct::Question:
+            s.temperature = std::min(s.temperature, 0.7f);
+            s.top_p = 0.92f;
+            s.min_p = 0.05f;
+            s.no_repeat_ngram = 0;
+            break;
+        case DialogAct::Chitchat:
+        case DialogAct::Unknown:
+            break;
+    }
+    s.validate();
+}
+
 std::string ChatSession::send(const std::string& user_message) {
     // RAG fast path: paraphrase-aware keyword match (digit-normalized, e.g.
     // "salam 3likom" == "salam alikom"). When a close question exists in the
@@ -134,7 +185,12 @@ std::string ChatSession::send(const std::string& user_message) {
             return true;
         };
     }
-    reply = gen_.chat(history_, opts_.gen, cb);
+    GenerationConfig turn_cfg = opts_.gen;
+    if (opts_.adaptive_dialog &&
+        (opts_.persona == "en" || opts_.persona == "english")) {
+        adapt_english_generation(turn_cfg, user_message);
+    }
+    reply = gen_.chat(history_, turn_cfg, cb);
     if (opts_.stream) std::cout << std::endl;
 
     history_.push_back({Role::Assistant, reply});
@@ -174,8 +230,16 @@ void ChatSession::run_repl() {
             }
             if (cmd == "temp") {
                 if (!arg.empty()) {
-                    opts_.gen.sampling.temperature = std::stof(arg);
-                    std::cout << "  [temperature = " << opts_.gen.sampling.temperature << "]\n";
+                    try {
+                        float t = std::stof(arg);
+                        if (!std::isfinite(t)) t = 0.0f;
+                        if (t < 0.0f) t = 0.0f;
+                        if (t > 5.0f) t = 5.0f;
+                        opts_.gen.sampling.temperature = t;
+                        std::cout << "  [temperature = " << opts_.gen.sampling.temperature << "]\n";
+                    } catch (const std::exception&) {
+                        std::cout << "  invalid temperature (want 0..5)\n";
+                    }
                 }
                 continue;
             }

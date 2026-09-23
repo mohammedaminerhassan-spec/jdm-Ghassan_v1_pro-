@@ -1,5 +1,5 @@
-# Ghassan v1 Flash - Pilot MoE Config (Kaggle smoke test)
-# Same architecture as configs/flash_moe.yaml, tiny schedule.
+# Ghassan v1 Pro English - Pilot MoE Config (Kaggle smoke test)
+# Same architecture as configs/en_pro.yaml, tiny schedule.
 # STOP after 200 steps. Measure tok/s here, then extrapolate the full run.
 # Do NOT run full training from this file.
 
@@ -21,10 +21,10 @@ model:
   moe_expert_dim: 768
   moe_shared: true
   moe_aux_scale: 0.01
-  # => 467,439,360 parameters
+  # => 479,727,360 parameters
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -33,7 +33,7 @@ training:
   precision: fp32
   gemm_fp16: true          # also validates the FP16 path in the pilot
   loss_scale_init: 16384   # PRO-HARDEN: كان 65536 فيتجاوز سقف fp16 الآمن
-                          # (trainer يخفضه مع warning). 16384 هو الصحيح لـT4.
+                           # (trainer يخفضه مع warning). 16384 هو الصحيح لـT4.
   loss_scale_window: 2000
   batch_size: 1            # CONSERVATIVE: start at 1, increase if VRAM allows
   seq_len: 256             # CONSERVATIVE: short context for the pilot
@@ -53,9 +53,9 @@ training:
   eval_batches: 5
   save_every: 200
   checkpoint_dir: artifacts/checkpoints/pilot
-  data_dir: artifacts/shards
+  data_dir: artifacts/shards_en
   resume: auto
 
 data:
-  train_glob: artifacts/shards/train_*.gbin
-  val_glob: artifacts/shards/val_*.gbin
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin

@@ -107,9 +107,9 @@ echo "[compiler] GCC  : $(g++ --version | head -1)"
 echo "[compiler] CMake: $(cmake --version | head -1)"
 
 # ---- 5b. Apache Arrow C++ (REQUIRED native parquet lake input).
-# The project is PARQUET-ONLY: english_parquet/english_chat_part*.parquet +
-# english_instruction_part*.parquet (built once by
-# tools/convert_hermes_to_parquet.py) are read straight into .gbin shards.
+# The project is PARQUET-ONLY: the supplied english_parquet lake
+# (english_chat_part*.parquet + english_instruction_part*.parquet) is read
+# straight into .gbin shards.
 # libarrow-dev/libparquet-dev are NOT in Ubuntu's default repos, so the
 # official Apache Arrow apt repository is added first. A failure here is
 # FATAL when --with-parquet was requested (training is impossible without
@@ -201,14 +201,10 @@ ls -lh "${BUILD_DIR}/bin/"
 # ---- 8. Run tests (unless skipped)
 if [[ "${SKIP_TESTS}" -eq 0 ]]; then
     echo ""
-    echo "[tests] Running model test..."
-    "${BUILD_DIR}/bin/test_model"   && echo "  [ok] test_model"
-    "${BUILD_DIR}/bin/test_tokenizer" && echo "  [ok] test_tokenizer"
-    "${BUILD_DIR}/bin/test_tiny_train" && echo "  [ok] test_tiny_train"
-
+    echo "[tests] Running CTest suite..."
+    ctest --test-dir "${BUILD_DIR}" --output-on-failure
     if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
-        echo "[tests] Running CUDA parity test..."
-        "${BUILD_DIR}/bin/test_cuda" && echo "  [ok] test_cuda"
+        echo "[tests] CUDA parity: see gate below"
     else
         echo "[tests] CUDA parity: SKIPPED (no GPU)"
     fi
@@ -220,7 +216,7 @@ fi
 # This is the correctness gate for the MoE GPU kernels (cuda/moe.cu): tiny
 # config, a few seconds, compares CPU vs CUDA forward+backward. If the kernels
 # were broken, training would silently diverge — so this MUST pass.
-if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]] && [[ "${SKIP_TESTS}" -eq 0 ]]; then
+if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
     echo ""
     echo "[gate] CUDA parity gate (MoE kernel validation)..."
     if [[ -x "${BUILD_DIR}/bin/test_cuda" ]]; then
@@ -239,7 +235,7 @@ fi
 # ---- 9. Tokenizer check (automatic training when missing)
 # PARQUET-ONLY English track: the BPE corpus comes from the Hermes lake
 # (english_chat_part*.parquet + english_instruction_part*.parquet) via
-# tools/parquet_to_corpus.py, then train_tokenizer --keep-case builds
+# data_pipeline parquet-corpus, then train_tokenizer --keep-case builds
 # artifacts/tokenizer/english32k.gtok (vocab 32000, case preserved).
 # The old JSON dump-text route was REMOVED (no silent synth-only garbage).
 echo ""
@@ -297,15 +293,8 @@ elif [[ -n "${LAKE_DIR}" ]]; then
     echo "[tokenizer] English lake found: ${LAKE_DIR}"
     echo "[tokenizer] Step 1/2: lake -> BPE corpus (keep-case)..."
     mkdir -p "${REPO_DIR}/artifacts/tokenizer" "${REPO_DIR}/artifacts/corpus"
-    if ! python3 -c "import pyarrow" 2>/dev/null; then
-        echo "[tokenizer] installing pyarrow for the corpus export..."
-        python3 -m pip install -q pyarrow || {
-            echo "[ERROR] pyarrow install failed (needed to read the lake)."
-            exit 1
-        }
-    fi
     CORPUS_LIMIT="${PARQUET_CORPUS_LIMIT:-400000}"
-    python3 "${REPO_DIR}/tools/parquet_to_corpus.py" \
+    "${BUILD_DIR}/bin/data_pipeline" parquet-corpus \
         --lake "${LAKE_DIR}" \
         --out "${REPO_DIR}/artifacts/corpus/corpus_en.txt" \
         --limit "${CORPUS_LIMIT}" || {

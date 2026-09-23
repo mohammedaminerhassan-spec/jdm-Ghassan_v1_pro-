@@ -2,12 +2,10 @@
 
 // dataset/json_reader.h — PARQUET-ONLY project: JSON file ingestion REMOVED.
 //
-// Hermes (openhermes2_5.json, 1M rows) was converted once via
-//   python tools/convert_hermes_to_parquet.py
-// into english_parquet/english_chat_part*.parquet +
-// english_parquet/english_instruction_part*.parquet
-// and training reads ONLY that lake via dataset/parquet_reader.h
-// (data_pipeline parquet --mode chat --style-mode en --keep-case).
+// The prebuilt Hermes lake is stored as
+// english_parquet/english_chat_part*.parquet +
+// english_parquet/english_instruction_part*.parquet and training reads ONLY
+// that lake via dataset/parquet_reader.h.
 //
 // This header keeps the MINIMAL chat-document types + the single
 // messages_json parser used by the parquet chat route. File-based JSON
@@ -46,7 +44,7 @@ using JsonDocCallback = std::function<void(const JsonDoc&)>;
 
 // PARQUET-ONLY: file-based JSON ingestion is REMOVED (was read_json_docs /
 // read_json_dir / load_json_texts / inspect_json). Any call is a recipe bug:
-// convert the corpus once with tools/convert_hermes_to_parquet.py and use
+// The prebuilt lake is consumed with
 //   data_pipeline parquet --mode chat --lake english_parquet ...
 // Keeping the old path would re-introduce the silent-drop divergence.
 

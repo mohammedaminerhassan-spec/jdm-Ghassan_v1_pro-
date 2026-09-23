@@ -4,6 +4,7 @@
 #include <queue>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace gai {
 
@@ -110,6 +111,8 @@ struct Cand {
 
 void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const {
     if (piece.empty()) return;
+    GAI_CHECK(piece.size() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+              "tokenizer chunk exceeds int range");
 
     // Whole-chunk fast path
     auto whole = token_ids_.find(piece);
@@ -170,8 +173,13 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
         if (nodes[static_cast<size_t>(i)].alive) ids.push_back(nodes[static_cast<size_t>(i)].id);
     }
 
+    // FIX P2 (cache thrash): wholesale clear on overflow caused a latency
+    // spike every 200k unique chunks (EN lake). Evict a random 1/8 instead
+    // so hot entries survive; amortized O(1) instead of cliff.
     if (cache_.size() >= cache_limit_) {
-        cache_.clear();
+        size_t drop = cache_.size() / 8 + 1;
+        auto it = cache_.begin();
+        while (drop-- > 0 && it != cache_.end()) it = cache_.erase(it);
     }
     cache_.emplace(piece, ids);
     out.insert(out.end(), ids.begin(), ids.end());
@@ -358,9 +366,9 @@ bool Tokenizer::load(const std::string& path) {
     finalize_index();
 
     u32 nmerges = 0;
-    if (!rd(f, nmerges)) return false;
+    if (!rd(f, nmerges) || nmerges > 10000000u) return false;
     merges_.clear();
-    merges_.reserve(nmerges * 2);
+    merges_.reserve(static_cast<size_t>(nmerges) * 2);
     for (u32 r = 0; r < nmerges; ++r) {
         u32 l = 0, rr = 0;
         if (!rd(f, l) || !rd(f, rr)) return false;

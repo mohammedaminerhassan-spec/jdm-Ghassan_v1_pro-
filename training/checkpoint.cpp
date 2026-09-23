@@ -468,7 +468,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     }
 
     u8 has_opt = 0;
-    if (!rd(f, has_opt)) return true;   // weights-only checkpoint is valid
+    if (!rd(f, has_opt)) return false;
     if (version == 3u) {
         // legacy v3: payload is always AdamW
         if (has_opt && opt) {
@@ -479,7 +479,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         return true;
     }
     u8 kind = OPT_ADAMW;
-    if (has_opt && !rd(f, kind)) return true;
+    if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_ADAMW) {
             log_warn("checkpoint holds lion moments but trainer uses adamw; starting fresh moments");
@@ -500,12 +500,15 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
 
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
-    // Accept v3..v8: weights + schedule always restore; moments restart fresh
+    // Accept v3..v9: weights + schedule always restore; moments restart fresh
     // with a warning when the optimizer kind differs, rather than restarting step 0.
+    // FIX P0-1 (T4 Lion resume): v9 optimizer blob layout is unchanged since v7,
+    // so only version < 5 is legacy. The old gate (version != 5..8) wrongly
+    // treated v9 (+v4) as legacy and silently dropped Lion/Muon moments.
     if (!rd(f, version) ||
         (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
         return false;
-    bool is_legacy = (version != 8u && version != 7u && version != 6u && version != 5u);
+    bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
     if (version >= 9u) {
@@ -578,7 +581,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     }
 
     u8 has_opt = 0;
-    if (!rd(f, has_opt)) return true;
+    if (!rd(f, has_opt)) return false;
     if (is_legacy) {
         // v3/v4 payload may be AdamW: weights already restored above,
         // moments can't be reused for Lion -> fresh start for opt only.
@@ -588,7 +591,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         return true;
     }
     u8 kind = OPT_ADAMW;
-    if (has_opt && !rd(f, kind)) return true;
+    if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_LION) {
             log_warn("checkpoint holds adamw moments but trainer uses lion; starting fresh moments");
@@ -614,7 +617,8 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     if (!rd(f, version) ||
         (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
         return false;
-    bool is_legacy = (version != 8u && version != 7u && version != 6u && version != 5u);
+    // FIX P0-1 (Muon too): same v9 gate as Lion loader above.
+    bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
     if (version >= 9u) {
@@ -687,7 +691,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     }
 
     u8 has_opt = 0;
-    if (!rd(f, has_opt)) return true;
+    if (!rd(f, has_opt)) return false;
     if (is_legacy) {
         // v3/v4 payloads predate Muon: weights already restored above,
         // moments restart fresh for the optimizer only.
@@ -697,7 +701,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         return true;
     }
     u8 kind = OPT_ADAMW;
-    if (has_opt && !rd(f, kind)) return true;
+    if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_MUON) {
             log_warn("checkpoint holds other-optimizer moments but trainer uses muon; starting fresh moments");
@@ -743,7 +747,9 @@ std::string Checkpoint::latest_in(const std::string& dir) {
 
     std::vector<std::string> found;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file()) continue;
+        if (ec) break;
+        std::error_code file_ec;
+        if (!e.is_regular_file(file_ec) || file_ec) continue;
         if (e.path().extension() == ".ckpt") found.push_back(e.path().string());
     }
     if (found.empty()) return "";

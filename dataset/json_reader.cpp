@@ -1,10 +1,8 @@
 // dataset/json_reader.cpp — PARQUET-ONLY: minimal messages_json parser.
 //
 // File-based JSON ingestion (read_json_docs / read_json_dir / ...) was
-// REMOVED. Hermes JSON was converted once:
-//   python tools/convert_hermes_to_parquet.py --input data/openhermes2_5.json --out english_parquet
-// Training reads ONLY english_parquet/* via dataset/parquet_reader.h
-// (data_pipeline parquet --mode chat). This file keeps the bounded DOM +
+// REMOVED. The prebuilt English lake is read directly from
+// english_parquet/* via dataset/parquet_reader.h. This file keeps the bounded DOM +
 // schema mapping needed to parse ONE {"messages":[...]} text from the
 // messages_json parquet column. Malformed rows -> false (skip, never crash).
 

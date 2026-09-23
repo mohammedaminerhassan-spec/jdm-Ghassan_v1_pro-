@@ -115,6 +115,12 @@ void synchronize() {
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+size_t free_bytes_live() {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return free_b;
+}
+
 void* cublas_handle() {
     if (!g_cublas) {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");

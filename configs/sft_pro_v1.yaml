@@ -1,5 +1,7 @@
-# Ghassan v1 Pro — SFT stage (matches pro_v1.yaml architecture exactly).
-# Stage 2 بعد pro_v1 pretrain. نفس حقول Pro (aux_free/yarn/swa/rope_type).
+# Ghassan v1 Pro 1B — English SFT stage (matches pro_v1.yaml architecture exactly).
+# Stage 2 after pro_v1 pretrain. Same shards, heavier instruction weight.
+# Keep this file's model.* block byte-identical to pro_v1.yaml or resume
+# fails the architecture gate. Lion + B=1/T=512 like pretrain (T4 fit).
 
 model:
   vocab_size: 32000
@@ -31,7 +33,7 @@ model:
   rope_type: 0
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -62,7 +64,7 @@ training:
   eval_every: 100
   eval_batches: 15
   save_every: 500
-  data_dir: artifacts/shards_1b_sft
+  data_dir: artifacts/shards_en
   checkpoint_dir: artifacts/checkpoints/pro_v1_sft
   resume: auto
   pretrained_checkpoint: artifacts/checkpoints/pro_v1/last.ckpt
@@ -72,10 +74,9 @@ training:
   ckpt_segments: 1
 
 data:
-  data_dir: artifacts/shards_1b_sft
+  data_dir: artifacts/shards_en
   train_prefix: train_
   val_prefix: val_
   mix:
-    darija_chat: 0.45
-    darija_speak: 0.30
-    darija_qa: 0.25
+    english_chat: 0.65
+    english_instruction: 0.35

@@ -1,17 +1,41 @@
-# Ghassan v1 English-Pro — MoE chat recipe for the chat_if English corpus
-# (426k multi-turn convos -> 350k deduped: english_chat + english_instruction).
-# Architecture: flash-size MoE (~480M total / ~204M active) so answers are FAST
-# (small conditional compute) yet strong. seq_len 1024: chat_if convos average
-# ~3-4k tokens and shards are window-split (never truncated), so 1024 keeps
-# full turns in context on T4 (flash memory math: ~11.8GB with ckpt, see below).
+# Ghassan v1 Pro — English PRETRAIN recipe (flagship single-T4 run).
+# Architecture: fast MoE, ~480M total / ~204M active per token:
+#   26 layers, 12 heads, 4 KV heads (GQA), 8 experts top-2 + shared, QK-Norm.
+# Why this size: 204M active experts + full attention responds FAST on T4
+# (single-token decode is memory-bound), while 480M total trains in one
+# Kaggle session budget. For maximum strength, see configs/pro_v1.yaml (1B).
+# T4 fit: fp32 masters + Lion/AdamW below, B=2/T=1024/accum=32
+# (65,536 tokens/step, ~11.8GB measured envelope).
 #
-# Data contract (built by kaggle/build_english_data.sh):
-#   artifacts/shards_en/train_english_chat_*.gbin        (from *.parquet chat parts)
-#   artifacts/shards_en/train_english_instruction_*.gbin (from *_instruction parts)
-# Tokenizer (SHIPPED in the zip, trained --keep-case on chat_if):
-#   artifacts/tokenizer/english32k.gtok (vocab 32000, case preserved)
-# Shard build MUST use: --style-mode en --keep-case --seq-len 1024
-#   --expect-vocab 32000 (mismatched flags silently corrupt casing/filters).
+# DATA (Parquet-only, English Hermes lake — Kaggle):
+#   EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh
+#     == data_pipeline parquet --mode chat --lake <lake> --match english_chat ...
+#        --tokenizer artifacts/tokenizer/english32k.gtok --expect-vocab 32000
+#        --style-mode en --keep-case --seq-len 1024 --domain english_chat
+#     (+ same for --match english_instruction --domain english_instruction)
+#   output: artifacts/shards_en/train_english_{chat,instruction}_*.gbin
+# Tokenizer (keep-case English BPE, vocab 32000):
+#   artifacts/tokenizer/english32k.gtok (trained by setup.sh from the lake).
+#   Shards MUST be built with --style-mode en --keep-case --expect-vocab 32000
+#   or casing/filters silently disagree between train and inference.
+#
+# CONTEXT WINDOW (controllable):
+#   - model.max_seq_len below is the HARD maximum (KV cache is sized from it).
+#   - training.seq_len (1024) is the window the model trains on (<= max_seq_len).
+#   - inference: ghassan-ai generate/chat --ctx N with N <= max_seq_len.
+#   - presets: 2048 = fastest, long chats stay coherent; 4096 = default;
+#     8192 needs rope_scale 2.0 (approximate NTK extrapolation, validate ppl).
+#   - memory remembers the window via the KV cache; older turns slide out
+#     (Generator keeps BOS + recent turns, evicting the front past the budget).
+#
+# TRAIN (single T4, timeboxed by pilot-measured tok/s, NOT by epochs):
+#   TOK=artifacts/tokenizer/english32k.gtok \
+#   CONFIG_PT=configs/en_pro.yaml CONFIG_SFT=configs/sft_en_pro.yaml \
+#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
+#   CKPT_PT=artifacts/checkpoints/en_pro CKPT_SFT=artifacts/checkpoints/en_pro_sft \
+#   GGUF_OUT=artifacts/ghassan-v1-pro_q4_0.gguf \
+#   bash kaggle/train_1b.sh --time-budget-min 540 --export-profile q4_0
+# Chat: ghassan-ai chat --model artifacts/ghassan-v1-pro_q4_0.gguf --persona en
 
 model:
   vocab_size: 32000        # english32k.gtok (keep-case)

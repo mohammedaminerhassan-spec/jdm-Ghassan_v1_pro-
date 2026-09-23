@@ -84,6 +84,7 @@ private:
     const Tokenizer& tok_;
     KVCache          cache_;
     int              max_context_;
+    Device           expected_device_ = Device::CPU;
 
     // P0-03 FIX: Absolute token position counter. After KV evict_front,
     // cache_.length() shrinks, but the true RoPE coordinate of the next

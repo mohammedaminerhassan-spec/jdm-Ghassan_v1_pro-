@@ -28,7 +28,9 @@ std::vector<std::string> list_parquet_files(const std::string& dir_or_file) {
         out.push_back(dir_or_file);
     } else {
         for (const auto& e : fs::recursive_directory_iterator(dir_or_file, ec)) {
-            if (!e.is_regular_file()) continue;
+            if (ec) break;
+            std::error_code file_ec;
+            if (!e.is_regular_file(file_ec) || file_ec) continue;
             std::string ext = e.path().extension().string();
             for (char& ch : ext) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
             if (ext == ".parquet") out.push_back(e.path().string());

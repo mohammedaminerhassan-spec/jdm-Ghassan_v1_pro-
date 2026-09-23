@@ -22,9 +22,9 @@ static void usage() {
     std::cout <<
     "gai_train - Ghassan AI training\n\n"
     "usage:\n"
-    "  gai_train --config configs/flash_moe.yaml\n"
-    "  gai_train --config configs/flash_moe.yaml --max-steps 100 --batch-size 2 --seq-len 256\n"
-    "  gai_train --dry-run --config configs/flash_moe.yaml     # report shapes/memory only\n\n"
+    "  gai_train --config configs/en_pro.yaml\n"
+    "  gai_train --config configs/en_pro.yaml --max-steps 100 --batch-size 2 --seq-len 256\n"
+    "  gai_train --dry-run --config configs/en_pro.yaml     # report shapes/memory only\n\n"
     "overrides (all optional, they win over the config file):\n"
     "  --data <dir> --checkpoint-dir <dir> --resume auto|none|<path>\n"
     "  --batch-size --seq-len --grad-accum --max-steps --lr --warmup --seed\n"
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     if (args.flag("help")) { usage(); return 0; }
 
     try {
-        std::string cfg_path = args.str("config", "configs/flash_moe.yaml");
+        std::string cfg_path = args.str("config", "configs/en_pro.yaml");
         Config cfg;
         if (fs::exists(cfg_path)) {
             cfg = Config::from_file(cfg_path);
@@ -70,25 +70,27 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- CLI overrides
+        // ---- CLI overrides (FIX P1-7: --strict-args fails fast instead of
+        // warn+default so a typo like --batch-size 2x never burns GPU hours)
+        const bool strict_args = args.flag("strict-args", false);
         if (args.has("data"))            tcfg.data_dir = args.str("data");
         if (args.has("checkpoint-dir"))  tcfg.checkpoint_dir = args.str("checkpoint-dir");
         if (args.has("resume"))          tcfg.resume = args.str("resume");
         if (args.flag("allow-recipe-drift")) tcfg.allow_recipe_drift = true;
-        if (args.has("batch-size"))      tcfg.batch_size = static_cast<int>(args.num("batch-size"));
-        if (args.has("seq-len"))         tcfg.seq_len = static_cast<int>(args.num("seq-len"));
-        if (args.has("grad-accum"))      tcfg.grad_accum = static_cast<int>(args.num("grad-accum"));
+        if (args.has("batch-size"))      tcfg.batch_size = strict_args ? args.num_int_strict("batch-size") : args.num_int("batch-size");
+        if (args.has("seq-len"))         tcfg.seq_len = strict_args ? args.num_int_strict("seq-len") : args.num_int("seq-len");
+        if (args.has("grad-accum"))      tcfg.grad_accum = strict_args ? args.num_int_strict("grad-accum") : args.num_int("grad-accum");
         // CLI --max-steps wins over the yaml schedule: it forces steps mode
         // (epochs cleared) so scripted time budgets can't silently mix modes.
         if (args.has("max-steps")) {
-            tcfg.max_steps = args.num("max-steps");
+            tcfg.max_steps = strict_args ? args.num_strict("max-steps") : args.num("max-steps");
             if (tcfg.epochs > 0)
                 log_warn("[cfg ] --max-steps overrides yaml epochs (epochs ignored)");
             tcfg.epochs = 0;
         }
-        if (args.has("gemm-fp16"))       tcfg.gemm_fp16 = args.num("gemm-fp16") != 0;
-        if (args.has("lr"))              tcfg.learning_rate = static_cast<float>(args.real("lr"));
-        if (args.has("warmup"))          tcfg.warmup_steps = args.num("warmup");
+        if (args.has("gemm-fp16"))       tcfg.gemm_fp16 = (strict_args ? args.num_strict("gemm-fp16") : args.num("gemm-fp16")) != 0;
+        if (args.has("lr"))              tcfg.learning_rate = static_cast<float>(strict_args ? args.real_strict("lr") : args.real("lr"));
+        if (args.has("warmup"))          tcfg.warmup_steps = strict_args ? args.num_strict("warmup") : args.num("warmup");
         if (args.has("optimizer")) {
             tcfg.optimizer = args.str("optimizer");
             if (tcfg.optimizer != "adamw" && tcfg.optimizer != "lion" && tcfg.optimizer != "muon")
@@ -105,24 +107,30 @@ int main(int argc, char** argv) {
         }
         if (args.has("ckpt-segments")) {
             tcfg.activation_checkpointing = true;
-            tcfg.ckpt_segments = static_cast<int>(args.num("ckpt-segments"));
+            tcfg.ckpt_segments = strict_args ? args.num_int_strict("ckpt-segments") : args.num_int("ckpt-segments");
             if (tcfg.ckpt_segments < 1) tcfg.ckpt_segments = 1;
             if (tcfg.ckpt_segments > 8) tcfg.ckpt_segments = 8;
         }
         if (args.has("ce-chunks")) {
-            tcfg.ce_chunks = static_cast<int>(args.num("ce-chunks"));
-            if (tcfg.ce_chunks < 0) tcfg.ce_chunks = 0;
+            tcfg.ce_chunks = strict_args ? args.num_int_strict("ce-chunks") : args.num_int("ce-chunks");
+            if (tcfg.ce_chunks <= 0) tcfg.ce_chunks = 1;
             if (tcfg.ce_chunks > 32) tcfg.ce_chunks = 32;
         }
-        if (args.has("seed"))            tcfg.seed = static_cast<u64>(args.num("seed"));
+        if (args.has("seed"))            tcfg.seed = static_cast<u64>(strict_args ? args.num_strict("seed") : args.num("seed"));
         if (args.has("device"))          tcfg.device = args.str("device");
-        if (args.has("log-every"))       tcfg.log_every = args.num("log-every");
-        if (args.has("eval-every"))      tcfg.eval_every = args.num("eval-every");
-        if (args.has("save-every"))      tcfg.save_every = args.num("save-every");
-        if (args.has("vocab"))           mcfg.vocab_size = static_cast<int>(args.num("vocab"));
-        if (args.has("layers"))          mcfg.num_layers = static_cast<int>(args.num("layers"));
-        if (args.has("hidden"))          mcfg.hidden_size = static_cast<int>(args.num("hidden"));
+        if (args.has("log-every"))       tcfg.log_every = strict_args ? args.num_strict("log-every") : args.num("log-every");
+        if (args.has("eval-every"))      tcfg.eval_every = strict_args ? args.num_strict("eval-every") : args.num("eval-every");
+        if (args.has("save-every"))      tcfg.save_every = strict_args ? args.num_strict("save-every") : args.num("save-every");
+        if (args.has("vocab"))           mcfg.vocab_size = strict_args ? args.num_int_strict("vocab") : args.num_int("vocab");
+        if (args.has("layers"))          mcfg.num_layers = strict_args ? args.num_int_strict("layers") : args.num_int("layers");
+        if (args.has("hidden"))          mcfg.hidden_size = strict_args ? args.num_int_strict("hidden") : args.num_int("hidden");
         mcfg.validate();
+        // Echo resolved overrides so pilot math never plans from truncated ints.
+        if (strict_args || args.flag("verbose", false))
+            log_info(strfmt("[cfg ] overrides: B=%d T=%d accum=%d steps=%lld lr=%.6g opt=%s",
+                            tcfg.batch_size, tcfg.seq_len, tcfg.grad_accum,
+                            (long long)tcfg.max_steps, (double)tcfg.learning_rate,
+                            tcfg.optimizer.c_str()));
 
 print_device_report();
 
@@ -225,7 +233,9 @@ print_device_report();
                             human_count(static_cast<u64>(tcfg.tokens_per_step())).c_str()));
             if (tcfg.max_steps > 0)
                 log_info(strfmt("  total training toks : %s (steps mode)",
-                                human_count(static_cast<u64>(tcfg.tokens_per_step() * tcfg.max_steps)).c_str()));
+                                human_count(static_cast<u64>(TrainerConfig::checked_schedule_mul(
+                                    tcfg.tokens_per_step(), tcfg.max_steps,
+                                    "total training tokens"))).c_str()));
             else
                 log_info(strfmt("  schedule            : epochs mode (%d epochs; steps from data size)",
                                 tcfg.epochs));

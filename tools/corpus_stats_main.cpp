@@ -49,8 +49,11 @@ int main(int argc, char** argv) {
         std::vector<std::string> files;
         std::error_code ec;
         if (fs::is_directory(input, ec)) {
-            for (const auto& e : fs::recursive_directory_iterator(input, ec))
-                if (e.is_regular_file()) files.push_back(e.path().string());
+            for (const auto& e : fs::recursive_directory_iterator(input, ec)) {
+                if (ec) break;
+                std::error_code file_ec;
+                if (e.is_regular_file(file_ec) && !file_ec) files.push_back(e.path().string());
+            }
         } else {
             files.push_back(input);
         }
@@ -65,7 +68,9 @@ int main(int argc, char** argv) {
         std::map<std::string, u64> quality_reasons;
         std::map<std::string, std::vector<std::string>> samples;
         const i64 limit = args.num("limit", 0);
-        const int nsample = static_cast<int>(args.num("sample", 0));
+        const int nsample = args.num_int("sample", 0);
+        GAI_CHECK(limit >= 0, "--limit must be >= 0");
+        GAI_CHECK(nsample >= 0, "--sample must be >= 0");
 
         Timer t;
         for (const auto& path : files) {

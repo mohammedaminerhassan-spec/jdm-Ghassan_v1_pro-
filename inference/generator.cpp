@@ -1,10 +1,14 @@
 #include "inference/generator.h"
 #include "core/ops.h"
 #include "core/device.h"
+#ifdef GAI_CUDA
+#include "cuda/cuda_utils.h"
+#endif
 
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 namespace gai {
 
@@ -19,6 +23,7 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     const ModelConfig& c = model.config();
     Device dev = model.device();
     max_context_ = max_context > 0 ? std::min(max_context, c.max_seq_len) : c.max_seq_len;
+    expected_device_ = dev;
     // PRO-HARDEN (T4/weak-PC OOM guard): KV cache = 2*L*max_len*kv_dim*4 bytes
     // متجاور. بدون فحص مسبق أي max_seq_len=8192 يفجر T4 فورا. نفشل برسالة
     // واضحة تقترح تصغير max_context بدل OOM غامض وسط التوليد.
@@ -27,9 +32,14 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
                       static_cast<size_t>(max_context_) *
                       static_cast<size_t>(c.kv_dim()) * sizeof(float);
         if (dev == Device::CUDA && cuda_available()) {
+            // FIX P2-1: device_info().free_mem is a stale startup snapshot.
+            // Query live VRAM so ctx=4096 fails fast only when truly OOM.
+#ifdef GAI_CUDA
+            size_t free_b = cuda::free_bytes_live();
+#else
             size_t free_b = device_info().free_mem;
-            // device_info() قد يكون stale: نعيد القياس الحي عند الإمكان عبر
-            // cached probe فقط؛ إن كان need > free نُفشل مبكرا برسالة عملية.
+#endif
+            if (free_b == 0) free_b = device_info().free_mem;
             if (free_b > 0 && need > free_b) {
                 GAI_FAIL(strfmt("KV cache needs %s but only %s free on device "
                                 "(L=%d ctx=%d kv_dim=%d). Halve max_context or max_seq_len.",
@@ -84,7 +94,13 @@ void Generator::reset() {
 
 // ---------------------------------------------------------------- decode step
 // Full body through the LM head; result stays in logits_dev_ (no copy).
+// FIX P2 (robustness): position is int downstream (kernels + KV slots), while
+// the monotonic counter is int64. Guard the 2B-token overflow explicitly.
 float* Generator::decode_step_logits(i32 token, int position) {
+    GAI_CHECK(position >= 0 && (i64)position <= (i64)std::numeric_limits<int>::max(),
+              "decode_step_logits: position out of int range");
+    GAI_CHECK(model_.device() == expected_device_,
+              "model device changed after Generator construction; rebuild the Generator");
     const ModelConfig& c = model_.config();
     const int d   = c.hidden_size;
     const int qd  = c.q_dim();
@@ -186,6 +202,8 @@ float* Generator::decode_step(i32 token, int position) {
 }
 
 void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
+    GAI_CHECK(model_.device() == expected_device_,
+              "model device changed after Generator construction; rebuild the Generator");
     // Batched prefill for fresh prompts (cache empty): one batched GEMM per
     // projection instead of P single-token GEMMs. Falls back to sequential
     // decode_step when the cache already holds context (rare: continuation).
@@ -372,6 +390,8 @@ void Generator::prefill(const std::vector<i32>& tokens) {
 
 // ---------------------------------------------------------------- generate
 std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_token) {
+    GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
+              "GenerationConfig::max_context must match the Generator context");
     std::vector<i32> out;
     Sampler sampler(cfg.sampling);
     Tokenizer::Stream stream(tok_);
@@ -398,7 +418,8 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
                       ? sc.top_k
                       : 0;
     const bool use_fast = sc.gpu_fast_sample && dev == Device::CUDA && V >= 512 &&
-                          win <= FAST_HIST_MAX && (want_greedy || K > 0);
+                          win <= FAST_HIST_MAX && sc.no_repeat_ngram == 0 &&
+                          (want_greedy || K > 0);
 
     // The logits from the last prefill step are already in logits_dev_
     // (fast) and logits_host_ (legacy).
@@ -453,6 +474,8 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
         // cache_.length() which shrinks after evict_front, corrupting RoPE.
         // Fast path leaves logits on device (no full-vocab D2H); legacy keeps
         // the host copy the sampler reads next iteration.
+        GAI_CHECK(absolute_pos_ >= 0 && absolute_pos_ <= (i64)std::numeric_limits<int>::max(),
+                  "generate: absolute_pos overflow (2B tokens); reset the Generator");
         if (use_fast) decode_step_logits(next, static_cast<int>(absolute_pos_));
         else decode_step(next, static_cast<int>(absolute_pos_));
         ++absolute_pos_;
@@ -467,6 +490,8 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
 
 std::string Generator::complete(const std::string& prompt, const GenerationConfig& cfg,
                                 StreamFn on_token) {
+    GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
+              "GenerationConfig::max_context must match the Generator context");
     reset();
     std::vector<i32> ids = tok_.encode(prompt, true, false);
     prefill(ids);
@@ -477,6 +502,8 @@ std::string Generator::complete(const std::string& prompt, const GenerationConfi
 
 std::string Generator::chat(const std::vector<Message>& msgs, const GenerationConfig& cfg,
                             StreamFn on_token) {
+    GAI_CHECK(cfg.max_context == 0 || cfg.max_context == max_context_,
+              "GenerationConfig::max_context must match the Generator context");
     reset();
     std::vector<i32> ids = ChatTemplate::encode(tok_, msgs, true, nullptr);
     // truncate from the front if the prompt alone exceeds the window
@@ -492,13 +519,13 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
 }
 
 // ---------------------------------------------------------------- scoring
-// PRO-HARDEN: النسخة القديمة كانت تبني make_activations(1,T) كاملا فيبقى
 // logits [T,V] (~524MB عند T=4096,V=32k) فيقطع T4. نقطع إلى بلوكات 512
-// (ذروة ~64MB) ونجمع sum/n عبر البلوكات — نفس المتوسط تماما.
-// ملاحظة: كل بلوك يعيد RoPE من 0 (forward لا يدعم offset)؛ مقبول للـeval
-// ويمنع OOM القاتل على T4. للـperplexity الدقيق استعمل T<=512.
+// (ذروة ~64MB) ونجمع sum/n عبر البلوكات — نفس المتوسط تماماً مع الحفاظ على
+// إزاحة RoPE الأصلية عند كل بلوك.
 double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask,
                                i64* out_ntok) {
+    GAI_CHECK(model_.device() == expected_device_,
+              "model device changed after Generator construction; rebuild the Generator");
     if (tokens.size() < 2) { if (out_ntok) *out_ntok = 0; return 0.0; }
     // FIX: heap over-read when mask shorter than tokens (SFT scoring crash).
     // Fail fast instead of reading past the vector (training/eval safety).
@@ -512,10 +539,11 @@ double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector
     for (int off = 0; off < T; off += SCORE_CHUNK) {
         const int Tc = std::min(SCORE_CHUNK, T - off);
         // نحتاج Tc+1 توكن لبناء أهداف البلوك (آخر هدف من البلوك التالي).
-        const int Tend = std::min(T, off + Tc + (off + Tc < T ? 1 : 0));
+        const int Tend = std::min(T, off + Tc + 1);
         const int Tn = Tend - off;
         if (Tn < 2) break;
         Activations act = model_.make_activations(1, Tn, false);
+        act.pos_offset = off;
         std::vector<i32> ids(tokens.begin() + off, tokens.begin() + off + Tn);
         std::vector<i32> tgt(static_cast<size_t>(Tn), -100);
         for (int i = 0; i + 1 < Tn; ++i) {

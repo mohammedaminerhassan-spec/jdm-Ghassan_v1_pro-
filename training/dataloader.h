@@ -30,7 +30,8 @@ struct ShardHeader {
     u64 n_docs   = 0;
 };
 
-// Writer used by the dataset pipeline.
+// Writer used by the dataset pipeline. Call close() explicitly: the
+// destructor never writes a partial shard after an exception.
 class ShardWriter {
 public:
     ShardWriter(const std::string& path, int vocab_size, bool with_loss_mask);
@@ -134,6 +135,11 @@ public:
 
     bool next(Batch& out);
     void skip_batches(i64 n);
+    // FIX P2 (DDP resume stall): fast_forward advances RNG + batches_ using
+    // only in-RAM doc metadata (no token read_window, no vector fills), so
+    // resuming at step 50k no longer replays GBs from disk. Bit-identical
+    // RNG consumption to next() because doc_end/n_tokens lookups are pure.
+    void fast_forward(i64 n);
     // DeepSeek DDP-resume rule: re-seed the stream (rank salt) without
     // touching shards/spec, so a rank can rebuild its exact post-resume
     // position as reseed(rank_seed)+skip(saved_batches) instead of inheriting

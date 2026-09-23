@@ -1,16 +1,33 @@
-# Ghassan v1 Pro — FLAGSHIP Pro recipe (single-T4, DeepSeek-V3/GLM-4 class).
-# مشتق من ultra_1b.yaml (~1.016B total / ~336M active) مع حقول Pro الجديدة.
-# كل حقول Pro default OFF في الكود، وهنا مفعلة بحذر بلا كسر التوافق:
-#   - moe_aux_free: false (classic aux loss 0.01؛ true يتطلب moe_aux_scale 0 —
-#     aux-loss-free الكامل مع EMA bias update مفعّل CPU+CUDA)
-#   - rope_yarn_low/high: YaRN ramp الكامل مفعّل (default 1/32 = سلوك legacy نفسه)
-#   - sliding_window: 0 (off؛ >0 SWA kernel مفعّل CPU+CUDA)
-#   - rope_type: 0 (interleaved default؛ 1=neox kernels مفعّلة CPU+CUDA للـcheckpoints الجديدة)
-# T4 fit: نفس ultra (Lion + B=1 + T=512 + grad_accum=128 = 65k tok/step).
-# Single-session: استعمل kaggle/train_1b.sh مع CONFIG_PT/CONFIG_SFT override:
+# Ghassan v1 Pro 1B — FLAGSHIP English pretrain for maximum strength (single-T4).
+# Maximum-strength variant of the Pro family: ~1.016B total / ~336M active.
+#   36 layers, 12 heads, 4 KV heads (GQA), 10 experts top-2 + shared, QK-Norm.
+# Use en_pro.yaml (480M) when you want the fastest responses; use this file
+# when you want the strongest English understanding on one T4.
+# T4 fit: 1B fp32 = 4.06GB weights + 4.06GB grads + Lion 4.06GB = ~12.2GB,
+# so optimizer MUST stay lion, batch_size=1, seq_len=512, grad_accum=128
+# (65,536 tokens/step). 32k English tokenizer is MANDATORY.
+#
+# DATA (Parquet-only, English Hermes lake — Kaggle):
+#   Tokenizer/shards are shared with en_pro: build them once with
+#   EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh
+#   (english32k.gtok keep-case + train_english_{chat,instruction}_*.gbin).
+#   Shard recipe there uses --seq-len 1024 windows; the trainer reads
+#   seq_len=512 windows out of them (DataLoader windows any T <= shard docs).
+#
+# CONTEXT WINDOW (controllable):
+#   - model.max_seq_len below is the HARD maximum (KV cache is sized from it).
+#   - training.seq_len (512) is the window the model trains on (<= max_seq_len).
+#   - inference: ghassan-ai generate/chat --ctx N with N <= max_seq_len.
+#   - presets: 2048 = fastest; 4096 = default; 8192 needs rope_scale 2.0
+#     (approximate NTK extrapolation, validate perplexity first).
+#
+# TRAIN (single T4, timeboxed by pilot-measured tok/s, NOT by epochs):
+#   TOK=artifacts/tokenizer/english32k.gtok \
 #   CONFIG_PT=configs/pro_v1.yaml CONFIG_SFT=configs/sft_pro_v1.yaml \
-#   PT_DIR=artifacts/shards_1b SFT_DIR=artifacts/shards_1b_sft \
-#   bash kaggle/train_1b.sh --time-budget-min 540
+#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
+#   CKPT_PT=artifacts/checkpoints/pro_v1 CKPT_SFT=artifacts/checkpoints/pro_v1_sft \
+#   GGUF_OUT=artifacts/ghassan-v1-pro-1b_q4_0.gguf \
+#   bash kaggle/train_1b.sh --time-budget-min 540 --export-profile q4_0
 
 model:
   vocab_size: 32000
@@ -30,7 +47,7 @@ model:
   moe_expert_dim: 1024
   moe_shared: true
   moe_aux_scale: 0.01      # classic aux loss (aux-free=false)
-  moe_aux_free: false       # Pro: true = لا aux grad (يتطلب aux_scale 0.0)
+  moe_aux_free: false       # Pro: true = no aux grad (requires aux_scale 0.0)
   moe_jitter: 0.01
   z_loss_scale: 0.0001
   use_qk_norm: true
@@ -39,10 +56,10 @@ model:
   rope_yarn_low: 1.0        # Pro YaRN ramp (default = legacy)
   rope_yarn_high: 32.0
   sliding_window: 0         # Pro SWA: 0=off (full causal)
-  rope_type: 0              # Pro: 0=interleaved (kernels الحالية)
+  rope_type: 0              # Pro: 0=interleaved (current kernels)
 
 tokenizer:
-  path: artifacts/tokenizer/darija32k.gtok
+  path: artifacts/tokenizer/english32k.gtok
   vocab_size: 32000
 
 training:
@@ -74,17 +91,14 @@ training:
   eval_batches: 20
   save_every: 500
   checkpoint_dir: artifacts/checkpoints/pro_v1
-  data_dir: artifacts/shards_1b
+  data_dir: artifacts/shards_en
   resume: auto
   activation_checkpointing: false
   ckpt_segments: 1
 
 data:
-  train_glob: artifacts/shards_1b/train_*.gbin
-  val_glob: artifacts/shards_1b/val_*.gbin
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
   mix:
-    darija_conversational: 0.40
-    darija_vocab: 0.20
-    darija_speak: 0.15
-    educational_science: 0.15
-    darija_qa: 0.10
+    english_chat: 0.80
+    english_instruction: 0.20

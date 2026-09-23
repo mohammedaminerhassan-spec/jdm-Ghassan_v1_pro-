@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# kaggle/train_1b.sh — Ghassan v1 Ultra 1B two-stage training (Kaggle GPU, multi-session safe)
+# kaggle/train_1b.sh — Ghassan v1 Pro English two-stage training (Kaggle GPU, multi-session safe)
 #
-#   Stage A (pretrain): configs/ultra_1b.yaml on artifacts/shards_1b (~1B tokens)
-#   Stage B (sft)     : configs/sft_ultra_1b.yaml on artifacts/shards_1b_sft
-#   -> GGUF export -> Darija smoke test. WSD scheduler + resume=auto so you can
+#   Stage A (pretrain): configs/en_pro.yaml on artifacts/shards_en (English lake)
+#   Stage B (sft)     : configs/sft_en_pro.yaml on artifacts/shards_en
+#   -> GGUF export -> English smoke test. WSD scheduler + resume=auto so you can
 #   stop/resume across Kaggle sessions until loss converges.
 #
 # Usage:
@@ -17,15 +17,15 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="full"
-# Overridable recipe (Darija Flash <=8h run shown below; defaults = Ultra 1B).
+# Overridable recipe (Pro 1B run shown below; defaults = Pro 480M English).
 # Example:
-#   CONFIG_PT=configs/darija_flash.yaml CONFIG_SFT=configs/sft_darija_flash.yaml \
-#   PT_DIR=artifacts/shards_darija SFT_DIR=artifacts/shards_darija_sft \
-#   CKPT_PT=artifacts/checkpoints/darija_flash CKPT_SFT=artifacts/checkpoints/darija_flash_sft \
-#   GGUF_OUT=artifacts/ghassan-darija-flash_q4_0.gguf \
+#   CONFIG_PT=configs/pro_v1.yaml CONFIG_SFT=configs/sft_pro_v1.yaml \
+#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
+#   CKPT_PT=artifacts/checkpoints/pro_v1 CKPT_SFT=artifacts/checkpoints/pro_v1_sft \
+#   GGUF_OUT=artifacts/ghassan-v1-pro-1b_q4_0.gguf \
 #   bash kaggle/train_1b.sh --time-budget-min 420 --export-profile q4_0 --pt-fraction 70
-CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/ultra_1b.yaml}"
-CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_ultra_1b.yaml}"
+CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/en_pro.yaml}"
+CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_en_pro.yaml}"
 TIME_BUDGET_MIN=540
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
@@ -49,25 +49,23 @@ done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
-# PARQUET-ONLY EN: override for English-Pro runs:
-#   TOK=artifacts/tokenizer/english32k.gtok CONFIG_PT=configs/en_pro.yaml ... bash kaggle/train_1b.sh
-TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/darija32k.gtok}"
+TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
 # PRO-HARDEN: fallback الصامت إلى 16k كان يضيع run كاملا ثم يفشل عند البوابة.
-# نفشل فورا إن غاب 32k (setup.sh يدربه تلقائيا).
+# نفشل فورا إن غاب 32k (setup.sh يدربه تلقائيا من English lake).
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] 32k tokenizer missing: ${TOK} (legacy 16k fallback DISABLED: it would waste embeddings)."
-    echo "[ERROR] Run: bash kaggle/setup.sh  (trains darija32k.gtok automatically)"
+    echo "[ERROR] Run: bash kaggle/setup.sh --with-parquet  (trains english32k.gtok automatically)"
     exit 1
 fi
-PT_DIR="${PT_DIR:-${REPO_DIR}/artifacts/shards_1b}"
-SFT_DIR="${SFT_DIR:-${REPO_DIR}/artifacts/shards_1b_sft}"
-CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/ultra_1b}"
-CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/ultra_1b_sft}"
-GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-v1-ultra-1b_${EXPORT_PROFILE}.gguf}"
+PT_DIR="${PT_DIR:-${REPO_DIR}/artifacts/shards_en}"
+SFT_DIR="${SFT_DIR:-${REPO_DIR}/artifacts/shards_en}"
+CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_pro}"
+CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_pro_sft}"
+GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf}"
 
 echo "============================================================"
-echo "  Ghassan v1 Ultra 1B — Two-Stage Training [${MODE}]"
-echo "  FLAGSHIP single-T4 recipe: ~1.016B total / ~336M active MoE | Lion + WSD"
+echo "  Ghassan v1 Pro English — Two-Stage Training [${MODE}]"
+echo "  FLAGSHIP single-T4 recipe: ~480M total / ~204M active MoE | WSD + resume"
 echo "============================================================"
 
 # PRO-HARDEN: حفظ checkpoints/GGUF في /kaggle/working/output (دائم) لا في
@@ -92,21 +90,21 @@ nvidia-smi --query-gpu=name,memory.free,memory.total --format=csv,noheader 2>/de
 [[ -f "${TOK}" ]] || { echo "[ERROR] Tokenizer missing: ${TOK}"; exit 1; }
 PT_SHARDS=$(find "${PT_DIR}" -name "train_*.gbin" 2>/dev/null | wc -l)
 SFT_SHARDS=$(find "${SFT_DIR}" -name "train_*.gbin" 2>/dev/null | wc -l)
-[[ "${PT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No pretrain shards in ${PT_DIR}. Run build_billion_data.sh first."; exit 1; }
-[[ "${SFT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No SFT shards in ${SFT_DIR}. Run build_billion_data.sh first."; exit 1; }
+[[ "${PT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No pretrain shards in ${PT_DIR}. Run build_english_data.sh first."; exit 1; }
+[[ "${SFT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No SFT shards in ${SFT_DIR}. Run build_english_data.sh first."; exit 1; }
 echo "[data] pretrain shards: ${PT_SHARDS} | sft shards: ${SFT_SHARDS}"
-# DISK FIT (19.5GB Kaggle + 3GB data): 1B ckpt is ~8GB each (last+best=16GB).
+# DISK FIT (19.5GB Kaggle): Pro ckpt is ~4GB each (last+best=8GB per stage).
 # Auto-clean intermediates that are never needed during training, then guard.
 echo "[disk] before training:"; df -h "${REPO_DIR}" | tail -n 1
 rm -rf "${REPO_DIR}/artifacts/corpus" "${REPO_DIR}/artifacts/synth" 2>/dev/null || true
-# If shards_1b still has a leftover merged jsonl, it is dead weight now.
+# If shards_en still has a leftover merged jsonl, it is dead weight now.
 find "${REPO_DIR}/artifacts" -maxdepth 2 -name "synthetic_*.jsonl" -delete 2>/dev/null || true
 FREE_KB=$(df "${REPO_DIR}" | awk 'NR==2{print $4}')
-# Need ~10GB free for 2x 1B ckpt + GGUF export temp. Fail fast, never mid-run OOM.
+# Need ~10GB free for 2x Pro ckpt + GGUF export temp. Fail fast, never mid-run OOM.
 if [[ "${FREE_KB}" -lt 10485760 ]]; then
-  echo "[ERROR] Disk too full for 1B training (free <10GB). 19.5GB Kaggle needs:"
+  echo "[ERROR] Disk too full for Pro training (free <10GB). 19.5GB Kaggle needs:"
   echo "  rm -rf artifacts/corpus artifacts/synth <merged jsonl> (done above)"
-  echo "  Keep only shards + tokenizer. JSON source can be deleted after sharding."
+  echo "  Keep only shards + tokenizer. Parquet source can be detached after sharding."
   echo "  Current:"; df -h "${REPO_DIR}" | tail -n 1; du -sh "${REPO_DIR}/artifacts/"* 2>/dev/null || true
   exit 1
 fi
@@ -197,7 +195,7 @@ else
 fi
 
 echo ""
-echo "[pilot] Measuring 1B speed (${PILOT_STEPS} steps)..."
+echo "[pilot] Measuring Pro speed (${PILOT_STEPS} steps)..."
 P_START=$(date +%s)
 # 10/10: do NOT force --gemm-fp16 0. Pilot must measure the REAL recipe (fp16 ON
 # for T4). Old script forced fp32, measured 3-5x slower speed, then planned
@@ -233,7 +231,7 @@ echo "[plan] total_steps=${TOTAL_STEPS} (pretrain=${PT_STEPS}, sft=${SFT_STEPS})
 echo "[plan] ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens this session"
 
 echo ""
-echo "[stage-A] Pretraining Ultra 1B (${PT_STEPS} steps)..."
+echo "[stage-A] Pretraining Pro (${PT_STEPS} steps)..."
 T0=$(date +%s)
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
     --data "${PT_DIR}" --max-steps "${PT_STEPS}" --warmup "${PT_WARM}" \
@@ -242,7 +240,7 @@ T0=$(date +%s)
 echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 
 echo ""
-echo "[stage-B] SFT Ultra 1B (${SFT_STEPS} steps)..."
+echo "[stage-B] SFT Pro (${SFT_STEPS} steps)..."
 T0=$(date +%s)
 if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
@@ -260,14 +258,14 @@ echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
-    echo "[smoke] Darija generation test (SELF-CONTAINED: no --tokenizer, the"
+    echo "[smoke] English generation test (SELF-CONTAINED: no --tokenizer, the"
     echo "  GGUF must carry its own tokenizer; any failure below is FATAL)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
-        --prompt "labas, kidayer? chno smitk?" --max-tokens 40 || \
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" --persona en \
+        --prompt "Hello, who are you? What can you help me with?" --max-tokens 60 || \
         { echo "[smoke] FAIL: self-contained GGUF generation failed"; exit 1; }
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
-        --prompt "شنو هي العاصمة ديال المغرب؟" --max-tokens 60 || \
-        { echo "[smoke] FAIL: self-contained GGUF generation failed (arabic)"; exit 1; }
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" --persona en \
+        --prompt "What is the capital of Morocco?" --max-tokens 60 || \
+        { echo "[smoke] FAIL: self-contained GGUF generation failed (factual)"; exit 1; }
     echo "[smoke] OK: GGUF runs standalone, no sidecar needed"
 fi
 

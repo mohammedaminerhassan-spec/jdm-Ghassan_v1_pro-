@@ -506,7 +506,7 @@ QualityVerdict quality_check_english(const std::string& text, const QualityConfi
         if ((s.size() == 1 || s.size() == 2) && !s.empty()) {
             v.accept = true; v.reason.clear(); return v;
         }
-        if (s.size() <= 4 && (s[0] >= 'A' && s[0] <= 'Z')) {
+        if (!s.empty() && s.size() <= 4 && (s[0] >= 'A' && s[0] <= 'Z')) {
             v.accept = true; v.reason.clear(); return v;
         }
         return v;
@@ -533,10 +533,25 @@ ToxicityResult check_toxicity(const std::string& text) {
         {"انتحار", "self-harm"}, {"اقتل نفسك", "self-harm"},
     };
 
+    // FIX P2 (false positives): comment promised word-boundary matching but
+    // code was substring find ("rape" fired inside "grape", "tbon" inside
+    // innocent tokens). Match on ASCII alnum boundaries now.
+    auto is_word_char = [](char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+    };
     ToxicityResult r;
     std::string low = to_lower_ascii(text);
+    // pad once so boundary checks never go out of range
+    const std::string hay = " " + low + " ";
     for (const auto& [term, cat] : terms) {
-        if (low.find(term) != std::string::npos) {
+        size_t pos = 0;
+        bool hit = false;
+        while ((pos = hay.find(term, pos)) != std::string::npos) {
+            char before = hay[pos - 1], after = hay[pos + std::strlen(term)];
+            if (!is_word_char(before) && !is_word_char(after)) { hit = true; break; }
+            ++pos;
+        }
+        if (hit) {
             ++r.hits;
             if (std::find(r.categories.begin(), r.categories.end(), cat) == r.categories.end())
                 r.categories.emplace_back(cat);

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# kaggle/train.sh — Ghassan v1 Flash one-session training (Kaggle GPU).
+# kaggle/train.sh — Ghassan v1 Pro English one-session training (Kaggle GPU).
 #
 # DEFAULT (one-shot): pilot-measure (100 steps) -> measures real tok/s ->
 #   computes max_steps to fit the time budget -> full run -> GGUF export ->
-#   Darija smoke test. Everything finishes inside ONE session.
+#   English smoke test. Everything finishes inside ONE session.
 #
 # Usage:
 #   bash kaggle/train.sh                                # one-shot (default)
@@ -20,7 +20,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_DIR}/build"
 
 MODE="oneshot"   # oneshot | pilot | full | dryrun
-CONFIG_FULL="${REPO_DIR}/configs/flash_moe.yaml"
+CONFIG_FULL="${REPO_DIR}/configs/en_pro.yaml"
 CONFIG_PILOT="${REPO_DIR}/kaggle/configs/pilot_moe.yaml"
 TIME_BUDGET_MIN=360
 EXPORT_GGUF=1
@@ -30,11 +30,11 @@ EXPORT_MARGIN_SEC=900   # time reserved for export + smoke test
 # FIX (set -u crash): GGUF_OUT was only set in the --pro branch, but the
 # default one-shot path uses --export "${GGUF_OUT}" unconditionally ->
 # "unbound variable" exit BEFORE training on Kaggle. Always define a default.
-GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-flash_${EXPORT_PROFILE}.gguf"
+GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pro)               CONFIG_FULL="${REPO_DIR}/configs/pro_moe.yaml"; GGUF_OUT="${REPO_DIR}/artifacts/ghassan_pro_${EXPORT_PROFILE}.gguf"; shift ;;
+        --pro)               CONFIG_FULL="${REPO_DIR}/configs/pro_v1.yaml"; GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro-1b_${EXPORT_PROFILE}.gguf"; shift ;;
         --pilot-only)        MODE="pilot";   shift ;;
         --full)              MODE="full";    shift ;;
         --dry-run)           MODE="dryrun";  shift ;;
@@ -45,19 +45,23 @@ while [[ $# -gt 0 ]]; do
         *) shift ;;
     esac
 done
-# Re-resolve default GGUF path after arg parsing (unless --pro overrode it):
-# keeps --export-profile q4_0 consistent without unbound-variable risk.
-if [[ "${CONFIG_FULL}" != *pro_moe.yaml ]]; then
-    GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-flash_${EXPORT_PROFILE}.gguf"
+# FIX P2 (--pro + --export-profile combo was frozen to fp16): the --pro branch
+# above baked EXPORT_PROFILE=fp16 into GGUF_OUT at parse time, and this block
+# skipped recompute for pro configs. Re-resolve unconditionally so
+# --pro --export-profile q4_0 really writes ...-1b_q4_0.gguf.
+if [[ "${CONFIG_FULL}" == *pro_v1.yaml ]]; then
+    GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro-1b_${EXPORT_PROFILE}.gguf"
+else
+    GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
 fi
 
 BINARY="${BUILD_DIR}/bin/gai_train"
 GEN_BIN="${BUILD_DIR}/bin/ghassan-ai"
 # PRO-HARDEN: fallback الصامت 32k->16k كان يضيع run ثم يفشل لاحقا. نفشل فورا.
-TOK="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
+TOK="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] 32k tokenizer missing: ${TOK} (legacy 16k fallback DISABLED)."
-    echo "[ERROR] Run: bash kaggle/setup.sh  (trains darija32k.gtok automatically)"
+    echo "[ERROR] Run: bash kaggle/setup.sh --with-parquet  (trains english32k.gtok automatically)"
     exit 1
 fi
 # PRO-HARDEN: persistence دائم لـKaggle (نفس train_1b.sh).
@@ -72,8 +76,8 @@ persist_output() {
 trap persist_output EXIT INT TERM
 
 echo "============================================================"
-echo "  Ghassan AI — Kaggle Training [${MODE}] (${CONFIG_FULL})"
-echo "  FLASH recipe (467M). NOT the 1B flagship — for that use train_1b.sh"
+echo "  Ghassan v1 Pro English — Kaggle Training [${MODE}] (${CONFIG_FULL})"
+echo "  Pro 480M recipe. For the 1B flagship use train_1b.sh (or --pro here)"
 echo "============================================================"
 
 # ---- sanity: binary
@@ -97,12 +101,12 @@ nvidia-smi --query-gpu=name,memory.free,memory.total \
 # ---- tokenizer + shards
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] Tokenizer not found: ${TOK}"
-    echo "        Run setup.sh first (it trains the tokenizer automatically)."
+    echo "        Run setup.sh --with-parquet first (it trains the tokenizer automatically)."
     exit 1
 fi
-TRAIN_SHARDS=$(find "${REPO_DIR}/artifacts/shards" -name "train_*.gbin" 2>/dev/null | wc -l)
+TRAIN_SHARDS=$(find "${REPO_DIR}/artifacts/shards_en" -name "train_*.gbin" 2>/dev/null | wc -l)
 if [[ "${TRAIN_SHARDS}" -eq 0 ]]; then
-    echo "[ERROR] No training shards. Run: bash kaggle/convert_data.sh"
+    echo "[ERROR] No training shards. Run: bash kaggle/build_english_data.sh"
     exit 1
 fi
 echo "[data] Training shards: ${TRAIN_SHARDS}"
@@ -121,7 +125,7 @@ fi
 # yaml helper: read a top-level training key (batch_size / seq_len / grad_accum)
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-mkdir -p "${REPO_DIR}/artifacts/checkpoints/pilot" "${REPO_DIR}/artifacts/checkpoints/flash"
+mkdir -p "${REPO_DIR}/artifacts/checkpoints/pilot" "${REPO_DIR}/artifacts/checkpoints/en_pro"
 
 run_train() {  # $1=config $2=device $3+=extra args...
     local cfg="$1"; local dev="$2"; shift 2
@@ -192,15 +196,15 @@ fi
 T_END=$(date +%s)
 echo "[train] Full run took $(( (T_END - T_START) / 60 ))m $(( (T_END - T_START) % 60 ))s"
 
-# ---------------------------------------------------------------- smoke test (Darija!)
+# ---------------------------------------------------------------- smoke test (English!)
 # SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
 # must carry its own tokenizer) and no swallowed failure — a broken export
 # must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
-    echo "[smoke] Testing the exported model (Darija prompt, no sidecar)..."
-    "${GEN_BIN}" generate --model "${GGUF_OUT}" \
-        --prompt "labas, kidayer? chno smitk?" --max-tokens 40 || \
+    echo "[smoke] Testing the exported model (English prompt, no sidecar)..."
+    "${GEN_BIN}" generate --model "${GGUF_OUT}" --persona en \
+        --prompt "Hello, who are you? What can you help me with?" --max-tokens 60 || \
         { echo "[smoke] FAIL: self-contained GGUF generation failed"; exit 1; }
     echo "[smoke] OK: GGUF runs standalone, no sidecar needed"
 fi

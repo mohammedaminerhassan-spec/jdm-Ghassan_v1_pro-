@@ -400,13 +400,16 @@ __global__ void k_rmsnorm_bwd_dx(const float* x, const float* w, const float* do
 }
 
 // dweight[i] = sum_r dout[r,i] * x[r,i] * rrms[r]  -> one block per column tile
+// FIX P2-5: accumulate in double (matches CPU f64 in ops_cpu.cpp:339) so
+// exploded activations do not drift vs the CPU reference; the store stays f32.
 __global__ void k_rmsnorm_bwd_dw(const float* x, const float* dout, const float* rrms,
                                  float* dweight, i64 rows, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= dim) return;
-    float acc = 0.0f;
-    for (i64 r = 0; r < rows; ++r) acc += dout[r * dim + i] * x[r * dim + i] * rrms[r];
-    dweight[i] += acc;
+    double acc = 0.0;
+    for (i64 r = 0; r < rows; ++r)
+        acc += (double)dout[r * dim + i] * (double)x[r * dim + i] * (double)rrms[r];
+    dweight[i] += (float)acc;
 }
 
 static int norm_block(int dim) {

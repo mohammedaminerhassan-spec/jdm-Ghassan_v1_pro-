@@ -1,4 +1,5 @@
 #include "dataset/synth.h"
+#include "dataset/json_reader.h"
 #include "dataset/synth_data.h"
 #include "dataset/dedup.h"
 #include "core/unicode.h"
@@ -340,10 +341,23 @@ bool SynthGenerator::generate(Conversation& out) {
         double p = rng.uniform();
 
         if (msa_conv && rng.uniform() < 0.5 && !synth_data::msa_exchanges().empty()) {
-            const auto& e = pick(synth_data::msa_exchanges(), rng);
-            out.messages.push_back({Role::User, e.user});
-            out.messages.push_back({Role::Assistant, e.assistant});
-            tid = tid * 31 + hash_string(e.user);
+            // FIX P2 (script leak): MSA rows pushed raw with no surface()/
+            // script gate, leaking Latin into Arabic convos. Route via the
+            // same retry gate as governor/reasoning; skip the turn if none pass.
+            const auto& pool = synth_data::msa_exchanges();
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 8; ++t) {
+                const auto& cand = pick(pool, rng);
+                if (script == Script::Latin || (!is_latin_only(cand.user) &&
+                                                !is_latin_only(cand.assistant))) {
+                    chosen = &cand;
+                    break;
+                }
+            }
+            if (!chosen) continue;  // never accept-and-leak; skip the turn
+            out.messages.push_back({Role::User, surface(chosen->user)});
+            out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
+            tid = tid * 31 + hash_string(chosen->user);
         } else if (p < cfg_.p_correction && produced > 0) {
             const auto& e = pick(synth_data::corrections(), rng);
             out.messages.push_back({Role::User, surface(e.user)});
@@ -362,15 +376,15 @@ bool SynthGenerator::generate(Conversation& out) {
             // conversation — that leak is what taught script-mixing before).
             const auto& pool = synth_data::governor_exchanges();
             const synth_data::Exchange* chosen = nullptr;
-            for (int t = 0; t < 4; ++t) {
+            for (int t = 0; t < 8; ++t) {
                 const auto& cand = pick(pool, rng);
                 if (script == Script::Latin || (!is_latin_only(cand.user) &&
                                                 !is_latin_only(cand.assistant))) {
                     chosen = &cand;
                     break;
                 }
-                chosen = &cand;  // fallback: accept on last try rather than stall
             }
+            if (!chosen) continue;  // FIX: skip instead of accept-and-leak
             out.messages.push_back({Role::User, surface(chosen->user)});
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
@@ -379,23 +393,34 @@ bool SynthGenerator::generate(Conversation& out) {
                    !synth_data::reasoning_exchanges().empty()) {
             const auto& pool = synth_data::reasoning_exchanges();
             const synth_data::Exchange* chosen = nullptr;
-            for (int t = 0; t < 4; ++t) {
+            for (int t = 0; t < 8; ++t) {
                 const auto& cand = pick(pool, rng);
                 if (script == Script::Latin || (!is_latin_only(cand.user) &&
                                                 !is_latin_only(cand.assistant))) {
                     chosen = &cand;
                     break;
                 }
-                chosen = &cand;
             }
+            if (!chosen) continue;  // FIX: skip instead of accept-and-leak
             out.messages.push_back({Role::User, surface(chosen->user)});
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
         } else if (rng.uniform() < 0.06) {
-            const auto& e = pick(synth_data::identity_questions(), rng);
-            out.messages.push_back({Role::User, e.user});
-            out.messages.push_back({Role::Assistant, e.assistant});
-            tid = tid * 31 + hash_string(e.user);
+            // FIX P2: identity rows also bypassed surface()/script gate.
+            const auto& pool = synth_data::identity_questions();
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 8; ++t) {
+                const auto& cand = pick(pool, rng);
+                if (script == Script::Latin || (!is_latin_only(cand.user) &&
+                                                !is_latin_only(cand.assistant))) {
+                    chosen = &cand;
+                    break;
+                }
+            }
+            if (!chosen) continue;
+            out.messages.push_back({Role::User, surface(chosen->user)});
+            out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
+            tid = tid * 31 + hash_string(chosen->user);
         } else if (produced > 0 && rng.uniform() < cfg_.p_followup && !D.followups.empty()) {
             const auto& e = pick(D.followups, rng);
             out.messages.push_back({Role::User, surface(e.user)});
@@ -492,11 +517,17 @@ bool SynthGenerator::generate(Conversation& out) {
 }
 
 std::vector<Conversation> SynthGenerator::generate_many(int n) {
+    GAI_CHECK(n >= 0, "synth conversation count must be >= 0");
+    GAI_CHECK(cfg_.max_attempts_multiplier > 0, "synth attempts multiplier must be > 0");
+    GAI_CHECK(cfg_.min_turns > 0 && cfg_.max_turns >= cfg_.min_turns &&
+                  cfg_.max_turns <= 1024,
+              "synth turn range is invalid");
     std::vector<Conversation> out;
     out.reserve(static_cast<size_t>(n));
-    int attempts = 0;
-    const int max_attempts = n * cfg_.max_attempts_multiplier + 5000;
-    while (static_cast<int>(out.size()) < n && attempts < max_attempts) {
+    i64 attempts = 0;
+    const i64 max_attempts =
+        static_cast<i64>(n) * static_cast<i64>(cfg_.max_attempts_multiplier) + 5000;
+    while (static_cast<i64>(out.size()) < n && attempts < max_attempts) {
         ++attempts;
         Conversation c;
         if (generate(c)) out.push_back(std::move(c));
@@ -540,10 +571,24 @@ static std::string json_unescape(const std::string& s) {
             case '"': o.push_back('"'); break;
             case '\\': o.push_back('\\'); break;
             case 'u': {
-                if (i + 4 < s.size()) {
-                    u32 cp = static_cast<u32>(std::stoul(s.substr(i + 1, 4), nullptr, 16));
+                auto is_hex = [](char ch) {
+                    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                           (ch >= 'A' && ch <= 'F');
+                };
+                if (i + 4 < s.size() && is_hex(s[i + 1]) && is_hex(s[i + 2]) &&
+                    is_hex(s[i + 3]) && is_hex(s[i + 4])) {
+                    u32 cp = 0;
+                    for (int k = 1; k <= 4; ++k) {
+                        char ch = s[i + static_cast<size_t>(k)];
+                        cp <<= 4;
+                        if (ch >= '0' && ch <= '9') cp |= static_cast<u32>(ch - '0');
+                        else if (ch >= 'a' && ch <= 'f') cp |= static_cast<u32>(ch - 'a' + 10);
+                        else cp |= static_cast<u32>(ch - 'A' + 10);
+                    }
                     utf8_encode(cp, o);
                     i += 4;
+                } else {
+                    o.push_back(n);
                 }
                 break;
             }
@@ -576,11 +621,16 @@ std::vector<Conversation> read_conversations_jsonl(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return out;
 
+    JsonReaderOptions jopts;
+    jopts.verbose = false;
+    jopts.max_value_bytes = 16u << 20u;
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty()) continue;
+        JsonDoc doc;
+        if (!doc_from_json_text(line, doc, jopts) || !doc.is_chat || doc.messages.empty()) continue;
         Conversation c;
-        // minimal targeted parser for the exact shape we write
+        c.messages = std::move(doc.messages);
         size_t dp = line.find("\"domain\":\"");
         if (dp != std::string::npos) {
             size_t b = dp + 10;
@@ -588,24 +638,7 @@ std::vector<Conversation> read_conversations_jsonl(const std::string& path) {
             while (e < line.size() && !(line[e] == '"' && line[e - 1] != '\\')) ++e;
             c.domain = json_unescape(line.substr(b, e - b));
         }
-        size_t p = 0;
-        while ((p = line.find("{\"role\":\"", p)) != std::string::npos) {
-            size_t rb = p + 9;
-            size_t re = line.find('"', rb);
-            if (re == std::string::npos) break;
-            std::string role = line.substr(rb, re - rb);
-            size_t cp = line.find("\"content\":\"", re);
-            if (cp == std::string::npos) break;
-            size_t cb = cp + 11;
-            size_t ce = cb;
-            while (ce < line.size() && !(line[ce] == '"' && line[ce - 1] != '\\')) ++ce;
-            Message m;
-            m.role = role == "system" ? Role::System : role == "user" ? Role::User : Role::Assistant;
-            m.content = json_unescape(line.substr(cb, ce - cb));
-            c.messages.push_back(std::move(m));
-            p = ce;
-        }
-        if (!c.messages.empty()) out.push_back(std::move(c));
+        out.push_back(std::move(c));
     }
     return out;
 }

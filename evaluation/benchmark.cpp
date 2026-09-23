@@ -1,5 +1,6 @@
 // benchmark.cpp — implementation of the Ghassan AI evaluation benchmark.
 #include "evaluation/benchmark.h"
+#include "dataset/english_logic.h"
 #include "inference/generator.h"
 #include "dataset/langid.h"
 #include "dataset/cleaner.h"
@@ -557,6 +558,29 @@ static std::string json_get_string(const std::string& line, const std::string& k
     return decoded;
 }
 
+static std::string json_unescape_basic(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '\\' || i + 1 >= value.size()) {
+            out.push_back(value[i]);
+            continue;
+        }
+        switch (value[++i]) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case '/': out.push_back('/'); break;
+            default: out.push_back(value[i]); break;
+        }
+    }
+    return out;
+}
+
 static std::vector<std::string> json_get_string_array(const std::string& line, const std::string& key) {
     std::vector<std::string> result;
     std::string search = "\"" + key + "\":[";
@@ -627,7 +651,7 @@ static std::vector<Message> json_get_context(const std::string& line) {
             ++ce;
         }
         if (ce >= ctx_str.size()) break;
-        std::string content = ctx_str.substr(cb, ce - cb);
+        std::string content = json_unescape_basic(ctx_str.substr(cb, ce - cb));
         Message m;
         m.role = role == "system" ? Role::System : role == "user" ? Role::User : Role::Assistant;
         m.content = content;
@@ -728,6 +752,12 @@ static std::string json_escape(const std::string& s) {
     return o;
 }
 
+static const char* role_name(Role r) {
+    if (r == Role::System) return "system";
+    if (r == Role::Assistant) return "assistant";
+    return "user";
+}
+
 void Benchmark::write_suite(const std::string& path, const std::vector<EvalItem>& items) {
     std::ofstream f(path);
     if (!f.good()) {
@@ -752,6 +782,12 @@ void Benchmark::write_suite(const std::string& path, const std::vector<EvalItem>
         for (size_t i = 0; i < it.forbid.size(); ++i) {
             if (i) f << ",";
             f << "\"" << json_escape(it.forbid[i]) << "\"";
+        }
+        f << "],\"note\":\"" << json_escape(it.note) << "\",\"context\":[";
+        for (size_t i = 0; i < it.context.size(); ++i) {
+            if (i) f << ",";
+            f << "{\"role\":\"" << role_name(it.context[i].role)
+              << "\",\"content\":\"" << json_escape(it.context[i].content) << "\"}";
         }
         f << "]}\n";
     }
@@ -837,14 +873,32 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
         r.toxic = tox.toxic;
     }
 
+    // English answer discipline (question/instruction/coding/multiple-choice).
+    if (item.expect_lang == "en") {
+        r.discipline_ok = english_logic::check_english_reply(item.prompt, response).disciplined;
+    }
+
+    // FIX P2 (score ignored its own core metrics): lang/discipline were
+    // computed but excluded, so a wrong-language disciplined-fail could still
+    // score 1.0. New weights keep backward-compat scale (max 1.0) while
+    // making discipline_rate/lang move the reported score.
     // Score
     double s = 0.0;
-    if (r.matched)       s += 0.50;
-    if (!r.forbidden_hit) s += 0.20;
+    if (r.matched)       s += 0.40;
+    if (!r.forbidden_hit) s += 0.15;
     if (r.length_ok)     s += 0.10;
     if (!r.robotic)      s += 0.10;
     if (!r.toxic)        s += 0.10;
+    if (r.lang_ok)       s += 0.10;
+    if (item.expect_lang == "en") {
+        if (r.discipline_ok) s += 0.05;
+    } else {
+        s += 0.05;  // non-EN items have no discipline gate; keep scale at 1.0
+    }
     r.score = s;
+    // FIX P2: tokens_per_sec was declared but never filled. Estimate from
+    // word count (words*1.3 ≈ tokens) so bench tooling stops showing 0.
+    r.tokens_per_sec = r.seconds > 0.0 ? (double)r.words * 1.3 / r.seconds : 0.0;
 
     return r;
 }
@@ -889,22 +943,25 @@ BenchmarkReport Benchmark::run() {
         if (r.toxic)         cs.toxic++;
         if (!r.lang_ok)      cs.lang_fail++;
         if (!r.length_ok)    cs.length_fail++;
+        if (!r.discipline_ok) cs.discipline_fail++;
 
         rpt.results.push_back(r);
     }
 
     // Aggregate
     if (!rpt.results.empty()) {
-        double sum_score = 0, sum_d1 = 0, sum_d2 = 0, sum_dar = 0, sum_words = 0;
-        int n_robotic = 0, n_toxic = 0, n_repeat = 0;
+        double sum_score = 0, sum_d1 = 0, sum_d2 = 0, sum_dar = 0, sum_words = 0, sum_tps = 0;
+        int n_robotic = 0, n_toxic = 0, n_repeat = 0, n_disciplined = 0;
         for (auto& r : rpt.results) {
             sum_score  += r.score;
             sum_d1     += r.distinct1;
             sum_d2     += r.distinct2;
             sum_dar    += r.darija_ratio;
             sum_words  += r.words;
+            sum_tps    += r.tokens_per_sec;
             if (r.robotic)          n_robotic++;
             if (r.toxic)            n_toxic++;
+            if (r.discipline_ok)    n_disciplined++;
             if (r.max_ngram_repeat > 5) n_repeat++;
         }
         double n = static_cast<double>(rpt.results.size());
@@ -913,8 +970,10 @@ BenchmarkReport Benchmark::run() {
         rpt.avg_distinct2   = sum_d2     / n;
         rpt.avg_darija_ratio = sum_dar   / n;
         rpt.avg_words       = sum_words  / n;
+        rpt.tokens_per_sec  = sum_tps    / n;
         rpt.robotic_rate    = static_cast<double>(n_robotic) / n;
         rpt.toxicity_rate   = static_cast<double>(n_toxic)   / n;
+        rpt.discipline_rate = static_cast<double>(n_disciplined) / n;
         rpt.repetition_rate = static_cast<double>(n_repeat)  / n;
     }
 
@@ -928,6 +987,7 @@ std::string BenchmarkReport::to_string() const {
     ss << strfmt("  overall score: %.3f\n", overall);
     ss << strfmt("  robotic rate : %.1f%%\n", robotic_rate * 100.0);
     ss << strfmt("  toxicity rate: %.1f%%\n", toxicity_rate * 100.0);
+    ss << strfmt("  discipline   : %.1f%%\n", discipline_rate * 100.0);
     ss << strfmt("  repetition   : %.1f%%\n", repetition_rate * 100.0);
     ss << strfmt("  avg distinct1: %.3f\n", avg_distinct1);
     ss << strfmt("  avg distinct2: %.3f\n", avg_distinct2);
@@ -947,12 +1007,22 @@ void BenchmarkReport::write_jsonl(const std::string& path) const {
         return;
     }
     for (auto& r : results) {
-        f << "{\"id\":\"" << r.id << "\","
+        f << "{\"id\":\"" << json_escape(r.id) << "\","
           << "\"category\":\"" << category_name(r.category) << "\","
+          << "\"prompt\":\"" << json_escape(r.prompt) << "\","
+          << "\"response\":\"" << json_escape(r.response) << "\","
           << "\"score\":" << r.score << ","
           << "\"matched\":" << (r.matched ? "true" : "false") << ","
+          << "\"forbidden_hit\":" << (r.forbidden_hit ? "true" : "false") << ","
+          << "\"lang_ok\":" << (r.lang_ok ? "true" : "false") << ","
+          << "\"length_ok\":" << (r.length_ok ? "true" : "false") << ","
           << "\"robotic\":" << (r.robotic ? "true" : "false") << ","
+          << "\"toxic\":" << (r.toxic ? "true" : "false") << ","
+          << "\"discipline_ok\":" << (r.discipline_ok ? "true" : "false") << ","
           << "\"words\":" << r.words << ","
+          << "\"distinct1\":" << r.distinct1 << ","
+          << "\"distinct2\":" << r.distinct2 << ","
+          << "\"max_ngram_repeat\":" << r.max_ngram_repeat << ","
           << "\"seconds\":" << r.seconds << "}\n";
     }
 }

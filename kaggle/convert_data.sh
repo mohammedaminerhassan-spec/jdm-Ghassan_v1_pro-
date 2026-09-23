@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # kaggle/convert_data.sh
 # ----------------------------------------------------------------
-# Converts the JSON/JSONL datasets into .gbin training shards
-# using the built C++ data_pipeline tool.
-# Run this AFTER setup.sh has completed successfully.
+# Legacy JSON/JSONL conversion guard. The project is Parquet-only;
+# use kaggle/build_english_data.sh for the shipped English lake.
 #
 # Usage:
 #   bash kaggle/convert_data.sh [--json-dir <dir>] [--tokenizer <path>]
@@ -27,7 +26,7 @@ if [[ ! -d "${JSON_DIR}" && -d "/kaggle/input" ]]; then
         fi
     done
 fi
-TOKENIZER="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
+TOKENIZER="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
 # PRO-HARDEN: لا fallback صامت إلى 16k (يضيع embeddings). فشل صريح.
 if [[ -n "${TOKENIZER_OVERRIDE:-}" ]]; then TOKENIZER="${TOKENIZER_OVERRIDE}"; fi
 if [[ ! -f "${TOKENIZER}" ]]; then
@@ -88,7 +87,7 @@ if [[ "${EXPECT_VOCAB}" != "0" ]]; then
     if [[ "${TOK_VOCAB}" != "${EXPECT_VOCAB}" ]]; then
         echo "[ERROR] tokenizer ${TOKENIZER} has vocab_size=${TOK_VOCAB:-unreadable}, need ${EXPECT_VOCAB}."
         echo "[ERROR] A legacy 16k file here would silently waste half the embeddings."
-        echo "[ERROR] Run setup.sh (trains darija32k.gtok) or pass --expect-vocab 0 to override."
+        echo "[ERROR] Run setup.sh (trains english32k.gtok) or pass --expect-vocab 0 to override."
         exit 1
     fi
     echo "[tok] ok: ${TOKENIZER} (vocab ${TOK_VOCAB})"
@@ -143,50 +142,7 @@ if [[ "${EXISTING}" -gt 0 ]]; then
 fi
 
 # ---- run conversion
-echo "[data] Starting JSON → .gbin conversion..."
-echo "[data] Chat/instruction docs get SFT masks (assistant-only loss)."
-echo ""
-
-START_TIME=$(date +%s)
-
-"${BINARY}" json \
-    --dir "${JSON_DIR}" \
-    --tokenizer "${TOKENIZER}" --expect-vocab "${EXPECT_VOCAB}" \
-    --out "${OUT_DIR}" \
-    --val-ratio "${VAL_RATIO}" \
-    --shard-tokens "${SHARD_TOKENS}" \
-    --seq-len "${SEQ_LEN}"
-
-END_TIME=$(date +%s)
-ELAPSED=$(( END_TIME - START_TIME ))
-ELAPSED_MIN=$(( ELAPSED / 60 ))
-ELAPSED_SEC=$(( ELAPSED % 60 ))
-
-echo ""
-echo "[data] Conversion completed in ${ELAPSED_MIN}m ${ELAPSED_SEC}s"
-echo ""
-
-# ---- verify output
-TRAIN_SHARDS=$(find "${OUT_DIR}" -name "train_*.gbin" 2>/dev/null | wc -l)
-VAL_SHARDS=$(find "${OUT_DIR}" -name "val_*.gbin" 2>/dev/null | wc -l)
-echo "[data] Output shards:"
-echo "       train: ${TRAIN_SHARDS} shard(s)"
-echo "       val  : ${VAL_SHARDS} shard(s)"
-if [[ "${TRAIN_SHARDS}" -eq 0 ]]; then
-    echo "[ERROR] No training shards produced. Check the log above."
-    exit 1
-fi
-
-# ---- inspect shards with the built tool
-echo ""
-echo "[data] Inspecting produced shards..."
-"${BUILD_DIR}/bin/data_pipeline" inspect \
-    --shards "${OUT_DIR}" \
-    --tokenizer "${TOKENIZER}" || true
-
-echo ""
-echo "============================================================"
-echo "  Conversion DONE"
-echo "  Shards are in: ${OUT_DIR}"
-echo "  Next step: bash kaggle/train.sh"
-echo "============================================================"
+echo "[ERROR] The JSON training route was removed; this repository is Parquet-only."
+echo "[ERROR] Use EN_PARQUET_DIR=<path> bash kaggle/build_english_data.sh"
+echo "[ERROR] or convert the shipped lake with data_pipeline parquet."
+exit 1

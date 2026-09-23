@@ -253,6 +253,12 @@ __global__ void k_route_bias(const float* logits, const float* bias,
     }
 }
 
+// FIX P1-4 (MoE memory storm): old kernels were slot-serial (one thread
+// loops rowlen=768..1280 with scalar loads/stores) and k_scatter_add issued
+// N*K*d atomicAdds. New versions vectorize via float4 when rowlen % 4 == 0
+// (all production shapes: 768/1024/1280) and keep an exact scalar tail.
+// Atomic count is unchanged semantically (K=2 shares a dst row) but each
+// transaction is now coalesced 128-bit where possible.
 // dst[s] = src[t] for slot s = t*K+k (token-space gather)
 __global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
                              i64 nslots, int rowlen, int K) {
@@ -261,7 +267,14 @@ __global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
     i32 t = slots[s] / K;
     const float* r = src + (i64)t * rowlen;
     float* o = dst + s * rowlen;
-    for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    int j = 0;
+    if ((rowlen & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (; j < rowlen / 4; ++j) o4[j] = r4[j];
+    } else {
+        for (; j < rowlen; ++j) o[j] = r[j];
+    }
 }
 
 // dst[s] = src[slot]  (slot-space gather)
@@ -271,7 +284,13 @@ __global__ void k_gather(const float* src, const i32* slots, float* dst,
     if (s >= nslots) return;
     const float* r = src + (i64)slots[s] * rowlen;
     float* o = dst + s * rowlen;
-    for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    if ((rowlen & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
+    } else {
+        for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    }
 }
 
 // dst[slot] = src[s]  (slot-space scatter)
@@ -281,7 +300,13 @@ __global__ void k_scatter_copy(const float* src, const i32* slots, float* dst,
     if (s >= nslots) return;
     const float* r = src + s * rowlen;
     float* o = dst + (i64)slots[s] * rowlen;
-    for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    if ((rowlen & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
+    } else {
+        for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    }
 }
 
 // dst[t] += w[t,k] * src[s]  (atomic: slots of one token share dst rows)
@@ -295,7 +320,19 @@ __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
     float wv = w ? w[(i64)t * K + k] : 1.0f;
     float* o = dst + (i64)t * d;
     const float* r = src + s * d;
-    for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
+    // vectorized load, scalar atomic store (float4 atomics do not exist)
+    if ((d & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        for (int j = 0; j < d / 4; ++j) {
+            float4 v = r4[j];
+            atomicAdd(&o[j * 4 + 0], wv * v.x);
+            atomicAdd(&o[j * 4 + 1], wv * v.y);
+            atomicAdd(&o[j * 4 + 2], wv * v.z);
+            atomicAdd(&o[j * 4 + 3], wv * v.w);
+        }
+    } else {
+        for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
+    }
 }
 
 // dst[s] = src[t] * w[t,k]
@@ -309,7 +346,17 @@ __global__ void k_scale_rows(const float* src, const float* w, const i32* slots,
     float wv = w[(i64)t * K + k];
     const float* r = src + (i64)t * d;
     float* o = dst + s * d;
-    for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
+    if ((d & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (int j = 0; j < d / 4; ++j) {
+            float4 v = r4[j];
+            v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
+            o4[j] = v;
+        }
+    } else {
+        for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
+    }
 }
 
 __device__ __forceinline__ float silu_f(float v) {

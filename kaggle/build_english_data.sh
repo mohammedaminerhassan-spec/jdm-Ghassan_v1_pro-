@@ -43,10 +43,15 @@ if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
     done
 fi
 # Local fallbacks (in order):
-#   1. ./english_parquet (output of tools/convert_hermes_to_parquet.py, 522k chat + 478k inst)
-#   2. kaggle_upload/english_parquet (vendored inside the project zip)
+#   1. dataset/english_parquet (vendored in THIS checkout, 522k chat + 478k inst)
+#   2. ./english_parquet (prebuilt lake)
+#   3. kaggle_upload/english_parquet (vendored inside the project zip)
+# FIX P2: the script never searched dataset/english_parquet although the lake
+# ships there in this checkout, forcing a manual EN_PARQUET_DIR every time.
 if [[ -z "${EN_DIR}" || ! -d "${EN_DIR}" ]]; then
-    if [[ -n "$(find "${REPO_DIR}/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
+    if [[ -n "$(find "${REPO_DIR}/dataset/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
+        EN_DIR="${REPO_DIR}/dataset/english_parquet"
+    elif [[ -n "$(find "${REPO_DIR}/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
         EN_DIR="${REPO_DIR}/english_parquet"
     elif [[ -n "$(find "${REPO_DIR}/kaggle_upload/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
         EN_DIR="${REPO_DIR}/kaggle_upload/english_parquet"

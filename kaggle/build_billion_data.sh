@@ -35,6 +35,17 @@
 #     NEVER keep corpus txt + jsonl + shards + 2x ckpt at once on Kaggle.
 set -euo pipefail
 
+# RETIRED Darija route: its configs (ultra_1b/sft_ultra_1b) were removed
+# (English-only pack). Without this guard the script would burn hours of
+# synth + sharding and only die at the final mix check.
+# English flow: EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh
+# Override (unsupported): LEGACY_DARIJA=1 bash kaggle/build_billion_data.sh
+if [[ "${LEGACY_DARIJA:-0}" != "1" ]]; then
+    echo "[ERROR] build_billion_data.sh is the retired Darija data route (configs removed)."
+    echo "[ERROR] English flow: EN_PARQUET_DIR=<lake> bash kaggle/build_english_data.sh"
+    exit 1
+fi
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${REPO_DIR}/build/bin/data_pipeline"
 TOK="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
