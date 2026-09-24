@@ -39,7 +39,7 @@ function(gai_apply_cxx_flags target)
     if(MSVC)
         # /MP = parallel compilation inside one project (fastest local builds).
         # /WX = zero-warning policy: any warning fails the build (no silent rot).
-        target_compile_options(${target} PRIVATE /W3 /WX /permissive- /Zc:preprocessor /bigobj /utf-8 /MP)
+        target_compile_options(${target} PRIVATE /W3 /WX /wd5105 /permissive- /Zc:preprocessor /bigobj /utf-8 /MP)
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2>)
     else()
         # -Werror = zero-warning policy on GCC/Clang (Kaggle). Unused-param kept

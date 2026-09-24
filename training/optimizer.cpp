@@ -227,7 +227,7 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     ops::copy(dev, O, G, rc);
     // Normalize: NS converges from X0 = G / ||G||_F (scale-invariant update).
     const double frob = std::sqrt(ops::global_sq_norm(dev, O, rc));
-    if (!std::isfinite(frob) || frob == 0.0) return; // degenerate: keep copy
+    if (!std::isfinite(frob) || frob < 1e-12) return; // degenerate: keep copy
     ops::scale_inplace(dev, O, static_cast<float>(1.0 / frob), rc);
 
     for (int it = 0; it < cfg_.ns_steps; ++it) {

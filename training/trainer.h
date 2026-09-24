@@ -103,12 +103,13 @@ struct TrainerConfig {
     // Per-rank micro throughput (one process). Global throughput multiplies by
     // world_size — DeepSeek budgeting rule: scheduler/steps must use GLOBAL.
     static i64 checked_schedule_mul(i64 a, i64 b, const char* what) {
-        const __int128 p = static_cast<__int128>(a) * static_cast<__int128>(b);
-        if (p < static_cast<__int128>(std::numeric_limits<i64>::min()) ||
-            p > static_cast<__int128>(std::numeric_limits<i64>::max())) {
+        if (a > 0 && b > 0 && a > std::numeric_limits<i64>::max() / b) {
             GAI_FAIL(std::string("training schedule overflow in ") + what);
         }
-        return static_cast<i64>(p);
+        if (a < 0 || b < 0) {
+            GAI_FAIL(std::string("training schedule negative value in ") + what);
+        }
+        return a * b;
     }
     i64 tokens_per_step() const {
         return checked_schedule_mul(

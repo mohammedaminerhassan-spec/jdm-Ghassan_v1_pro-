@@ -1086,6 +1086,9 @@ void Trainer::run_pretrain() {
             if (warned_empty++ < 3)
                 log_warn("[train] all-masked step (ntok=0): optimizer skipped (aux-only grads)");
             gnorm = 0.0;
+            for (Parameter* p : model_.parameters()) {
+                if (p->g.defined()) p->g.zero_();
+            }
         }
         scaler_update(gnorm);
 
@@ -1212,6 +1215,9 @@ void Trainer::run_sft() {
             if (warned_empty_sft++ < 3)
                 log_warn("[sft] all-masked step (ntok=0): optimizer skipped (aux-only grads)");
             gnorm = 0.0;
+            for (Parameter* p : model_.parameters()) {
+                if (p->g.defined()) p->g.zero_();
+            }
         }
         scaler_update(gnorm);
 
@@ -1421,10 +1427,11 @@ i64 Trainer::sync_ntok_sum(i64 local) {
     dist_->all_reduce_sum(static_cast<float*>(dist_ntok_.data_ptr()), 1);
     float out = 0.0f;
     device_copy(&out, Device::CPU, dist_ntok_.data_ptr(), Device::CUDA, sizeof(float));
-    return static_cast<i64>(std::llround(out));
+    i64 res = static_cast<i64>(std::llround(out));
+    return res > 0 ? res : 0;
 #else
     (void)dist_;
-    return local;
+    return local > 0 ? local : 0;
 #endif
 }
 

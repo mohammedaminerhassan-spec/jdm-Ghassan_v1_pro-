@@ -1018,7 +1018,13 @@ std::string llama_tensor_name(const std::string& internal) {
 const GGUFTensorInfo* GGUFReader::find_weight(const std::string& internal) const {
     if (const GGUFTensorInfo* ti = find_tensor(internal)) return ti;
     const std::string alt = llama_tensor_name(internal);
-    if (!alt.empty()) return find_tensor(alt);
+    if (!alt.empty()) {
+        if (const GGUFTensorInfo* ti = find_tensor(alt)) return ti;
+    }
+    const std::string alt_moe = llama_moe_tensor_name(internal);
+    if (!alt_moe.empty()) {
+        if (const GGUFTensorInfo* ti = find_tensor(alt_moe)) return ti;
+    }
     return nullptr;
 }
 
