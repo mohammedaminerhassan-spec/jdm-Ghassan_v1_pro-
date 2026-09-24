@@ -6,9 +6,16 @@
 #include "training/dataloader.h"
 #include "training/checkpoint.h"
 #include "training/distributed.h"
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace gai {
 
@@ -51,6 +58,7 @@ struct TrainerConfig {
     // precision
     DType param_dtype   = DType::F32;   // F32, BF16, F16 (label; compute is fp32/ff16-GEMM)
     bool  gemm_fp16     = true;         // CUDA: large GEMMs on FP16 tensor cores
+    bool  fp16_weight_cache = false;
     double loss_scale_init   = 65536.0; // dynamic loss-scaler start (0 disables scaling)
     int    loss_scale_window = 2000;    // clean steps before doubling the scale
     // T4 memory saver: gradient/activation checkpointing via micro-batch
@@ -67,6 +75,10 @@ struct TrainerConfig {
     // 4 shrinks them to [N/4,V] each (~393MB saved at B=2,T=1024,V=32k) with
     // mathematically identical grads (sums, not means, per block). 1..32.
     int   ce_chunks = 4;
+    // Phase 1A — Segment-masked sequence packing: pack multiple short docs
+    // end-to-end into one [B,T] row with a block-causal mask so no PAD tokens
+    // are wasted. Recovers 20-40% throughput vs the one-doc-per-row baseline.
+    bool  pack_sequences = false;
     // distributed training
     bool  ddp = false;         // enable multi-GPU DDP (auto-detected if >1 GPU)
     // io / cadence
@@ -136,6 +148,7 @@ struct TrainerConfig {
 class Trainer {
 public:
     Trainer(Model& model, TrainerConfig cfg);
+    ~Trainer();
 
     void run();
     double evaluate(i64 max_batches);
@@ -175,12 +188,14 @@ private:
 
     Tensor dev_ids_;
     Tensor dev_targets_;
+    Tensor dev_segments_;
     Parameter* frozen_emb_ = nullptr;   // set when freeze_embeddings (grads re-zeroed)
 
     // activation-checkpointing scratch (allocated only when enabled and B>1)
     Activations ckpt_act_;
     Tensor ckpt_ids_;
     Tensor ckpt_targets_;
+    Tensor ckpt_segments_;
     bool use_ckpt_ = false;
     // Persistent CPU staging for ckpt batch-slicing (grows monotonically,
     // never per-segment malloc). Old code allocated 2 vectors per segment per
@@ -206,6 +221,46 @@ private:
     // Persistent fused DDP staging (grows monotonically, never per-step alloc).
     Tensor dist_fused_;
     Tensor dist_ntok_; // persistent 1-float device buffer for ntok sync (no per-step alloc)
+
+    // ---- Phase 1D: background checkpoint writer ----
+    // Serialization runs on a dedicated thread so the training loop never
+    // stalls on disk I/O. The mutex+cv protect pending_save_fn_ (the closure
+    // that captures all state by value at the call site). save_async() returns
+    // immediately; wait_for_save() drains before run() exits or a new save
+    // supersedes the queued one (we keep only the latest pending write).
+    std::thread            ckpt_writer_thread_;
+    std::mutex             ckpt_mutex_;
+    std::condition_variable ckpt_cv_;
+    std::deque<std::function<void()>> pending_saves_;
+    bool                   ckpt_stop_ = false;
+    bool                   ckpt_busy_ = false;
+    bool                   ckpt_failed_ = false;
+    std::string            ckpt_error_;
+    std::shared_ptr<CheckpointSnapshot> snapshot_cache_;
+    i64                    snapshot_step_ = -1;
+    void start_ckpt_writer();
+    void stop_ckpt_writer();
+    void save_async(std::function<void()> fn);  // enqueue; drops superseded writes
+    void wait_for_save();                       // block until queue is empty
+
+    // ---- Phase 1C: prefetch batch ----
+    // A background thread calls train_loader_.next() into prefetch_batch_
+    // while the GPU is computing the current step. next_batch() swaps the
+    // ready buffer in and starts the next prefetch immediately.
+    std::thread             prefetch_thread_;
+    std::mutex              prefetch_mutex_;
+    std::condition_variable prefetch_cv_;
+    Batch                   prefetch_batch_;
+    bool                    prefetch_ready_ = false;
+    bool                    prefetch_stop_  = false;
+    bool                    prefetch_pause_ = false;
+    bool                    prefetch_in_io_ = false;
+    bool                    prefetch_running_ = false;
+    void start_prefetch();
+    void stop_prefetch();
+    void quiesce_prefetch();
+    void resume_prefetch();
+    bool next_train_batch(Batch& out);
 };
 
 } // namespace gai

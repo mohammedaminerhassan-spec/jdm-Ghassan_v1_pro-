@@ -12,6 +12,8 @@ namespace gai {
 constexpr int OPT_STATE_LEGACY = 0;
 constexpr int OPT_STATE_CURRENT = 1;
 
+struct OptimizerStateSnapshot;
+
 struct AdamWConfig {
     float lr           = 3e-4f;
     float beta1        = 0.9f;
@@ -40,6 +42,7 @@ public:
     void save_state(std::ostream& os) const;
     bool load_state(std::istream& is, int state_version);
     size_t state_bytes() const;
+    OptimizerStateSnapshot snapshot_state() const;
 
     const AdamWConfig& config() const { return cfg_; }
     void set_config(const AdamWConfig& c) { cfg_ = c; }
@@ -76,6 +79,7 @@ public:
     void save_state(std::ostream& os) const;
     bool load_state(std::istream& is, int state_version);
     size_t state_bytes() const;
+    OptimizerStateSnapshot snapshot_state() const;
 
     const LionConfig& config() const { return cfg_; }
     void set_config(const LionConfig& c) { cfg_ = c; }
@@ -103,6 +107,18 @@ struct MuonConfig {
     int   ns_steps     = 5;      // Newton-Schulz iterations (1..10)
 };
 
+enum class OptimizerSnapshotKind : u8 { None = 0, AdamW = 1, Lion = 2, Muon = 3 };
+
+struct OptimizerStateSnapshot {
+    OptimizerSnapshotKind kind = OptimizerSnapshotKind::None;
+    i64 step = 0;
+    AdamWConfig adamw{};
+    LionConfig lion{};
+    MuonConfig muon{};
+    std::vector<Tensor> first;
+    std::vector<Tensor> second;
+};
+
 // Muon (orthogonalized momentum, cf. Moonshot Kimi K2): 2D matmul weights
 // (decay==true) update along Newton-Schulz-orthogonalized momentum — the
 // largest single-optimizer speedup reported for small models (1.5-2x vs
@@ -125,6 +141,7 @@ public:
     void save_state(std::ostream& os) const;
     bool load_state(std::istream& is, int state_version);
     size_t state_bytes() const;
+    OptimizerStateSnapshot snapshot_state() const;
 
     const MuonConfig& config() const { return cfg_; }
     void set_config(const MuonConfig& c) { cfg_ = c; }

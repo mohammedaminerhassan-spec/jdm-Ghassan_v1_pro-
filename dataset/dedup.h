@@ -54,6 +54,7 @@ private:
     // overwrites/ignored -> order-dependent false negatives). Keep ALL doc ids.
     std::vector<std::unordered_map<u64, std::vector<u32>>> band_tables_;
     std::vector<std::vector<u64>> signatures_;
+    std::vector<bool> signature_blocked_;
     std::unordered_set<u64> blocklist_;
     std::vector<u64> hash_seeds_;
     u64 seen_ = 0, exact_dups_ = 0, near_dups_ = 0, blocked_ = 0;

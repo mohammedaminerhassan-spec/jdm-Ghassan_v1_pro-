@@ -61,6 +61,15 @@ std::vector<u64> Deduplicator::minhash(const std::string& canonical) const {
     return sig;
 }
 
+static u64 band_hash(const std::vector<u64>& sig, int band, int rows) {
+    u64 hash = 1469598103934665603ull;
+    for (int row = 0; row < rows; ++row) {
+        hash ^= sig[static_cast<size_t>(band * rows + row)];
+        hash *= 1099511628211ull;
+    }
+    return splitmix64(hash ^ static_cast<u64>(band));
+}
+
 bool Deduplicator::add(const std::string& text) {
     ++seen_;
     std::string canon = Normalizer::canonical(text);
@@ -104,12 +113,20 @@ bool Deduplicator::add(const std::string& text) {
                 for (int i = 0; i < cfg_.num_hashes; ++i)
                     if (other[static_cast<size_t>(i)] == sig[static_cast<size_t>(i)]) ++match;
                 double est = static_cast<double>(match) / static_cast<double>(cfg_.num_hashes);
-                if (est >= cfg_.jaccard_threshold) { ++near_dups_; return false; }
+                if (est >= cfg_.jaccard_threshold) {
+                    if (ci < signature_blocked_.size() && signature_blocked_[ci]) {
+                        ++blocked_;
+                        return false;
+                    }
+                    ++near_dups_;
+                    return false;
+                }
             }
         }
 
         u32 idx = static_cast<u32>(signatures_.size());
         signatures_.push_back(sig);
+        signature_blocked_.push_back(false);
         for (int b = 0; b < cfg_.bands; ++b) {
             u64 bh = 1469598103934665603ull;
             for (int r = 0; r < rows; ++r) {
@@ -169,13 +186,28 @@ void Deduplicator::load_blocklist(const std::string& path) {
     }
     std::string line;
     u64 n = 0;
+    const int rows = cfg_.num_hashes / cfg_.bands;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        blocklist_.insert(hash_string(Normalizer::canonical(line)));
+        std::string canonical = Normalizer::canonical(line);
+        if (canonical.empty()) continue;
+        u64 hash = hash_string(canonical);
+        if (!blocklist_.insert(hash).second) continue;
+        std::vector<u64> sig = minhash(canonical);
+        u32 idx = static_cast<u32>(signatures_.size());
+        signatures_.push_back(std::move(sig));
+        signature_blocked_.push_back(true);
+        if (cfg_.near) {
+            for (int band = 0; band < cfg_.bands; ++band) {
+                band_tables_[static_cast<size_t>(band)][band_hash(
+                    signatures_.back(), band, rows)].push_back(idx);
+            }
+        }
         ++n;
     }
-    log_info(strfmt("dedup: loaded %s eval-contamination hashes", human_count(n).c_str()));
+    log_info(strfmt("dedup: loaded %s exact+near eval-contamination signatures",
+                    human_count(n).c_str()));
 }
 
 std::string Deduplicator::summary() const {

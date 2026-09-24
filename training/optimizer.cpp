@@ -14,6 +14,11 @@
 
 namespace gai {
 
+static Tensor snapshot_tensor(const Tensor& src) {
+    if (!src.defined()) return {};
+    return src.device() == Device::CPU ? src.clone() : src.to(Device::CPU);
+}
+
 AdamW::AdamW(Model& model, AdamWConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "AdamW requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
@@ -94,6 +99,18 @@ size_t AdamW::state_bytes() const {
     for (const auto& t : m_) n += t.nbytes();
     for (const auto& t : v_) n += t.nbytes();
     return n;
+}
+
+OptimizerStateSnapshot AdamW::snapshot_state() const {
+    OptimizerStateSnapshot s;
+    s.kind = OptimizerSnapshotKind::AdamW;
+    s.step = t_;
+    s.adamw = cfg_;
+    s.first.reserve(m_.size());
+    s.second.reserve(v_.size());
+    for (const Tensor& t : m_) s.first.push_back(snapshot_tensor(t));
+    for (const Tensor& t : v_) s.second.push_back(snapshot_tensor(t));
+    return s;
 }
 
 // P2-4: v1 layout is [count][t][u8 fmt=1][6 field-wise f32]
@@ -380,6 +397,18 @@ size_t Muon::state_bytes() const {
     return n;
 }
 
+OptimizerStateSnapshot Muon::snapshot_state() const {
+    OptimizerStateSnapshot s;
+    s.kind = OptimizerSnapshotKind::Muon;
+    s.step = t_;
+    s.muon = cfg_;
+    s.first.reserve(m_.size());
+    s.second.reserve(v_.size());
+    for (const Tensor& t : m_) s.first.push_back(snapshot_tensor(t));
+    for (const Tensor& t : v_) s.second.push_back(snapshot_tensor(t));
+    return s;
+}
+
 void Muon::save_state(std::ostream& os) const {
     u64 count = static_cast<u64>(m_.size());
     os.write(reinterpret_cast<const char*>(&count), 8);
@@ -533,6 +562,16 @@ size_t Lion::state_bytes() const {
     size_t n = 0;
     for (const auto& t : m_) n += t.nbytes();
     return n;
+}
+
+OptimizerStateSnapshot Lion::snapshot_state() const {
+    OptimizerStateSnapshot s;
+    s.kind = OptimizerSnapshotKind::Lion;
+    s.step = t_;
+    s.lion = cfg_;
+    s.first.reserve(m_.size());
+    for (const Tensor& t : m_) s.first.push_back(snapshot_tensor(t));
+    return s;
 }
 
 void Lion::save_state(std::ostream& os) const {

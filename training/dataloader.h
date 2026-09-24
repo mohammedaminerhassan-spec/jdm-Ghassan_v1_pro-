@@ -99,11 +99,13 @@ private:
 struct BatchSpec {
     int batch_size = 8;
     int seq_len    = 1024;
+    bool pack_sequences = false;
 };
 
 struct Batch {
     std::vector<i32> ids;       // [B*T]
     std::vector<i32> targets;   // [B*T], -100 where ignored
+    std::vector<i32> segment_ids;
     int  B = 0, T = 0;
     i64  tokens_supervised = 0;
 };
@@ -150,6 +152,8 @@ public:
     int num_shards() const;
     i64 batches_seen() const { return batches_; }
     bool using_mix() const { return use_mix_; }
+    bool packing() const { return pack_sequences_; }
+    bool all_shards_have_mask() const;
     std::string mix_report() const;
 
     // checkpointing (v5: includes RNG Box-Muller spare for bit-exact resume)
@@ -170,12 +174,18 @@ private:
     Rng  rng_;
     u64  total_tokens_ = 0;
     i64  batches_ = 0;
+    i64  committed_batches_ = 0;
+    State committed_state_{};
+    bool pack_sequences_ = false;
+
+    State capture_current_state() const;
 
     // Pick one window [B,T] from a single shard (shared by both paths).
     // Returns false ONLY on storage read failure (never for short docs —
     // those legitimately leave PAD tails). Callers must retry or fail loud;
     // a failed window must never masquerade as an unsupervised row (P1-20).
     bool fill_from_shard(const Shard& sh, Batch& out, int b);
+    bool fill_packed_row(const Shard& sh, Batch& out, int b);
 };
 
 std::vector<std::string> list_shards(const std::string& dir, const std::string& prefix);

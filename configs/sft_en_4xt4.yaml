@@ -53,7 +53,7 @@ training:
   beta2: 0.99                # lion default (explicit value wins over auto)
   eps: 1.0e-8
   grad_clip: 1.0
-  seed: 42
+  seed: 139
   log_every: 10
   eval_every: 100
   eval_batches: 10
@@ -66,6 +66,7 @@ training:
   freeze_embeddings: false
   activation_checkpointing: true
   ckpt_segments: 2
+  pack_sequences: true
   ddp: true                    # Enable multi-GPU DDP
 
 data:

@@ -220,6 +220,9 @@ print_device_report();
             log_info(strfmt("  %s (fp32)    : %s",
                             muon ? "muon m+v+NS " : lion ? "lion m      " : "adamw m+v   ",
                             human_bytes(opt_b).c_str()));
+            size_t fp16_cache = tcfg.fp16_weight_cache ? static_cast<size_t>(params * 2) : 0;
+            log_info(strfmt("  fp16 weight cache  : %s",
+                            human_bytes(fp16_cache).c_str()));
             log_info(strfmt("  activations b=%d t=%d%s%s : %s",
                             tcfg.batch_size, tcfg.seq_len,
                             tcfg.activation_checkpointing ? " [ckpt]" : "",
@@ -228,7 +231,7 @@ print_device_report();
             log_info(strfmt("  sched %s | opt %s",
                             tcfg.scheduler.c_str(), tcfg.optimizer.c_str()));
             log_info(strfmt("  TOTAL               : %s",
-                            human_bytes(params * 8 + opt_b + act).c_str()));
+                            human_bytes(params * 8 + fp16_cache + opt_b + act).c_str()));
             log_info(strfmt("  tokens per step     : %s",
                             human_count(static_cast<u64>(tcfg.tokens_per_step())).c_str()));
             if (tcfg.max_steps > 0)

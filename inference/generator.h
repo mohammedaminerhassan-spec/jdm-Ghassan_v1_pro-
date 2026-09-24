@@ -53,7 +53,8 @@ public:
 
     // Teacher-forced scoring, used by the evaluation harness.
     double score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask = nullptr,
-                        i64* out_ntok = nullptr);
+                        i64* out_ntok = nullptr,
+                        const std::vector<i32>* segment_ids = nullptr);
 
     const GenerationStats& stats() const { return stats_; }
     KVCache& cache() { return cache_; }
@@ -86,8 +87,8 @@ private:
     int              max_context_;
     Device           expected_device_ = Device::CPU;
 
-    // P0-03 FIX: Absolute token position counter. After KV evict_front,
-    // cache_.length() shrinks, but the true RoPE coordinate of the next
+    // P0-03 FIX: Absolute token position counter. After the KV ring wraps,
+    // cache_.length() stays capped, but the true RoPE coordinate of the next
     // token must keep increasing monotonically. Using cache_.length() as
     // position after eviction corrupts the relative positional distances
     // between retained cached keys and the new query.
@@ -97,7 +98,7 @@ private:
     // Using Tensors (not std::vector) fixes the latent CUDA bug where host
     // pointers were passed to device kernels. Host staging is only for the
     // token id, position, and final logits row consumed by the sampler.
-    Tensor x_, xb_, q_, k_, v_, attn_, proj_, gate_, up_, act_, logits_dev_, scores_;
+    Tensor x_, xb_, q_, k_, v_, qkv_, attn_, proj_, gate_, up_, act_, logits_dev_, scores_;
     Tensor tok_dev_, pos_dev_;
     Tensor hlast_;   // [d] last-row norm scratch for prefill head (audit P1: no [P,V])
     Tensor topk_vals_dev_, topk_ids_dev_;   // [FAST_TOPK_MAX] device candidates

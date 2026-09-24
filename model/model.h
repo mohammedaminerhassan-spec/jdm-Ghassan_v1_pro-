@@ -83,6 +83,7 @@ struct Parameter {
     std::vector<i64> shape;
     Tensor           w;
     Tensor           g;
+    Tensor           fp16_cache;
     bool             decay = true;   // AdamW weight decay applies?
     bool             frozen = false; // AdamW skips frozen params entirely
 
@@ -94,6 +95,7 @@ struct LayerParams {
     Parameter wq;          // [q_dim, d]
     Parameter wk;          // [kv_dim, d]
     Parameter wv;          // [kv_dim, d]
+    Tensor    wqkv_fp16;   // [q_dim + 2*kv_dim, d]
     Parameter wo;          // [d, q_dim]
     Parameter ffn_norm;    // [d]
     Parameter qk_qnorm;    // [hd] per-head Q gain (only when use_qk_norm)
@@ -141,6 +143,7 @@ struct Activations {
     Tensor xb;         // [B*T, d]  normed input (attn)
     Tensor xb2;        // [B*T, d]  normed input (ffn)
     Tensor q, k, v;    // [B*T, *]
+    Tensor qkv;        // [B*T, q_dim + 2*kv_dim]
     Tensor att_out;    // [B*T, q_dim]
     Tensor proj;       // [B*T, d]
     Tensor gate, up, act;   // dense FFN only: [B*T, ffn]
@@ -204,6 +207,7 @@ struct Activations {
 class Model {
 public:
     explicit Model(ModelConfig cfg, Device dev = Device::CPU);
+    ~Model();
 
     const ModelConfig& config() const { return cfg_; }
     Device device() const { return device_; }
@@ -218,20 +222,28 @@ public:
     void print_parameter_report() const;
 
     void init_weights(u64 seed = 42);
+    void enable_fp16_weight_cache(bool on);
+    void mark_weights_dirty();
+    bool fp16_weight_cache_enabled() const { return fp16_weight_cache_; }
+    size_t fp16_weight_cache_bytes() const;
     void enable_grad(bool on);
     bool grad_enabled() const { return grad_enabled_; }
     void zero_grad();
     void to(Device dev);
+    void set_rope_runtime(float scale, float yarn_mscale);
+    const float* rope_inv_freq_ptr() const;
 
     // ---- forward / backward (training path, dense over B*T)
     // ids [B,T] int32 on device. Returns logits [B*T, V] (view into activations).
-    Tensor& forward(const i32* ids, int B, int T, Activations& act);
+    Tensor& forward(const i32* ids, int B, int T, Activations& act,
+                    const i32* segment_ids = nullptr);
     // targets [B*T] with -100 for ignored positions.
     // dout_scale amplifies dlogits for FP16 loss scaling (grads come out scaled
     // by the same factor; the caller unscales via the optimizer grad_scale).
     double  forward_backward(const i32* ids, const i32* targets, int B, int T,
                              Activations& act, i64* out_ntok = nullptr,
-                             float dout_scale = 1.0f, bool want_aux_stats = false);
+                             float dout_scale = 1.0f, bool want_aux_stats = false,
+                             const i32* segment_ids = nullptr);
 
     // ce_chunks: row-blocks for the chunked loss in forward_backward
     // (1 = legacy full [N,V] logits; >1 = compact [Cc,V] scratch where
@@ -254,6 +266,7 @@ public:
     const float* moe_bias_ptr(int layer) const;
     float* moe_bias_ptr_mut(int layer);
     void update_moe_bias(int layer, const float* frac_host, int ne);
+    void set_moe_bias(int layer, const float* values, size_t count);
     const std::vector<std::vector<float>>& moe_bias_all() const { return moe_bias_; }
 
     // ---- weights io (raw f32 dump; the .gai format lives in format/)
@@ -262,6 +275,7 @@ public:
 
     LayerParams&       layer(int i)       { return layers_[static_cast<size_t>(i)]; }
     const LayerParams& layer(int i) const { return layers_[static_cast<size_t>(i)]; }
+    const u16* fused_qkv_ptr(int i) const;
     Parameter& tok_embeddings() { return tok_emb_; }
     Parameter& final_norm()     { return final_norm_; }
     Parameter& lm_head()        { return cfg_.tie_embeddings ? tok_emb_ : lm_head_; }
@@ -269,6 +283,7 @@ public:
 
 private:
     void alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay);
+    void rebuild_rope_cache();
 
     // per-layer aux-loss helper (also accumulates routing stats below).
     // want_stats=false (training hot path): no host copies at all; the raw
@@ -280,7 +295,8 @@ private:
 
     // Body of forward() up to (and including) the final norm; the lm_head
     // GEMM is left to the caller so forward_backward() can chunk it.
-    void forward_body(const i32* ids, int B, int T, Activations& act);
+    void forward_body(const i32* ids, int B, int T, Activations& act,
+                      const i32* segment_ids);
 
     ModelConfig cfg_;
     // routing stats: [layer][expert] tokens routed (for balance reporting)
@@ -293,6 +309,9 @@ private:
     float moe_bias_lr_ = 0.001f;
     Device      device_ = Device::CPU;
     bool        grad_enabled_ = false;
+    bool        fp16_weight_cache_ = false;
+    bool        fp16_weights_dirty_ = false;
+    Tensor      rope_inv_freq_;
 
     Parameter                tok_emb_;
     Parameter                lm_head_;     // only used when !tie_embeddings

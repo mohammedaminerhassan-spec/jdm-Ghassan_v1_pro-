@@ -222,6 +222,34 @@ void linear_forward(const float* x, const float* w, float* y, int M, int K, int 
     gemm(false, true, M, N, K, 1.0f, x, K, w, K, 0.0f, y, N);
 }
 
+void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {
+#ifdef GAI_OPENMP
+    #pragma omp parallel for if(M * N > 256) schedule(static)
+#endif
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            const u16* row = w + static_cast<size_t>(n) * K;
+            const float* xrow = x + static_cast<size_t>(m) * K;
+            for (int k = 0; k < K; ++k) sum += xrow[k] * fp16_to_fp32(row[k]);
+            y[static_cast<size_t>(m) * N + n] = sum;
+        }
+    }
+}
+
+void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, int kvd) {
+    if (n <= 0) return;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i64 t = 0; t < n; ++t) {
+        const float* row = qkv + t * (qd + 2 * kvd);
+        std::memcpy(q + t * qd, row, sizeof(float) * static_cast<size_t>(qd));
+        std::memcpy(k + t * kvd, row + qd, sizeof(float) * static_cast<size_t>(kvd));
+        std::memcpy(v + t * kvd, row + qd + kvd, sizeof(float) * static_cast<size_t>(kvd));
+    }
+}
+
 void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N) {
     if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, w, K, 1.0f, dx, K);   // dx += dy * W
@@ -524,6 +552,51 @@ void rope_backward_ex(float* dq, float* dk, const i32* pos,
                rope_type, yarn_low, yarn_high, yarn_scale, -1.0f);
 }
 
+static void rope_apply_cached(float* q, float* k, const i32* pos, const float* inv_freq,
+                              i64 ntok, int n_heads, int n_kv, int head_dim,
+                              int rope_type, float sign) {
+    const int half = head_dim / 2;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (i64 t = 0; t < ntok; ++t) {
+        for (int h = 0; h < n_heads; ++h) {
+            float* row = q + (t * n_heads + h) * head_dim;
+            for (int i = 0; i < half; ++i) {
+                float c = std::cos(static_cast<float>(pos[t]) * inv_freq[i]);
+                float s = std::sin(static_cast<float>(pos[t]) * inv_freq[i]) * sign;
+                if (rope_type == 1) {
+                    rope_pair(row[i], row[i + half], c, s);
+                } else {
+                    rope_pair(row[2 * i], row[2 * i + 1], c, s);
+                }
+            }
+        }
+        for (int h = 0; h < n_kv; ++h) {
+            float* row = k + (t * n_kv + h) * head_dim;
+            for (int i = 0; i < half; ++i) {
+                float c = std::cos(static_cast<float>(pos[t]) * inv_freq[i]);
+                float s = std::sin(static_cast<float>(pos[t]) * inv_freq[i]) * sign;
+                if (rope_type == 1) {
+                    rope_pair(row[i], row[i + half], c, s);
+                } else {
+                    rope_pair(row[2 * i], row[2 * i + 1], c, s);
+                }
+            }
+        }
+    }
+}
+
+void rope_forward_cached(float* q, float* k, const i32* pos, const float* inv_freq,
+                         i64 ntok, int n_heads, int n_kv, int head_dim, int rope_type) {
+    rope_apply_cached(q, k, pos, inv_freq, ntok, n_heads, n_kv, head_dim, rope_type, 1.0f);
+}
+
+void rope_backward_cached(float* dq, float* dk, const i32* pos, const float* inv_freq,
+                          i64 ntok, int n_heads, int n_kv, int head_dim, int rope_type) {
+    rope_apply_cached(dq, dk, pos, inv_freq, ntok, n_heads, n_kv, head_dim, rope_type, -1.0f);
+}
+
 // ================================================================ swiglu
 static inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
@@ -692,7 +765,8 @@ void attention_decode(const float* q, const float* kcache, const float* vcache,
 
 void attention_forward_ex(const float* q, const float* k, const float* v,
                           float* out, float* probs,
-                          int B, int T, int H, int KV, int hd, float scale, int window) {
+                          int B, int T, int H, int KV, int hd, float scale, int window,
+                          const i32* segment_ids) {
     const int group = H / KV;
     const size_t qs  = static_cast<size_t>(T) * H  * hd;
     const size_t kvs = static_cast<size_t>(T) * KV * hd;
@@ -716,16 +790,27 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
                 const float* qh = q + static_cast<size_t>(b) * qs + (static_cast<size_t>(t) * H + h) * hd;
                 int j0 = (window > 0) ? (t - window + 1 > 0 ? t - window + 1 : 0) : 0;
                 int len = t + 1 - j0;
+                const i32 seg_t = segment_ids ? segment_ids[static_cast<size_t>(b) * T + t] : 0;
                 float mx = -3.4e38f;
                 for (int j = j0; j <= t; ++j) {
+                    i32 seg_j = segment_ids ? segment_ids[static_cast<size_t>(b) * T + j] : 0;
+                    if (segment_ids && seg_t >= 0 && seg_j != seg_t) {
+                        s[static_cast<size_t>(j - j0)] = -3.4e38f;
+                        continue;
+                    }
                     const float* kh = k + static_cast<size_t>(b) * kvs + (static_cast<size_t>(j) * KV + kvh) * hd;
                     float d = dot_f32(qh, kh, hd) * scale;
                     s[static_cast<size_t>(j - j0)] = d;
                     mx = std::max(mx, d);
                 }
                 float sum = 0.f;
-                for (int j = 0; j < len; ++j) { s[static_cast<size_t>(j)] = std::exp(s[static_cast<size_t>(j)] - mx); sum += s[static_cast<size_t>(j)]; }
-                float inv = 1.0f / sum;
+                for (int j = 0; j < len; ++j) {
+                    float value = s[static_cast<size_t>(j)];
+                    value = value < -3.0e38f ? 0.0f : std::exp(value - mx);
+                    s[static_cast<size_t>(j)] = value;
+                    sum += s[static_cast<size_t>(j)];
+                }
+                float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
                 float* o = out + static_cast<size_t>(b) * qs + (static_cast<size_t>(t) * H + h) * hd;
                 std::memset(o, 0, sizeof(float) * static_cast<size_t>(hd));
                 for (int j = 0; j < len; ++j) {
@@ -832,6 +917,58 @@ void attention_decode_ex(const float* q, const float* kcache, const float* vcach
     }
 }
 
+static inline size_t decode_ring_slot(int j, int pinned_prefix, int ring_start, int ring_capacity) {
+    if (j < pinned_prefix) return static_cast<size_t>(j);
+    return static_cast<size_t>(pinned_prefix) +
+           static_cast<size_t>((ring_start + (j - pinned_prefix)) % ring_capacity);
+}
+
+void attention_decode_ring(const float* q, const float* kcache, const float* vcache,
+                           float* out, int H, int KV, int hd, int ring_start,
+                           int pinned_prefix, int cur_len, int cache_max,
+                           float scale, float* scratch, int window) {
+    GAI_CHECK(H > 0 && KV > 0 && hd > 0, "attention_decode_ring: empty shape");
+    GAI_CHECK(H % KV == 0, "attention_decode_ring: H must be a multiple of KV");
+    GAI_CHECK(cur_len >= 0 && cache_max >= 0 && cur_len <= cache_max,
+              "attention_decode_ring: length exceeds cache capacity");
+    GAI_CHECK(pinned_prefix >= 0 && pinned_prefix <= cur_len,
+              "attention_decode_ring: pinned prefix out of range");
+    const int ring_capacity = cache_max - pinned_prefix;
+    if (cur_len > pinned_prefix) {
+        GAI_CHECK(ring_capacity > 0, "attention_decode_ring: ring has no rolling slots");
+        GAI_CHECK(ring_start >= 0 && ring_start < ring_capacity,
+                  "attention_decode_ring: ring start out of range");
+    }
+    const int group = H / KV;
+#ifdef GAI_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < H; ++h) {
+        int kvh = h / group;
+        float* s = scratch + static_cast<size_t>(h) * static_cast<size_t>(cur_len);
+        const float* qh = q + static_cast<size_t>(h) * hd;
+        int j0 = (window > 0 && cur_len > window) ? cur_len - window : 0;
+        float mx = -3.4e38f;
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            const float* kh = kcache + (slot * static_cast<size_t>(KV) + kvh) * hd;
+            float d = dot_f32(qh, kh, hd) * scale;
+            s[j] = d;
+            mx = std::max(mx, d);
+        }
+        float sum = 0.f;
+        for (int j = j0; j < cur_len; ++j) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
+        float inv = 1.0f / sum;
+        float* o = out + static_cast<size_t>(h) * hd;
+        std::memset(o, 0, sizeof(float) * static_cast<size_t>(hd));
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            const float* vh = vcache + (slot * static_cast<size_t>(KV) + kvh) * hd;
+            axpy_f32(o, vh, s[j] * inv, hd);
+        }
+    }
+}
+
 // ================================================================ loss
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
@@ -846,7 +983,7 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     // P3-3: OpenMP reduction order is unspecified, so the loss scalar is not
     // bit-reproducible run to run. Default keeps the parallel sum (fast);
     // GAI_DETERMINISTIC=1 forces the serial order for debugging.
-    const bool deterministic = [] {
+    [[maybe_unused]] const bool deterministic = [] {
         const char* e = std::getenv("GAI_DETERMINISTIC");
         return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
     }();

@@ -322,6 +322,9 @@ bool DataLoader::open(const std::vector<std::string>& paths, BatchSpec spec, u64
     use_mix_ = false;
     total_tokens_ = 0;
     batches_ = 0;
+    committed_batches_ = 0;
+    pack_sequences_ = spec.pack_sequences;
+    committed_state_ = capture_current_state();
 
     for (const auto& p : paths) {
         Shard s;
@@ -331,7 +334,8 @@ bool DataLoader::open(const std::vector<std::string>& paths, BatchSpec spec, u64
             log_warn("dataloader: cannot load shard " + p);
             continue;
         }
-        if (s.n_tokens() < static_cast<u64>(spec.seq_len) + 1) {
+        const u64 min_tokens = spec.pack_sequences ? 2u : static_cast<u64>(spec.seq_len) + 1u;
+        if (s.n_tokens() < min_tokens) {
             log_warn("dataloader: shard too small, skipped: " + p);
             continue;
         }
@@ -358,6 +362,9 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
     use_mix_ = false;
     total_tokens_ = 0;
     batches_ = 0;
+    committed_batches_ = 0;
+    pack_sequences_ = spec.pack_sequences;
+    committed_state_ = capture_current_state();
     if (mix.empty()) return false;
 
     double wsum = 0.0;
@@ -381,7 +388,8 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         for (const auto& p : paths) {
             Shard s;
             if (!s.load_header(p) && !s.load(p)) { log_warn("dataloader: cannot load shard " + p); continue; }
-            if (s.n_tokens() < static_cast<u64>(spec.seq_len) + 1) {
+            const u64 min_tokens = spec.pack_sequences ? 2u : static_cast<u64>(spec.seq_len) + 1u;
+            if (s.n_tokens() < min_tokens) {
                 log_warn("dataloader: shard too small, skipped: " + p);
                 continue;
             }
@@ -416,6 +424,17 @@ int DataLoader::num_shards() const {
     return static_cast<int>(shards_.size());
 }
 
+bool DataLoader::all_shards_have_mask() const {
+    if (use_mix_) {
+        for (const auto& g : groups_) {
+            for (const Shard& s : g.shards) if (!s.has_mask()) return false;
+        }
+        return !groups_.empty();
+    }
+    for (const Shard& s : shards_) if (!s.has_mask()) return false;
+    return !shards_.empty();
+}
+
 std::string DataLoader::mix_report() const {
     if (!use_mix_ || groups_.empty()) return "";
     std::string s = "mix:";
@@ -430,20 +449,6 @@ std::string DataLoader::mix_report() const {
 
 bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
     const int T = spec_.seq_len;
-    // DeepSeek-quality document isolation (FIX: no cross-doc leak):
-    // Old packing stitched 2-3 docs into one row with no attention mask, so
-    // causal attention leaked context across documents AND RoPE positions
-    // (0..T-1) were wrong for the 2nd/3rd doc. Llama/DeepSeek either mask
-    // documents or isolate them. We isolate: each row comes from ONE doc,
-    // truncated at doc_end, tail padded with 0/-100 (honest, not counted).
-    // P2 efficiency: to avoid large PAD tails when the first random start
-    // lands near a doc end, try up to 4 candidates and keep the longest fit
-    // (still ONE doc per row, no packing, positions always 0..T-1 correct).
-    // P2-21 honesty note: best-of-4 is NOT uniform sampling — longer
-    // documents/regions win more often than short trailing regions. Kept
-    // deliberately as a padding-efficiency policy, not a neutral sampler.
-    // Full segment-masked packing (multiple docs/row with block-causal mask)
-    // is the future P2-03 upgrade; this retry already cuts PAD waste ~3x.
     u64 best_start = 0, best_end = 0, best_avail = 0;
     for (int attempt = 0; attempt < 4; ++attempt) {
         u64 max_start = sh.n_tokens() > 0 ? sh.n_tokens() - 1 : 0;
@@ -460,36 +465,70 @@ bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
             best_avail = avail;
             best_start = start;
             best_end = doc_end_idx;
-            if (best_avail >= static_cast<u64>(T) + 1) break; // full window found
+            if (best_avail >= static_cast<u64>(T) + 1) break;
         }
     }
-    if (best_avail == 0 || best_start >= sh.n_tokens()) return true; // row stays PAD/-100
-    u64 start = best_start, doc_end_idx = best_end, avail = best_avail;
-    // Need avail tokens for ids + 1 lookahead for the last target.
-    // FIX (T4/GPU-starvation): old code allocated 2 vectors per row per batch
-    // (B*T rows per step). Reuse monotonic thread-local staging instead.
-    u64 want = std::min<u64>(avail, static_cast<u64>(T) + 1);
-    if (start + want > sh.n_tokens()) want = sh.n_tokens() - start;
+    if (best_avail == 0 || best_start >= sh.n_tokens()) return true;
+    u64 want = std::min<u64>(best_avail, static_cast<u64>(T) + 1);
+    if (best_start + want > sh.n_tokens()) want = sh.n_tokens() - best_start;
     if (want == 0) return true;
     thread_local std::vector<u32> toks;
     thread_local std::vector<u8> masks;
-    if (!sh.read_window(start, want, toks, masks)) return false; // I/O failure: caller retries/fails
-    // Emit at most T ids; toks[want-1] is lookahead-only for the last target.
+    if (!sh.read_window(best_start, want, toks, masks)) return false;
     int filled = static_cast<int>(std::min<u64>(toks.size(), static_cast<u64>(T)));
-    // If toks.size() == T+1 (full window + lookahead), filled == T, correct.
-    // If toks.size() <= T (doc end), filled == toks.size(), tail stays PAD.
     for (int i = 0; i < filled; ++i) {
         size_t o = static_cast<size_t>(b) * T + static_cast<size_t>(i);
-        u64 ti = start + static_cast<u64>(i);
+        u64 ti = best_start + static_cast<u64>(i);
         out.ids[o] = static_cast<i32>(toks[static_cast<size_t>(i)]);
-        bool has_next = (static_cast<size_t>(i) + 1 < toks.size()) && (ti + 1 < doc_end_idx);
+        out.segment_ids[o] = 0;
+        bool has_next = (static_cast<size_t>(i) + 1 < toks.size()) && (ti + 1 < best_end);
         if (has_next) {
             u8 m = masks.empty() ? 1 : masks[static_cast<size_t>(i) + 1];
             if (m) {
                 out.targets[o] = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
                 ++out.tokens_supervised;
             }
-        } // else targets stays -100 (doc end / no lookahead)
+        }
+    }
+    return true;
+}
+
+bool DataLoader::fill_packed_row(const Shard& sh, Batch& out, int b) {
+    const int T = spec_.seq_len;
+    const size_t row_off = static_cast<size_t>(b) * static_cast<size_t>(T);
+    int pos = 0;
+    i32 segment = 0;
+    thread_local std::vector<u32> toks;
+    thread_local std::vector<u8> masks;
+
+    while (pos < T) {
+        u64 nd = sh.n_docs();
+        if (nd == 0 || sh.n_tokens() == 0) return pos > 0;
+        u64 doc_start = sh.doc_start_at(rng_.below(nd));
+        u64 doc_end = sh.doc_end(doc_start);
+        u64 doc_len = doc_end > doc_start ? doc_end - doc_start : 0;
+        if (doc_len == 0) continue;
+        u64 want = std::min<u64>(doc_len, static_cast<u64>(T - pos) + 1);
+        if (doc_start + want > sh.n_tokens()) want = sh.n_tokens() - doc_start;
+        if (want == 0) break;
+        if (!sh.read_window(doc_start, want, toks, masks)) return false;
+        int filled = static_cast<int>(std::min<u64>(toks.size(), static_cast<u64>(T - pos)));
+        for (int i = 0; i < filled; ++i) {
+            size_t o = row_off + static_cast<size_t>(pos + i);
+            out.ids[o] = static_cast<i32>(toks[static_cast<size_t>(i)]);
+            out.segment_ids[o] = segment;
+            bool has_next = static_cast<size_t>(i + 1) < toks.size() &&
+                            static_cast<u64>(i + 1) < doc_len;
+            if (has_next) {
+                u8 m = masks.empty() ? 1 : masks[static_cast<size_t>(i) + 1];
+                if (m) {
+                    out.targets[o] = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
+                    ++out.tokens_supervised;
+                }
+            }
+        }
+        pos += filled;
+        ++segment;
     }
     return true;
 }
@@ -503,19 +542,16 @@ bool DataLoader::next(Batch& out) {
     out.T = T;
     out.ids.assign(static_cast<size_t>(B) * T, 0);
     out.targets.assign(static_cast<size_t>(B) * T, -100);
+    out.segment_ids.assign(static_cast<size_t>(B) * T, -1);
     out.tokens_supervised = 0;
 
     for (int b = 0; b < B; ++b) {
-        // P1-20: a failed window read must never become a silent padded row
-        // (it would shrink the supervised-token budget invisibly). Retry the
-        // row on another shard/window; a persistently failing shard means a
-        // corrupt disk/image, so fail the run loudly instead of training on.
+        // P1-20: a failed window read must never become a silent padded row.
         bool row_ok = false;
         std::string last_path;
         for (int attempt = 0; attempt < 8 && !row_ok; ++attempt) {
             const Shard* shp = nullptr;
             if (use_mix_) {
-                // 1. pick a domain by its mix weight (one uniform draw)
                 double r = (double)rng_.uniform();
                 double acc = 0.0;
                 size_t gi = groups_.size() - 1;
@@ -523,7 +559,6 @@ bool DataLoader::next(Batch& out) {
                     acc += groups_[i].weight;
                     if (r < acc) { gi = i; break; }
                 }
-                // 2. pick a shard inside the domain proportionally to its size
                 const DomainGroup& g = groups_[gi];
                 u64 pick = rng_.below(g.total_tokens);
                 size_t si = 0;
@@ -533,7 +568,6 @@ bool DataLoader::next(Batch& out) {
                 }
                 shp = &g.shards[si];
             } else {
-                // legacy: sample a shard proportionally to its size
                 u64 pick = rng_.below(total_tokens_);
                 size_t si = 0;
                 for (; si + 1 < shards_.size(); ++si) {
@@ -543,13 +577,17 @@ bool DataLoader::next(Batch& out) {
                 shp = &shards_[si];
             }
             last_path = shp->path();
-            row_ok = fill_from_shard(*shp, out, b);
+            // Phase 1A: use segment-masked packing when enabled.
+            row_ok = pack_sequences_ ? fill_packed_row(*shp, out, b)
+                                     : fill_from_shard(*shp, out, b);
         }
         if (!row_ok)
             GAI_FAIL("dataloader: shard read failed 8x in a row at " + last_path +
                      " (corrupt shard or dying disk — refusing silent padded training)");
     }
     ++batches_;
+    ++committed_batches_;
+    committed_state_ = capture_current_state();
     return true;
 }
 
@@ -592,49 +630,71 @@ void DataLoader::fast_forward(i64 n) {
                     }
                     shp = &shards_[si];
                 }
-                // Bit-exact replica of fill_from_shard RNG draws (metadata
-                // only: doc_end/doc_start_at are in-RAM, no read_window).
-                u64 best_avail = 0;
-                for (int fa = 0; fa < 4; ++fa) {
-                    u64 max_start = shp->n_tokens() > 0 ? shp->n_tokens() - 1 : 0;
-                    u64 start = max_start > 0 ? rng_.below(max_start + 1) : 0;
-                    u64 doc_end_idx = shp->doc_end(start);
-                    u64 avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
-                    if (avail == 0) {
+                if (pack_sequences_) {
+                    int pos = 0;
+                    while (pos < T) {
                         u64 nd = shp->n_docs();
-                        start = (nd > 0) ? shp->doc_start_at(rng_.below(nd)) : 0;
-                        doc_end_idx = shp->doc_end(start);
-                        avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
+                        if (nd == 0) break;
+                        u64 doc_start = shp->doc_start_at(rng_.below(nd));
+                        u64 doc_end = shp->doc_end(doc_start);
+                        u64 doc_len = doc_end > doc_start ? doc_end - doc_start : 0;
+                        if (doc_len == 0) continue;
+                        u64 want = std::min<u64>(doc_len, static_cast<u64>(T - pos) + 1);
+                        if (doc_start + want > shp->n_tokens()) want = shp->n_tokens() - doc_start;
+                        if (want == 0) break;
+                        pos += static_cast<int>(std::min<u64>(want, static_cast<u64>(T - pos)));
                     }
-                    if (avail > best_avail) {
-                        best_avail = avail;
-                        if (best_avail >= static_cast<u64>(T) + 1) break;
+                } else {
+                    u64 best_avail = 0;
+                    for (int fa = 0; fa < 4; ++fa) {
+                        u64 max_start = shp->n_tokens() > 0 ? shp->n_tokens() - 1 : 0;
+                        u64 start = max_start > 0 ? rng_.below(max_start + 1) : 0;
+                        u64 doc_end_idx = shp->doc_end(start);
+                        u64 avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
+                        if (avail == 0) {
+                            u64 nd = shp->n_docs();
+                            start = (nd > 0) ? shp->doc_start_at(rng_.below(nd)) : 0;
+                            doc_end_idx = shp->doc_end(start);
+                            avail = (doc_end_idx > start) ? (doc_end_idx - start) : 0;
+                        }
+                        if (avail > best_avail) {
+                            best_avail = avail;
+                            if (best_avail >= static_cast<u64>(T) + 1) break;
+                        }
                     }
                 }
-                break;  // fill_from_shard always returns true here (row PAD ok)
+                break;
             }
         }
         ++batches_;
+        ++committed_batches_;
     }
+    committed_state_ = capture_current_state();
 }
 
 void DataLoader::reseed(u64 seed) {
     rng_.seed_with(seed);
     batches_ = 0;
+    committed_batches_ = 0;
+    committed_state_ = capture_current_state();
 }
 
-DataLoader::State DataLoader::get_state() const {
+DataLoader::State DataLoader::capture_current_state() const {
     State s{};
     bool hs = false;
     rng_.get_full_state(s.rng, s.rng_spare, hs);
     s.rng_has_spare = hs ? 1 : 0;
-    s.batches = batches_;
+    s.batches = committed_batches_;
     return s;
 }
+
+DataLoader::State DataLoader::get_state() const { return committed_state_; }
 
 void DataLoader::set_state(const State& s) {
     rng_.set_full_state(s.rng, s.rng_spare, s.rng_has_spare != 0);
     batches_ = s.batches;
+    committed_batches_ = s.batches;
+    committed_state_ = s;
 }
 
 } // namespace gai

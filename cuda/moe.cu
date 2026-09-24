@@ -79,7 +79,7 @@ static void grp_ensure(size_t nk, int ne) {
         if (g_grp_cnt) CU_CHECK(cudaFree(g_grp_cnt));
         if (g_grp_cur) CU_CHECK(cudaFree(g_grp_cur));
         CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
-        CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)ne));
+        CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));
         g_grp_ne_cap = ne;
     }
 }
@@ -488,6 +488,17 @@ __global__ void k_group_hist(const i32* idx, int* cnt, i64 NK, int ne) {
     if (e >= 0 && e < ne) atomicAdd(&cnt[e], 1);
 }
 
+__global__ void k_group_offsets(const int* cnt, int* offsets, int* cursors, int ne) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int running = 0;
+    for (int e = 0; e < ne; ++e) {
+        offsets[e] = running;
+        cursors[e] = running;
+        running += cnt[e] < 0 ? 0 : cnt[e];
+    }
+    offsets[ne] = running;
+}
+
 __global__ void k_group_fill(const i32* idx, i32* grouped, int* cursors,
                              i64 NK, int ne) {
     i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -512,25 +523,15 @@ static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
     if (NK <= 0) return;
     CU_CHECK(cudaMemset(g_grp_cnt, 0, sizeof(int) * (size_t)ne));
     k_group_hist<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_cnt, NK, ne);
+    k_group_offsets<<<1, 1>>>(g_grp_cnt, g_grp_cur, g_grp_cur, ne);
     CU_CHECK(cudaGetLastError());
-    // Tiny sync: ne ints instead of NK ints (8 vs 4096 at N=2048,K=2).
-    // PERF NOTE (unmeasured here — needs T4 + Nsight): the payload is tiny so
-    // this is latency, not bandwidth. At grad_accum=128 x 36 MoE layers the
-    // repeated D2H stalls can still show up as a CPU/GPU gap. Profile step
-    // time with Nsight Systems on the real GPU before optimizing further
-    // (candidate: fully device-side grouping when it proves hot).
-    CU_CHECK(cudaMemcpy(h_counts, g_grp_cnt, sizeof(int) * (size_t)ne,
+    CU_CHECK(cudaMemcpy(h_offsets, g_grp_cur, sizeof(int) * (size_t)(ne + 1),
                         cudaMemcpyDeviceToHost));
-    h_offsets[0] = 0;
     for (int e = 0; e < ne; ++e) {
-        int c = h_counts[e] < 0 ? 0 : h_counts[e];
-        h_counts[e] = c;
-        h_offsets[e + 1] = h_offsets[e] + c;
+        int c = h_offsets[e + 1] - h_offsets[e];
+        h_counts[e] = c < 0 ? 0 : c;
     }
     if (h_offsets[ne] <= 0) return;
-    // cursors start at per-expert offsets; atomicAdd walks them forward.
-    CU_CHECK(cudaMemcpy(g_grp_cur, h_offsets, sizeof(int) * (size_t)ne,
-                        cudaMemcpyHostToDevice));
     k_group_fill<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
     CU_CHECK(cudaGetLastError());
 }

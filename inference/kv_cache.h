@@ -14,54 +14,76 @@ class KVCache {
 public:
     KVCache() = default;
     KVCache(const ModelConfig& cfg, int max_len, Device dev);
-    ~KVCache() {
-        // P1-07 FIX: free the per-instance eviction temp (was a process-lifetime
-        // static that was never freed and could corrupt multi-instance setups).
-        if (tmp_) { device_free(tmp_, k_.empty() ? Device::CPU : k_[0].device()); tmp_ = nullptr; }
-    }
-    // Move-only (raw pointer ownership of tmp_)
     KVCache(KVCache&& o) noexcept
         : k_(std::move(o.k_)), v_(std::move(o.v_)),
           max_len_(o.max_len_), kv_dim_(o.kv_dim_),
           layers_(o.layers_), len_(o.len_),
-          tmp_(o.tmp_), tmp_cap_(o.tmp_cap_) {
-        o.tmp_ = nullptr;
-        o.tmp_cap_ = 0;
+          pinned_(o.pinned_), start_(o.start_) {
         o.len_ = 0;
+        o.pinned_ = 0;
+        o.start_ = 0;
     }
     KVCache& operator=(KVCache&& o) noexcept {
         if (this != &o) {
-            if (tmp_) device_free(tmp_, k_.empty() ? Device::CPU : k_[0].device());
             k_ = std::move(o.k_);
             v_ = std::move(o.v_);
             max_len_ = o.max_len_;
             kv_dim_ = o.kv_dim_;
             layers_ = o.layers_;
             len_ = o.len_;
-            tmp_ = o.tmp_;
-            tmp_cap_ = o.tmp_cap_;
-            o.tmp_ = nullptr;
-            o.tmp_cap_ = 0;
+            pinned_ = o.pinned_;
+            start_ = o.start_;
             o.len_ = 0;
+            o.pinned_ = 0;
+            o.start_ = 0;
         }
         return *this;
     }
     KVCache(const KVCache&)            = delete;
     KVCache& operator=(const KVCache&) = delete;
 
-    void reset() { len_ = 0; }
+    void reset() {
+        len_ = 0;
+        start_ = 0;
+    }
     int  length() const { return len_; }
     int  capacity() const { return max_len_; }
-    // FIX: unchecked set/advance allowed len_ > max_len_ -> OOB memmove /
-    // D2D copy in evict_front/decode_step (inference crash, heap corruption).
-    // Fail fast instead of corrupting memory (also protects low-PC long chats).
+    int  pinned_prefix() const { return pinned_; }
+    int  ring_start() const { return start_; }
+    void set_pinned_prefix(int n) {
+        GAI_CHECK(n >= 0 && n <= max_len_, "KVCache::set_pinned_prefix out of range");
+        pinned_ = n;
+    }
     void set_length(int n) {
         GAI_CHECK(n >= 0 && n <= max_len_, "KVCache::set_length out of range");
         len_ = n;
+        start_ = 0;
     }
-    void advance(int n) {
-        GAI_CHECK(n >= 0 && len_ + n <= max_len_, "KVCache::advance overflow");
-        len_ += n;
+    int physical_slot(int logical) const {
+        GAI_CHECK(logical >= 0 && logical < len_, "KVCache::physical_slot out of range");
+        if (logical < pinned_) return logical;
+        const int ring_capacity = max_len_ - pinned_;
+        GAI_CHECK(ring_capacity > 0, "KVCache has no rolling slots");
+        GAI_CHECK(start_ >= 0 && start_ < ring_capacity, "KVCache ring start out of range");
+        return pinned_ + ((start_ + (logical - pinned_)) % ring_capacity);
+    }
+    int allocate_slot() {
+        GAI_CHECK(pinned_ >= 0 && pinned_ <= max_len_, "KVCache pinned prefix out of range");
+        if (len_ < max_len_) {
+            int slot = len_;
+            if (len_ >= pinned_) {
+                const int ring_capacity = max_len_ - pinned_;
+                GAI_CHECK(ring_capacity > 0, "KVCache has no rolling slots");
+                slot = pinned_ + ((start_ + (len_ - pinned_)) % ring_capacity);
+            }
+            ++len_;
+            return slot;
+        }
+        GAI_CHECK(pinned_ < max_len_, "KVCache is full and has no rolling slots");
+        const int ring_capacity = max_len_ - pinned_;
+        const int slot = pinned_ + (start_ % ring_capacity);
+        start_ = (start_ + 1) % ring_capacity;
+        return slot;
     }
 
     float* k(int layer) { return k_[static_cast<size_t>(layer)].f32(); }
@@ -71,19 +93,14 @@ public:
 
     size_t bytes() const;
 
-    // Drops the oldest `n` positions, shifting the rest down. Used when a long
-    // chat exceeds the context window (with the system prompt kept via `keep`).
-    void evict_front(int n, int keep = 0);
-
 private:
     std::vector<Tensor> k_, v_;
     int max_len_ = 0;
     int kv_dim_  = 0;
     int layers_  = 0;
     int len_     = 0;
-    // P1-07: per-instance CUDA eviction temp (replaces the old static g_tmp).
-    void*  tmp_     = nullptr;
-    size_t tmp_cap_ = 0;
+    int pinned_  = 0;
+    int start_   = 0;
 };
 
 } // namespace gai

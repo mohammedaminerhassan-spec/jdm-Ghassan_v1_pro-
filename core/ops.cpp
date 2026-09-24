@@ -8,6 +8,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 // Dispatch (T4-ONLY): Device::CUDA goes to cuda_ops::*, everything else to cpu::*.
 // No TPU/Metal/Vulkan branches exist by design — zero dead code paths.
@@ -36,6 +38,8 @@ static std::atomic<bool> g_gemm_fp16{true};
 static std::atomic<bool> g_gemm_bf16{false};
 static std::atomic<float> g_moe_jitter{0.0f};
 static std::atomic<u64> g_jitter_seed{0};
+static std::mutex g_fp16_weights_mutex;
+static std::unordered_map<const float*, std::pair<const u16*, i64>> g_fp16_weights;
 
 void set_moe_jitter(float j) {
     if (j < 0.0f) j = 0.0f;
@@ -125,7 +129,52 @@ void gemm(Device dev, bool ta, bool tb, int M, int N, int K, float alpha,
 
 void linear_forward(Device dev, const float* x, const float* w, float* y, int M, int K, int N) {
     g_perf_gemm.fetch_add(1, std::memory_order_relaxed);
+    const u16* half = nullptr;
+    i64 count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+        auto it = g_fp16_weights.find(w);
+        if (it != g_fp16_weights.end()) {
+            half = it->second.first;
+            count = it->second.second;
+        }
+    }
+    if (half && count == static_cast<i64>(K) * N) {
+        g_perf_fp16.fetch_add(1, std::memory_order_relaxed);
+        linear_forward_fp16(dev, x, half, y, M, K, N);
+        return;
+    }
     GAI_DISPATCH(dev, linear_forward(x, w, y, M, K, N));
+}
+
+void linear_forward_fp16(Device dev, const float* x, const u16* w, float* y, int M, int K, int N) {
+    GAI_DISPATCH(dev, linear_forward_fp16(x, w, y, M, K, N));
+}
+
+void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n) {
+    if (dev == Device::CPU) {
+        for (i64 i = 0; i < n; ++i) dst[i] = fp32_to_fp16(src[i]);
+        return;
+    }
+#ifdef GAI_CUDA
+    cuda_ops::convert_f32_to_f16(src, dst, n);
+#endif
+}
+
+void register_fp16_weight(const float* master, const u16* half, i64 n) {
+    GAI_CHECK(master != nullptr && half != nullptr && n > 0, "invalid fp16 weight registration");
+    std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+    g_fp16_weights[master] = {half, n};
+}
+
+void unregister_fp16_weight(const float* master) {
+    std::lock_guard<std::mutex> lock(g_fp16_weights_mutex);
+    g_fp16_weights.erase(master);
+}
+
+void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
+               i64 n, int qd, int kvd) {
+    GAI_DISPATCH(dev, split_qkv(qkv, q, k, v, n, qd, kvd));
 }
 
 void linear_backward(Device dev, const float* x, const float* w, const float* dy,
@@ -229,6 +278,20 @@ void rope_backward_ex(Device dev, float* dq, float* dk, const i32* pos,
                           rope_type, yarn_low, yarn_high, yarn_scale);
 }
 
+void rope_forward_cached(Device dev, float* q, float* k, const i32* pos,
+                         const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                         int head_dim, int rope_type) {
+    GAI_DISPATCH(dev, rope_forward_cached(q, k, pos, inv_freq, ntok, n_heads, n_kv,
+                                          head_dim, rope_type));
+}
+
+void rope_backward_cached(Device dev, float* dq, float* dk, const i32* pos,
+                          const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                          int head_dim, int rope_type) {
+    GAI_DISPATCH(dev, rope_backward_cached(dq, dk, pos, inv_freq, ntok, n_heads, n_kv,
+                                           head_dim, rope_type));
+}
+
 void swiglu_forward(Device dev, const float* g, const float* u, float* out, i64 n) {
     GAI_DISPATCH(dev, swiglu_forward(g, u, out, n));
 }
@@ -257,17 +320,38 @@ void attention_decode(Device dev, const float* q, const float* kc, const float* 
     GAI_DISPATCH(dev, attention_decode(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch));
 }
 
-void attention_forward_ex(Device dev,
-                          const float* q, const float* k, const float* v,
-                          float* out, float* probs,
-                          int B, int T, int H, int KV, int hd, float scale, int window) {
+void attention_decode_ring(Device dev,
+                           const float* q, const float* kcache, const float* vcache,
+                           float* out, int H, int KV, int hd, int ring_start,
+                           int pinned_prefix, int cur_len, int cache_max,
+                           float scale, float* scratch, int window) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
-        cuda_ops::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window);
+        cuda_ops::attention_decode_ring(q, kcache, vcache, out, H, KV, hd, ring_start,
+                                        pinned_prefix, cur_len, cache_max, scale,
+                                        scratch, window);
         return;
     }
 #endif
-    cpu::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window);
+    cpu::attention_decode_ring(q, kcache, vcache, out, H, KV, hd, ring_start,
+                               pinned_prefix, cur_len, cache_max, scale,
+                               scratch, window);
+}
+
+void attention_forward_ex(Device dev,
+                          const float* q, const float* k, const float* v,
+                          float* out, float* probs,
+                          int B, int T, int H, int KV, int hd, float scale, int window,
+                          const i32* segment_ids) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window,
+                                       segment_ids);
+        return;
+    }
+#endif
+    cpu::attention_forward_ex(q, k, v, out, probs, B, T, H, KV, hd, scale, window,
+                              segment_ids);
 }
 
 void attention_backward_ex(Device dev,

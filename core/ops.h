@@ -77,6 +77,13 @@ void gemm(Device dev,
 
 // Convenience: y[M,N] = x[M,K] * W[N,K]^T   (weights stored as [out, in], no bias)
 void linear_forward(Device dev, const float* x, const float* w, float* y, int M, int K, int N);
+// Split fused [N, qd + 2*kvd] rows into contiguous [N, qd], [N, kvd], [N, kvd] views.
+void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
+               i64 n, int qd, int kvd);
+void linear_forward_fp16(Device dev, const float* x, const u16* w, float* y, int M, int K, int N);
+void convert_f32_to_f16(Device dev, const float* src, u16* dst, i64 n);
+void register_fp16_weight(const float* master, const u16* half, i64 n);
+void unregister_fp16_weight(const float* master);
 // dx[M,K] += dy[M,N] * W[N,K] ; dw[N,K] += dy[M,N]^T * x[M,K]
 void linear_backward(Device dev, const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N);
@@ -115,8 +122,14 @@ void rope_forward_ex(Device dev, float* q, float* k, const i32* pos,
                      i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
                      int rope_type, float yarn_low, float yarn_high, float yarn_scale);
 void rope_backward_ex(Device dev, float* dq, float* dk, const i32* pos,
-                      i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
-                      int rope_type, float yarn_low, float yarn_high, float yarn_scale);
+                       i64 ntok, int n_heads, int n_kv, int head_dim, float theta,
+                       int rope_type, float yarn_low, float yarn_high, float yarn_scale);
+void rope_forward_cached(Device dev, float* q, float* k, const i32* pos,
+                         const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                         int head_dim, int rope_type);
+void rope_backward_cached(Device dev, float* dq, float* dk, const i32* pos,
+                          const float* inv_freq, i64 ntok, int n_heads, int n_kv,
+                          int head_dim, int rope_type);
 
 // ---------------------------------------------------------------- swiglu
 // out = silu(g) * u   (g,u,out all [n, d])
@@ -201,7 +214,8 @@ void attention_backward(Device dev,
 void attention_forward_ex(Device dev,
                           const float* q, const float* k, const float* v,
                           float* out, float* probs,
-                          int B, int T, int H, int KV, int hd, float scale, int window);
+                          int B, int T, int H, int KV, int hd, float scale, int window,
+                          const i32* segment_ids = nullptr);
 void attention_backward_ex(Device dev,
                            const float* q, const float* k, const float* v,
                            const float* probs, const float* dout,
@@ -219,6 +233,11 @@ void attention_decode_ex(Device dev,
                          const float* q, const float* kcache, const float* vcache,
                          float* out, int H, int KV, int hd, int cur_len, int max_len,
                          float scale, float* scratch, int window);
+void attention_decode_ring(Device dev,
+                           const float* q, const float* kcache, const float* vcache,
+                           float* out, int H, int KV, int hd, int ring_start,
+                           int pinned_prefix, int cur_len, int cache_max,
+                           float scale, float* scratch, int window);
 
 // ---------------------------------------------------------------- loss
 // logits[n, V], targets[n] (-100 = ignore). Returns sum of losses and count.

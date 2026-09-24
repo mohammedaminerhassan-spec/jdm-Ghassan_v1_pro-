@@ -1,0 +1,26 @@
+model:
+  vocab_size: 600
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 4
+  num_kv_heads: 2
+  intermediate_size: 256
+  max_seq_len: 64
+  use_moe: true
+  num_experts: 4
+  moe_top_k: 2
+  moe_expert_dim: 64
+  moe_shared: true
+  use_qk_norm: true
+  moe_aux_free: true
+  moe_aux_scale: 0.0
+
+training:
+  optimizer: adamw
+  batch_size: 2
+  seq_len: 64
+  grad_accum: 2
+  warmup_steps: 10
+  save_every: 25
+  max_steps: 100
+  device: cpu

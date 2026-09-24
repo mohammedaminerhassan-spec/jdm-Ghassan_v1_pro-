@@ -59,7 +59,7 @@ training:
   beta2: 0.99
   eps: 1.0e-8
   grad_clip: 1.0
-  seed: 42
+  seed: 138
   log_every: 10
   eval_every: 100
   eval_batches: 15
@@ -72,6 +72,7 @@ training:
   freeze_embeddings: false
   activation_checkpointing: false
   ckpt_segments: 1
+  pack_sequences: true
 
 data:
   data_dir: artifacts/shards_en

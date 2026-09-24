@@ -76,6 +76,7 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true
+  fp16_weight_cache: true
   loss_scale_init: 16384
   loss_scale_window: 2000
   batch_size: 2
@@ -104,6 +105,7 @@ training:
   resume: auto
   activation_checkpointing: true
   ckpt_segments: 2
+  pack_sequences: true
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin

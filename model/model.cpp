@@ -188,6 +188,21 @@ void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     }
 }
 
+void Model::set_moe_bias(int layer, const float* values, size_t count) {
+    if (!cfg_.use_moe || !cfg_.moe_aux_free || !values) return;
+    ensure_moe_bias();
+    if (layer < 0 || static_cast<size_t>(layer) >= moe_bias_.size() ||
+        count != moe_bias_[static_cast<size_t>(layer)].size()) {
+        GAI_FAIL("checkpoint moe bias shape mismatch");
+    }
+    auto& bias = moe_bias_[static_cast<size_t>(layer)];
+    std::copy(values, values + count, bias.begin());
+    if (device_ == Device::CUDA && static_cast<size_t>(layer) < moe_bias_dev_.size()) {
+        device_copy(moe_bias_dev_[static_cast<size_t>(layer)].data_ptr(), device_,
+                    bias.data(), Device::CPU, sizeof(float) * bias.size());
+    }
+}
+
 // ================================================================ config
 void ModelConfig::validate() const {
     GAI_CHECK(vocab_size > 0, "vocab_size must be > 0");
@@ -374,6 +389,34 @@ std::string ModelConfig::summary() const {
 float rope_theta_eff(const ModelConfig& m) { return rope_theta_eff_local(m); }
 float rope_mscale(const ModelConfig& m) { return rope_mscale_local(m); }
 
+void Model::rebuild_rope_cache() {
+    const int half = cfg_.head_dim() / 2;
+    std::vector<float> host(static_cast<size_t>(half));
+    const float theta = rope_theta_eff_local(cfg_);
+    for (int i = 0; i < half; ++i) {
+        float base = 1.0f / std::pow(theta,
+            (2.0f * static_cast<float>(i)) / static_cast<float>(cfg_.head_dim()));
+        if (cfg_.rope_scale > 1.0f) {
+            const float wavelength = 2.0f * 3.14159265358979f / base;
+            if (wavelength > cfg_.rope_yarn_high) {
+                base /= cfg_.rope_scale;
+            } else if (wavelength > cfg_.rope_yarn_low) {
+                const float span = cfg_.rope_yarn_high - cfg_.rope_yarn_low;
+                const float t = span > 0.0f ? (wavelength - cfg_.rope_yarn_low) / span : 1.0f;
+                base *= 1.0f - t + t / cfg_.rope_scale;
+            }
+        }
+        host[static_cast<size_t>(i)] = base;
+    }
+    rope_inv_freq_ = Tensor({half}, DType::F32, device_);
+    device_copy(rope_inv_freq_.data_ptr(), device_, host.data(), Device::CPU,
+                host.size() * sizeof(float));
+}
+
+const float* Model::rope_inv_freq_ptr() const {
+    return rope_inv_freq_.defined() ? rope_inv_freq_.f32() : nullptr;
+}
+
 // ================================================================ model
 void Model::alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay) {
     p.name  = name;
@@ -382,6 +425,10 @@ void Model::alloc_param(Parameter& p, const std::string& name, std::vector<i64> 
     p.w = Tensor::zeros(shape, DType::F32, device_);
     p.w.set_name(name);
     params_.push_back(&p);
+}
+
+Model::~Model() {
+    enable_fp16_weight_cache(false);
 }
 
 Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
@@ -449,6 +496,13 @@ Model::Model(ModelConfig cfg, Device dev) : cfg_(std::move(cfg)), device_(dev) {
         ensure_moe_bias();
         log_info("[moe ] aux-loss-free bias enabled (DeepSeek-V3 §3.2): EMA steering, no aux grad");
     }
+    rebuild_rope_cache();
+}
+
+const u16* Model::fused_qkv_ptr(int i) const {
+    if (!fp16_weight_cache_ || i < 0 || static_cast<size_t>(i) >= layers_.size()) return nullptr;
+    const Tensor& fused = layers_[static_cast<size_t>(i)].wqkv_fp16;
+    return fused.defined() ? fused.ptr<u16>() : nullptr;
 }
 
 Parameter* Model::find_parameter(const std::string& name) {
@@ -524,6 +578,8 @@ ParamReport Model::parameter_report() const {
 
 void Model::to(Device dev) {
     if (device_ == dev) return;
+    const bool restore_fp16_cache = fp16_weight_cache_;
+    if (restore_fp16_cache) enable_fp16_weight_cache(false);
     log_warn("[model] Model::to() moved weights; REBUILD Trainer activations and "
              "Generator cache/scratch on the new device before next step "
              "(cross-device use-after-move crashes T4).");
@@ -532,6 +588,7 @@ void Model::to(Device dev) {
         if (p->g.defined()) p->g = p->g.to(dev);
     }
     device_ = dev;
+    if (rope_inv_freq_.defined()) rope_inv_freq_ = rope_inv_freq_.to(dev);
     if (cfg_.use_moe && cfg_.moe_aux_free) {
         const size_t L = static_cast<size_t>(cfg_.num_layers);
         if (moe_bias_.size() != L)
@@ -547,6 +604,17 @@ void Model::to(Device dev) {
             }
         }
     }
+    if (restore_fp16_cache) enable_fp16_weight_cache(true);
+}
+
+void Model::set_rope_runtime(float scale, float yarn_mscale) {
+    cfg_.rope_scale = scale;
+    cfg_.rope_yarn_mscale = yarn_mscale;
+    cfg_.validate();
+    rebuild_rope_cache();
+    log_info(strfmt("[rope] runtime scale=%.3f mscale=%.3f theta=%.1f",
+                    (double)scale, (double)rope_mscale_local(cfg_),
+                    (double)rope_theta_eff_local(cfg_)));
 }
 
 std::string ParamReport::to_string(const ModelConfig& cfg) const {
@@ -651,6 +719,55 @@ void Model::init_weights(u64 seed) {
     if (orig_dev != Device::CPU) {
         to(orig_dev);
     }
+    if (fp16_weight_cache_) enable_fp16_weight_cache(true);
+}
+
+void Model::enable_fp16_weight_cache(bool on) {
+    if (!on) {
+        for (Parameter* p : params_) {
+            if (p->fp16_cache.defined()) {
+                ops::unregister_fp16_weight(p->w.f32());
+                p->fp16_cache = Tensor();
+            }
+        }
+        for (LayerParams& layer : layers_) layer.wqkv_fp16 = Tensor();
+        fp16_weight_cache_ = false;
+        fp16_weights_dirty_ = false;
+        return;
+    }
+    if (!fp16_weight_cache_) {
+        for (Parameter* p : params_) {
+            if (p->shape.size() != 2) continue;
+            p->fp16_cache = Tensor::empty(p->shape, DType::F16, device_);
+        }
+        fp16_weight_cache_ = true;
+    }
+    for (Parameter* p : params_) {
+        if (!p->fp16_cache.defined()) continue;
+        ops::convert_f32_to_f16(device_, p->w.f32(), p->fp16_cache.ptr<u16>(), p->numel());
+        ops::register_fp16_weight(p->w.f32(), p->fp16_cache.ptr<u16>(), p->numel());
+    }
+    const i64 d = cfg_.hidden_size;
+    const i64 qd = cfg_.q_dim();
+    const i64 kvd = cfg_.kv_dim();
+    for (LayerParams& layer : layers_) {
+        layer.wqkv_fp16 = Tensor::empty({qd + 2 * kvd, d}, DType::F16, device_);
+        u16* fused = layer.wqkv_fp16.ptr<u16>();
+        ops::convert_f32_to_f16(device_, layer.wq.w.f32(), fused, qd * d);
+        ops::convert_f32_to_f16(device_, layer.wk.w.f32(), fused + qd * d, kvd * d);
+        ops::convert_f32_to_f16(device_, layer.wv.w.f32(), fused + (qd + kvd) * d, kvd * d);
+    }
+    fp16_weights_dirty_ = false;
+}
+
+void Model::mark_weights_dirty() {
+    if (fp16_weight_cache_) fp16_weights_dirty_ = true;
+}
+
+size_t Model::fp16_weight_cache_bytes() const {
+    size_t bytes = 0;
+    for (const Parameter* p : params_) bytes += p->fp16_cache.nbytes();
+    return bytes;
 }
 
 void Model::enable_grad(bool on) {
@@ -730,9 +847,10 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
     a.x       = mk({N, d},  device_, acc);
     a.xb      = mk({N, d},  device_, acc);
     a.xb2     = mk({N, d},  device_, acc);
-    a.q       = mk({N, qd}, device_, acc);
-    a.k       = mk({N, kvd},device_, acc);
-    a.v       = mk({N, kvd},device_, acc);
+    if (fp16_weight_cache_) a.qkv = mk({N, qd + 2 * kvd}, device_, acc);
+    a.q = mk({N, qd}, device_, acc);
+    a.k = mk({N, kvd}, device_, acc);
+    a.v = mk({N, kvd}, device_, acc);
     a.att_out = mk({N, qd}, device_, acc);
     a.proj    = mk({N, d},  device_, acc);
     if (moe) {
@@ -886,6 +1004,7 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
     const u64 L   = static_cast<u64>(cfg_.num_layers);
 
     u64 e = sat_mul(N, (4 * d + qd * 2 + kvd * 2 + F * 3 + V));
+    if (fp16_weight_cache_) e = sat_add(e, sat_mul(N, (qd + 2 * kvd)));
     if (cfg_.use_moe) e = sat_add(e, sat_mul(N, (static_cast<u64>(cfg_.num_experts) + 2 * static_cast<u64>(cfg_.moe_top_k))));
     // Forward misses pos[N] i32 + xfinal/hnorm/dtmp grad scratch in the old
     // math (systematic under-count ~5-8%). Account for them explicitly.
@@ -935,7 +1054,8 @@ static void check_act_device(Device dev, const char* name, const Tensor& t) {
     }
 }
 
-void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
+void Model::forward_body(const i32* ids, int B, int T, Activations& act,
+                         const i32* segment_ids) {
     // FIX: fail-fast guards (training/inference crash + T4/low-PC OOM safety).
     // Old code accepted B/T<=0 -> N<=0 cast to size_t = huge alloc -> OOM,
     // and N>INT_MAX truncated to int M in linear_forward -> silent zero math.
@@ -953,6 +1073,22 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
     const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     const bool  train = act.with_grad;
     Device dev = device_;
+    if (fp16_weight_cache_ && fp16_weights_dirty_) {
+        for (Parameter* p : params_) {
+            if (!p->fp16_cache.defined()) continue;
+            ops::convert_f32_to_f16(dev, p->w.f32(), p->fp16_cache.ptr<u16>(), p->numel());
+        }
+        const i64 d = cfg_.hidden_size;
+        const i64 qd = cfg_.q_dim();
+        const i64 kvd = cfg_.kv_dim();
+        for (LayerParams& layer : layers_) {
+            u16* fused = layer.wqkv_fp16.ptr<u16>();
+            ops::convert_f32_to_f16(dev, layer.wq.w.f32(), fused, qd * d);
+            ops::convert_f32_to_f16(dev, layer.wk.w.f32(), fused + qd * d, kvd * d);
+            ops::convert_f32_to_f16(dev, layer.wv.w.f32(), fused + (qd + kvd) * d, kvd * d);
+        }
+        fp16_weights_dirty_ = false;
+    }
     // DeepSeek fail-fast: OOB ids previously trained as zero-vectors silently
     // (embedding_forward memset 0). On CPU we can check the host buffer here
     // for free vs GEMMs; on CUDA the ids live on device so the check happens
@@ -1027,14 +1163,8 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
     // ---- embeddings
     ops::embedding_forward(dev, ids, tok_emb_.w.f32(), act.x.f32(), N, d, V);
 
-    // FIX P2 (RoPE cache): theta_eff/mscale involve pow+log and were
-    // recomputed per layer (26-36x per forward) plus per-token pow inside
-    // kernels. Hoist to locals once per forward (bit-identical math).
-    const float theta_eff_fwd = rope_theta_eff(cfg_);
-    const int rope_type_fwd = cfg_.rope_type;
-    const float yarn_low_fwd = cfg_.rope_yarn_low;
-    const float yarn_high_fwd = cfg_.rope_yarn_high;
-    const float yarn_scale_fwd = cfg_.rope_scale;
+    const float* rope_freq = rope_inv_freq_ptr();
+    GAI_CHECK(rope_freq != nullptr, "forward: RoPE frequency cache is missing");
 
     for (int l = 0; l < cfg_.num_layers; ++l) {
         LayerParams& L = layers_[static_cast<size_t>(l)];
@@ -1048,9 +1178,25 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
                              rrms1, N, d, cfg_.rms_eps);
         if (train) ops::copy(dev, act.saved_xb[sl].f32(), act.xb.f32(), N * d);
 
-        ops::linear_forward(dev, act.xb.f32(), L.wq.w.f32(), act.q.f32(), static_cast<int>(N), d, qd);
-        ops::linear_forward(dev, act.xb.f32(), L.wk.w.f32(), act.k.f32(), static_cast<int>(N), d, kvd);
-        ops::linear_forward(dev, act.xb.f32(), L.wv.w.f32(), act.v.f32(), static_cast<int>(N), d, kvd);
+        float* qp = nullptr;
+        float* kp = nullptr;
+        float* vp = nullptr;
+        if (act.qkv.defined()) {
+            ops::linear_forward_fp16(dev, act.xb.f32(), L.wqkv_fp16.ptr<u16>(),
+                                     act.qkv.f32(), static_cast<int>(N), d, qd + 2 * kvd);
+            ops::split_qkv(dev, act.qkv.f32(), act.q.f32(), act.k.f32(), act.v.f32(),
+                            N, qd, kvd);
+            qp = act.q.f32();
+            kp = act.k.f32();
+            vp = act.v.f32();
+        } else {
+            qp = act.q.f32();
+            kp = act.k.f32();
+            vp = act.v.f32();
+            ops::linear_forward(dev, act.xb.f32(), L.wq.w.f32(), qp, static_cast<int>(N), d, qd);
+            ops::linear_forward(dev, act.xb.f32(), L.wk.w.f32(), kp, static_cast<int>(N), d, kvd);
+            ops::linear_forward(dev, act.xb.f32(), L.wv.w.f32(), vp, static_cast<int>(N), d, kvd);
+        }
 
         // QK-Norm (optional): per-head RMSNorm on Q/K before RoPE stabilizes
         // MoE training at 1B (prevents attention logit explosion). Layout
@@ -1059,33 +1205,34 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
         // segfault on partial alloc / stale ckpt. Require both gains.
         if (cfg_.use_qk_norm && L.qk_qnorm.w.defined() && L.qk_knorm.w.defined()) {
             if (train) {
-                ops::copy(dev, act.saved_qk_raw_q[sl].f32(), act.q.f32(), N * qd);
-                ops::copy(dev, act.saved_qk_raw_k[sl].f32(), act.k.f32(), N * kvd);
+                ops::copy(dev, act.saved_qk_raw_q[sl].f32(), qp, N * qd);
+                ops::copy(dev, act.saved_qk_raw_k[sl].f32(), kp, N * kvd);
             }
             float* rrms_q = train ? act.saved_qk_rms_q[sl].f32() : nullptr;
             float* rrms_k = train ? act.saved_qk_rms_k[sl].f32() : nullptr;
-            ops::rmsnorm_forward(dev, act.q.f32(), L.qk_qnorm.w.f32(), act.q.f32(),
+            ops::rmsnorm_forward(dev, qp, L.qk_qnorm.w.f32(), qp,
                                  rrms_q, N * H, hd, cfg_.rms_eps);
-            ops::rmsnorm_forward(dev, act.k.f32(), L.qk_knorm.w.f32(), act.k.f32(),
+            ops::rmsnorm_forward(dev, kp, L.qk_knorm.w.f32(), kp,
                                  rrms_k, N * KV, hd, cfg_.rms_eps);
         }
 
         // Pro kernels: NeoX + full YaRN ramp + SWA (DeepSeek-V3 / LLaMA-3 class).
         // Legacy path (rope_type 0, scale 1, window 0) is bit-identical to old calls.
-        ops::rope_forward_ex(dev, act.q.f32(), act.k.f32(), act.pos.i32p(), N, H, KV, hd, theta_eff_fwd,
-                             rope_type_fwd, yarn_low_fwd, yarn_high_fwd, yarn_scale_fwd);
+        ops::rope_forward_cached(dev, qp, kp, act.pos.i32p(), rope_freq, N, H, KV, hd,
+                                 cfg_.rope_type);
 
         if (train) {
-            ops::copy(dev, act.saved_q[sl].f32(), act.q.f32(), N * qd);
-            ops::copy(dev, act.saved_k[sl].f32(), act.k.f32(), N * kvd);
-            ops::copy(dev, act.saved_v[sl].f32(), act.v.f32(), N * kvd);
+            ops::copy(dev, act.saved_q[sl].f32(), qp, N * qd);
+            ops::copy(dev, act.saved_k[sl].f32(), kp, N * kvd);
+            ops::copy(dev, act.saved_v[sl].f32(), vp, N * kvd);
         }
 
         // Probs are never stored (recomputed per layer in backward).
         // nullptr here = memory-lean forward on both CPU and CUDA.
-        ops::attention_forward_ex(dev, act.q.f32(), act.k.f32(), act.v.f32(),
+        ops::attention_forward_ex(dev, qp, kp, vp,
                                   act.att_out.f32(), nullptr,
-                                  B, T, H, KV, hd, scale, cfg_.sliding_window);
+                                  B, T, H, KV, hd, scale, cfg_.sliding_window,
+                                  segment_ids);
         if (train) ops::copy(dev, act.saved_attout[sl].f32(), act.att_out.f32(), N * qd);
 
         ops::linear_forward(dev, act.att_out.f32(), L.wo.w.f32(), act.proj.f32(), static_cast<int>(N), qd, d);
@@ -1143,10 +1290,11 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act) {
     if (train) ops::copy(dev, act.saved_hnorm.f32(), act.xb.f32(), N * d);
 }
 
-Tensor& Model::forward(const i32* ids, int B, int T, Activations& act) {
+Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
+                       const i32* segment_ids) {
     // Full-[N,V] inference/eval path. Chunked training activations carry only
     // compact [Cc,V] scratch: they must go through forward_backward().
-    forward_body(ids, B, T, act);
+    forward_body(ids, B, T, act, segment_ids);
     const int d = cfg_.hidden_size;
     const int V = cfg_.vocab_size;
     const i64 N = static_cast<i64>(B) * T;
@@ -1164,7 +1312,7 @@ Tensor& Model::forward(const i32* ids, int B, int T, Activations& act) {
 // ---------------------------------------------------------------- backward
 double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                Activations& act, i64* out_ntok, float dout_scale,
-                               bool want_aux_stats) {
+                               bool want_aux_stats, const i32* segment_ids) {
     GAI_CHECK(act.with_grad, "forward_backward requires gradient activations");
     GAI_CHECK(grad_enabled_, "call enable_grad(true) before forward_backward");
 
@@ -1180,7 +1328,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     const float scale = (1.0f / std::sqrt(static_cast<float>(hd))) * rope_mscale_local(cfg_);
     Device dev = device_;
 
-    forward_body(ids, B, T, act);
+    forward_body(ids, B, T, act, segment_ids);
 
     // ---- chunked lm head + loss (roadmap item 6; with z-loss stabilizer).
     // Materializing full [N,V] logits+dlogits costs 524MB at B=2,T=1024,V=32k
@@ -1237,6 +1385,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     const bool use_dev_aux = (dev == Device::CUDA) && cfg_.use_moe &&
                              cfg_.moe_aux_scale > 0.0f;
     double* aux_accum = use_dev_aux ? ops::moe_aux_begin(dev) : nullptr;
+
+    const float* rope_freq_bwd = rope_inv_freq_ptr();
+    GAI_CHECK(rope_freq_bwd != nullptr, "backward: RoPE frequency cache is missing");
 
     // ---- final norm
     ops::zero(dev, act.dx.f32(), N * d);
@@ -1330,16 +1481,16 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         ops::attention_forward_ex(dev, act.saved_q[sl].f32(), act.saved_k[sl].f32(),
                                   act.saved_v[sl].f32(), act.att_out.f32(),
                                   act.attn_probs_tmp.f32(),
-                                  B, T, H, KV, hd, scale, cfg_.sliding_window);
+                                  B, T, H, KV, hd, scale, cfg_.sliding_window,
+                                  segment_ids);
         ops::attention_backward_ex(dev, act.saved_q[sl].f32(), act.saved_k[sl].f32(),
                                    act.saved_v[sl].f32(), act.attn_probs_tmp.f32(),
                                    act.dattout.f32(),
                                    act.dq.f32(), act.dk.f32(), act.dv.f32(),
                                    B, T, H, KV, hd, scale, cfg_.sliding_window);
 
-        const float theta_eff_bwd = rope_theta_eff(cfg_);
-        ops::rope_backward_ex(dev, act.dq.f32(), act.dk.f32(), act.pos.i32p(), N, H, KV, hd, theta_eff_bwd,
-                              cfg_.rope_type, cfg_.rope_yarn_low, cfg_.rope_yarn_high, cfg_.rope_scale);
+        ops::rope_backward_cached(dev, act.dq.f32(), act.dk.f32(), act.pos.i32p(), rope_freq_bwd,
+                                  N, H, KV, hd, cfg_.rope_type);
 
         // QK-Norm backward (exact, using saved pre-norm Q/K):
         // dq/dk hold dL/d(normed Q/K) from rope_backward. rmsnorm_backward does dx+=f(dout), so
@@ -1485,6 +1636,7 @@ bool Model::load_raw(const std::string& path) {
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
         p->w.copy_from(cpu);
     }
+    if (fp16_weight_cache_) enable_fp16_weight_cache(true);
     return true;
 }
 

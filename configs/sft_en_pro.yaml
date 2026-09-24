@@ -49,6 +49,7 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true
+  fp16_weight_cache: true
   loss_scale_init: 16384
   loss_scale_window: 2000
   batch_size: 2
@@ -67,7 +68,7 @@ training:
   beta2: 0.95
   eps: 1.0e-8
   grad_clip: 1.0
-  seed: 42
+  seed: 137
   log_every: 10
   eval_every: 250
   eval_batches: 15
@@ -80,6 +81,7 @@ training:
   freeze_embeddings: false
   activation_checkpointing: true
   ckpt_segments: 2
+  pack_sequences: true
 
 data:
   data_dir: artifacts/shards_en

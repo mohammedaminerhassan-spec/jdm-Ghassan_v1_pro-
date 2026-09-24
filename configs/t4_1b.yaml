@@ -83,6 +83,7 @@ training:
   resume: auto
   activation_checkpointing: false   # B==1: no effect, grad_accum does the work
   ckpt_segments: 1
+  pack_sequences: true
   ddp: true                  # 4x T4 data-parallel (NCCL) — for train_4xt4.sh only.
                              # Single-GPU runs refuse DDP loudly; use
                              # configs/en_pro.yaml via kaggle/train_1b.sh instead.

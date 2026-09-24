@@ -83,6 +83,7 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     else t.param_dtype = DType::F32;
     // compute GEMMs in fp16 on CUDA tensor cores (weights/grads stay fp32)
     t.gemm_fp16          = c.get_bool("training.gemm_fp16", t.gemm_fp16);
+    t.fp16_weight_cache  = c.get_bool("training.fp16_weight_cache", t.fp16_weight_cache);
     t.loss_scale_init    = static_cast<double>(c.get_f32("training.loss_scale_init",
                                                          static_cast<float>(t.loss_scale_init)));
     t.loss_scale_window  = static_cast<int>(c.get_int("training.loss_scale_window",
@@ -140,6 +141,8 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.ce_chunks = static_cast<int>(c.get_int("training.ce_chunks", t.ce_chunks));
     if (t.ce_chunks <= 0) t.ce_chunks = 1;
     if (t.ce_chunks > 32) t.ce_chunks = 32;
+    // Phase 1A: sequence packing (default off — safe for existing shards).
+    t.pack_sequences = c.get_bool("training.pack_sequences", false);
     t.ddp = c.get_bool("training.ddp", false);
 
     // P2-5: data.train_glob/val_glob ("<dir>/<prefix>*.gbin") used to be
@@ -222,14 +225,16 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
             "training.warmup_steps", "training.optimizer", "training.scheduler",
             "training.sched_decay_frac", "training.weight_decay", "training.beta1",
             "training.beta2", "training.eps", "training.grad_clip",
-            "training.precision", "training.gemm_fp16", "training.loss_scale_init",
+             "training.precision", "training.gemm_fp16", "training.fp16_weight_cache",
+             "training.loss_scale_init",
             "training.loss_scale_window", "training.log_every", "training.eval_every",
             "training.eval_batches", "training.save_every", "training.checkpoint_dir",
             "training.resume", "training.seed", "training.device", "training.stage",
             "training.pretrained_checkpoint", "training.allow_no_pretrained",
             "training.allow_recipe_drift",
             "training.freeze_embeddings", "training.activation_checkpointing",
-            "training.ckpt_segments", "training.ce_chunks", "training.ddp",
+             "training.ckpt_segments", "training.ce_chunks", "training.pack_sequences",
+             "training.ddp",
             "data.data_dir",
             "data.train_glob", "data.val_glob", "data.train_prefix", "data.val_prefix",
         };
@@ -470,7 +475,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                         (unsigned long long)train_seed, (unsigned long long)cfg_.seed));
     }
 #endif
-    BatchSpec spec{cfg_.batch_size, cfg_.seq_len};
+    BatchSpec spec{cfg_.batch_size, cfg_.seq_len, cfg_.pack_sequences};
     bool opened = false;
     if (!cfg_.mix.empty()) {
         // Prefer domain-weighted sampling when train_<domain>_*.gbin exists.
@@ -484,6 +489,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             GAI_FAIL("no training shards found in " + cfg_.data_dir +
                      " (expected " + cfg_.train_prefix + "*.gbin)");
         }
+    }
+    if (cfg_.is_sft()) {
+        GAI_CHECK(train_loader_.all_shards_have_mask(),
+                  "SFT training shards must contain an assistant-span loss mask");
     }
     have_val_ = val_loader_.open_glob(cfg_.data_dir, cfg_.val_prefix, spec, val_seed);
 
@@ -554,6 +563,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 
     dev_ids_ = Tensor::empty({static_cast<i64>(cfg_.batch_size) * cfg_.seq_len}, DType::I32, model_.device());
     dev_targets_ = Tensor::empty({static_cast<i64>(cfg_.batch_size) * cfg_.seq_len}, DType::I32, model_.device());
+    dev_segments_ = Tensor::empty({static_cast<i64>(cfg_.batch_size) * cfg_.seq_len}, DType::I32, model_.device());
 
     // ---- activation checkpointing via batch-splitting (T4 path)
     // (use_ckpt_ resolved above, before arena allocation)
@@ -568,6 +578,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         ckpt_act_ = model_.make_activations(segB, cfg_.seq_len, true, cfg_.ce_chunks);
         ckpt_ids_ = Tensor::empty({static_cast<i64>(segB) * cfg_.seq_len}, DType::I32, model_.device());
         ckpt_targets_ = Tensor::empty({static_cast<i64>(segB) * cfg_.seq_len}, DType::I32, model_.device());
+        ckpt_segments_ = Tensor::empty({static_cast<i64>(segB) * cfg_.seq_len}, DType::I32, model_.device());
         log_info(strfmt("[ckpt-act] ON: micro-batch %d split into segments of B=%d (peak act ~1/%d, grads identical)",
                         cfg_.batch_size, segB, seg));
     }
@@ -590,7 +601,8 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         // full arena is no longer allocated in checkpoint mode).
         size_t live_train_act = act_.bytes + (use_ckpt_ ? ckpt_act_.bytes : 0);
         size_t peak_act = live_train_act;
-        size_t need_core = params * 8 + opt_state_bytes() + peak_act + eval_act_.bytes;
+        size_t fp16_cache = cfg_.fp16_weight_cache ? static_cast<size_t>(params * 2) : 0;
+        size_t need_core = params * 8 + fp16_cache + opt_state_bytes() + peak_act + eval_act_.bytes;
         // params*8 = weights+grads fp32; opt = m+v (adamw) or m (lion); + train/eval acts.
         // Note: with DDP, each GPU has its own full copy of weights/grads/opt state.
         size_t slack = (1024ull << 20); // 1GB: ctx + workspaces + frag (pools are tight now)
@@ -659,12 +671,6 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         bool ok = use_muon_ ? Checkpoint::load(resume_path, model_, opt_muon_.get(), state_, &moments_restored)
                     : use_lion_ ? Checkpoint::load(resume_path, model_, opt_lion_.get(), state_, &moments_restored)
                                 : Checkpoint::load(resume_path, model_, opt_adam_.get(), state_, &moments_restored);
-        // FIX P2 (aux-free bias not checkpointed): .ckpt carries no EMA bias
-        // vector, so resuming an aux-free run silently resets router balance.
-        // Fail loud unless the user explicitly opts into GGUF-only handoff.
-        if (ok && model_.config().moe_aux_free)
-            log_warn("[ckpt] moe_aux_free=true: router EMA bias is NOT in .ckpt "
-                     "(resets to 0 on resume; use GGUF for aux-free handoff or accept rebalance)");
         if (ok) {
             // DeepSeek resume rule: bias-correction t_ must match moments.
             // Fresh moments + t_=N => m_hat≈(1-b)*g (~10x too small first
@@ -721,6 +727,16 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             log_warn("[ckpt] failed to load " + resume_path + "; model reset before scratch run");
         }
     }
+    if (cfg_.fp16_weight_cache) {
+        model_.enable_fp16_weight_cache(true);
+        log_info(strfmt("[prec] persistent fp16 weight cache: %s",
+                        human_bytes(model_.fp16_weight_cache_bytes()).c_str()));
+    }
+}
+
+Trainer::~Trainer() {
+    stop_prefetch();
+    stop_ckpt_writer();
 }
 
 float Trainer::scaler_for_step() {
@@ -769,10 +785,11 @@ double Trainer::forward_backward_micro(const Batch& batch, float dscale, i64* ou
         i64 N = static_cast<i64>(batch.B) * batch.T;
         device_copy(dev_ids_.data_ptr(), model_.device(), batch.ids.data(), Device::CPU, N * sizeof(i32));
         device_copy(dev_targets_.data_ptr(), model_.device(), batch.targets.data(), Device::CPU, N * sizeof(i32));
+        device_copy(dev_segments_.data_ptr(), model_.device(), batch.segment_ids.data(), Device::CPU, N * sizeof(i32));
         i64 ntok = 0;
         double l = model_.forward_backward(dev_ids_.i32p(), dev_targets_.i32p(),
                                            batch.B, batch.T, act_, &ntok, dscale,
-                                           want_aux_stats);
+                                           want_aux_stats, dev_segments_.i32p());
         if (frozen_emb_ && frozen_emb_->g.defined()) frozen_emb_->g.zero_();
         if (out_ntok) *out_ntok = ntok;
         return l;
@@ -787,26 +804,17 @@ double Trainer::forward_backward_micro(const Batch& batch, float dscale, i64* ou
     for (int b0 = 0; b0 < B; b0 += segB) {
         int curB = std::min(segB, B - b0);
         i64 curN = static_cast<i64>(curB) * T;
-        // gather slice [b0, b0+curB) from CPU batch into contiguous CPU staging
-        // (batch layout is [B,T] row-major, so each row is contiguous)
-        if (ckpt_staging_ids_.size() < static_cast<size_t>(curN)) {
-            ckpt_staging_ids_.resize(static_cast<size_t>(curN));
-            ckpt_staging_tgt_.resize(static_cast<size_t>(curN));
-        }
-        i32* slice_ids = ckpt_staging_ids_.data();
-        i32* slice_tgt = ckpt_staging_tgt_.data();
-        for (int b = 0; b < curB; ++b) {
-            size_t src = static_cast<size_t>(b0 + b) * static_cast<size_t>(T);
-            size_t dst = static_cast<size_t>(b) * static_cast<size_t>(T);
-            std::memcpy(slice_ids + dst, batch.ids.data() + src, sizeof(i32) * static_cast<size_t>(T));
-            std::memcpy(slice_tgt + dst, batch.targets.data() + src, sizeof(i32) * static_cast<size_t>(T));
-        }
-        device_copy(ckpt_ids_.data_ptr(), model_.device(), slice_ids, Device::CPU, static_cast<size_t>(curN) * sizeof(i32));
-        device_copy(ckpt_targets_.data_ptr(), model_.device(), slice_tgt, Device::CPU, static_cast<size_t>(curN) * sizeof(i32));
+        size_t src = static_cast<size_t>(b0) * static_cast<size_t>(T);
+        device_copy(ckpt_ids_.data_ptr(), model_.device(), batch.ids.data() + src, Device::CPU,
+                    static_cast<size_t>(curN) * sizeof(i32));
+        device_copy(ckpt_targets_.data_ptr(), model_.device(), batch.targets.data() + src, Device::CPU,
+                    static_cast<size_t>(curN) * sizeof(i32));
+        device_copy(ckpt_segments_.data_ptr(), model_.device(), batch.segment_ids.data() + src, Device::CPU,
+                    static_cast<size_t>(curN) * sizeof(i32));
         i64 ntok = 0;
         double l = model_.forward_backward(ckpt_ids_.i32p(), ckpt_targets_.i32p(),
                                            curB, T, ckpt_act_, &ntok, dscale,
-                                           want_aux_stats);
+                                           want_aux_stats, ckpt_segments_.i32p());
         if (frozen_emb_ && frozen_emb_->g.defined()) frozen_emb_->g.zero_();
         loss_num += l * static_cast<double>(ntok);
         ntok_tot += ntok;
@@ -826,8 +834,9 @@ double Trainer::evaluate(i64 max_batches) {
         i64 N = static_cast<i64>(batch.B) * batch.T;
         device_copy(dev_ids_.data_ptr(), model_.device(), batch.ids.data(), Device::CPU, N * sizeof(i32));
         device_copy(dev_targets_.data_ptr(), model_.device(), batch.targets.data(), Device::CPU, N * sizeof(i32));
-        
-        Tensor& logits = model_.forward(dev_ids_.i32p(), batch.B, batch.T, eval_act_);
+        device_copy(dev_segments_.data_ptr(), model_.device(), batch.segment_ids.data(), Device::CPU, N * sizeof(i32));
+
+        Tensor& logits = model_.forward(dev_ids_.i32p(), batch.B, batch.T, eval_act_, dev_segments_.i32p());
         double sum = 0.0;
         i64 n = 0;
         // DeepSeek eval parity: train adds z_loss*logZ^2 (1e-4 in all MoE
@@ -878,46 +887,55 @@ void Trainer::opt_set_step(i64 t) {
 }
 
 void Trainer::save(const std::string& name) {
-    // P0-04 FIX: rank-0-only writes. Old code let 4 ranks race on the same
-    // last.ckpt.tmp -> last.ckpt (corruption/rename failures). Now only the
-    // main rank writes; others barrier (their weights are bit-identical after
-    // synced optimizer steps, and loader state is rank-specific so resume is
-    // defined as rank0's stream — documented in logs).
-    // NOTE: loader state saved is the MAIN rank's stream. Resuming multi-GPU
-    // continues each rank from base_seed+rank salt (deterministic), not from
-    // an exact 4-way offset — global ordering stays disjoint, exact cross-
-    // session bit-continuation of all 4 streams is not claimed (see §10).
     if (!is_main_rank()) {
 #ifdef GAI_CUDA
         if (dist_ && dist_->world_size() > 1) dist_->barrier();
 #endif
         return;
     }
-    state_.loader = train_loader_.get_state();
-    state_.loss_scale = loss_scale_;
-    state_.clean_steps = clean_steps_;
-    state_.tok_vocab = model_.config().vocab_size;
-    // v8 scheduler snapshot (see Checkpoint): total/warmup/peak/min/decay/kind
-    // so a resumed run with a different schedule warns instead of reshaping past LR.
-    state_.sched_total = total_steps_ > 0 ? total_steps_ : sched_.total();
-    state_.sched_warmup = sched_.warmup();
-    state_.sched_peak = sched_.peak();
-    state_.sched_min_ratio = cfg_.min_lr_ratio;
-    state_.sched_decay_frac = cfg_.sched_decay_frac;
-    state_.sched_kind = (cfg_.scheduler == "wsd") ? 1 : 0;
-    {
-        int ws = 1;
+
+    quiesce_prefetch();
+    try {
+        state_.loader = train_loader_.get_state();
+        state_.loss_scale = loss_scale_;
+        state_.clean_steps = clean_steps_;
+        state_.tok_vocab = model_.config().vocab_size;
+        state_.sched_total = total_steps_ > 0 ? total_steps_ : sched_.total();
+        state_.sched_warmup = sched_.warmup();
+        state_.sched_peak = sched_.peak();
+        state_.sched_min_ratio = cfg_.min_lr_ratio;
+        state_.sched_decay_frac = cfg_.sched_decay_frac;
+        state_.sched_kind = (cfg_.scheduler == "wsd") ? 1 : 0;
+        {
+            int ws = 1;
 #ifdef GAI_CUDA
-        if (dist_ && dist_->world_size() > 1) ws = dist_->world_size();
+            if (dist_ && dist_->world_size() > 1) ws = dist_->world_size();
 #endif
-        state_.ddp_world = ws;
+            state_.ddp_world = ws;
+        }
+        if (!snapshot_cache_ || snapshot_step_ != state_.step) {
+            if (use_muon_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                Checkpoint::capture(model_, *opt_muon_, state_));
+            else if (use_lion_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                Checkpoint::capture(model_, *opt_lion_, state_));
+            else snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                Checkpoint::capture(model_, *opt_adam_, state_));
+            snapshot_step_ = state_.step;
+        }
+    } catch (...) {
+        resume_prefetch();
+        throw;
     }
-    std::string path = (fs::path(cfg_.checkpoint_dir) / name).string();
-    Timer t;
-    if (use_muon_) Checkpoint::save(path, model_, *opt_muon_, state_);
-    else if (use_lion_) Checkpoint::save(path, model_, *opt_lion_, state_);
-    else Checkpoint::save(path, model_, *opt_adam_, state_);
-    log_info(strfmt("[ckpt] saved %s (%s)", path.c_str(), human_duration(t.seconds()).c_str()));
+    resume_prefetch();
+
+    const std::string path = (fs::path(cfg_.checkpoint_dir) / name).string();
+    std::shared_ptr<CheckpointSnapshot> snapshot = snapshot_cache_;
+    save_async([path, snapshot]() {
+        Timer t;
+        Checkpoint::save(*snapshot, path);
+        log_info(strfmt("[ckpt] saved %s (%s)", path.c_str(),
+                        human_duration(t.seconds()).c_str()));
+    });
 #ifdef GAI_CUDA
     if (dist_ && dist_->world_size() > 1) dist_->barrier();
 #endif
@@ -1023,6 +1041,11 @@ void Trainer::run_pretrain() {
     Batch batch;
     Timer step_timer;
 
+    // Phase 1C: start async prefetch; Phase 1D: start background ckpt writer.
+    start_prefetch();
+    start_ckpt_writer();
+    // Prime the first prefetch (prefetch thread already called next() into slot).
+
     while (state_.step < total_steps_) {
         step_timer.reset();
         model_.zero_grad();
@@ -1048,10 +1071,10 @@ void Trainer::run_pretrain() {
         int    micro_done = 0;
 
         for (int micro = 0; micro < cfg_.grad_accum; ++micro) {
-            // NOTE: the loader samples random windows indefinitely (with
-            // replacement); next() only fails when NO shards exist at all.
-            // See §10: this is a stochastic token budget, not classic epochs.
-            if (!train_loader_.next(batch)) {
+            // Phase 1C: next_train_batch() returns the prefetched batch and
+            // immediately triggers the background thread to load the next one,
+            // so the GPU is never idle waiting for disk I/O.
+            if (!next_train_batch(batch)) {
                 GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
             }
 
@@ -1081,6 +1104,7 @@ void Trainer::run_pretrain() {
         if (ntok_global > 0) {
             float grad_scale = 1.0f / (static_cast<float>(ntok_global) * dscale);
             gnorm = opt_step(lr, grad_scale);
+            model_.mark_weights_dirty();
         } else {
             static int warned_empty = 0;
             if (warned_empty++ < 3)
@@ -1133,11 +1157,16 @@ void Trainer::run_pretrain() {
         }
     }
 
+    // Phase 1C: stop prefetch thread before final save.
+    stop_prefetch();
     // FIX P1-6: skip the unconditional final save when the loop just saved
     // (worst case was a double ~8-12GB write on the same step: best.ckpt
     // inside eval + last.ckpt on cadence + last.ckpt here).
     if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
         save("last.ckpt");
+    // Phase 1D: drain the async writer before printing the done line.
+    wait_for_save();
+    stop_ckpt_writer();
     log_info(strfmt("---------------- pretrain done: %lld steps, %s tokens, %s --------------------",
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
@@ -1162,6 +1191,10 @@ void Trainer::run_sft() {
     Batch batch;
     Timer step_timer;
 
+    // Phase 1C+1D: start prefetch + background ckpt writer for SFT loop.
+    start_prefetch();
+    start_ckpt_writer();
+
     while (state_.step < total_steps_) {
         step_timer.reset();
         model_.zero_grad();
@@ -1183,7 +1216,7 @@ void Trainer::run_sft() {
         int    micro_done = 0;
 
         for (int micro = 0; micro < cfg_.grad_accum; ++micro) {
-            if (!train_loader_.next(batch)) {
+            if (!next_train_batch(batch)) {
                 GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
             }
 
@@ -1210,6 +1243,7 @@ void Trainer::run_sft() {
         if (ntok_global > 0) {
             float grad_scale = 1.0f / (static_cast<float>(ntok_global) * dscale);
             gnorm = opt_step(lr, grad_scale);
+            model_.mark_weights_dirty();
         } else {
             static int warned_empty_sft = 0;
             if (warned_empty_sft++ < 3)
@@ -1254,9 +1288,14 @@ void Trainer::run_sft() {
         }
     }
 
+    // Phase 1C: stop prefetch thread before final save.
+    stop_prefetch();
     // FIX P1-6 (SFT mirror): skip redundant final save (see pretrain loop).
     if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
         save("last.ckpt");
+    // Phase 1D: drain async writer.
+    wait_for_save();
+    stop_ckpt_writer();
     log_info(strfmt("---------------- SFT done: %lld steps, %s tokens, %s --------------------",
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
@@ -1433,6 +1472,188 @@ i64 Trainer::sync_ntok_sum(i64 local) {
     (void)dist_;
     return local > 0 ? local : 0;
 #endif
+}
+
+// ============================================================
+// Phase 1D — Background Checkpoint Writer
+// ============================================================
+// save_async() captures the current TrainState + loader/optimizer snapshot by
+// value inside a closure and enqueues it. If a previous write is still queued
+// (not yet started), it is replaced by the newer one (we always want the
+// freshest checkpoint). The writer thread blocks until it has work, executes
+// the closure, then sleeps again. wait_for_save() drains the queue before the
+// training run exits so no data is lost on Kaggle preemption.
+
+void Trainer::start_ckpt_writer() {
+    if (ckpt_writer_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+        ckpt_stop_ = false;
+        ckpt_failed_ = false;
+        ckpt_error_.clear();
+    }
+    ckpt_writer_thread_ = std::thread([this]() {
+        while (true) {
+            std::function<void()> fn;
+            {
+                std::unique_lock<std::mutex> lk(ckpt_mutex_);
+                ckpt_cv_.wait(lk, [this] { return !pending_saves_.empty() || ckpt_stop_; });
+                if (pending_saves_.empty() && ckpt_stop_) break;
+                fn = std::move(pending_saves_.front());
+                pending_saves_.pop_front();
+                ckpt_busy_ = true;
+            }
+            if (fn) {
+                try {
+                    fn();
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                    ckpt_failed_ = true;
+                    ckpt_error_ = e.what();
+                    log_warn(std::string("[ckpt-async] write failed: ") + e.what());
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                    ckpt_failed_ = true;
+                    ckpt_error_ = "unknown checkpoint write failure";
+                    log_warn("[ckpt-async] write failed with unknown exception");
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                ckpt_busy_ = false;
+            }
+            ckpt_cv_.notify_all();
+        }
+    });
+}
+
+void Trainer::stop_ckpt_writer() {
+    {
+        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+        ckpt_stop_ = true;
+    }
+    ckpt_cv_.notify_all();
+    if (ckpt_writer_thread_.joinable()) ckpt_writer_thread_.join();
+}
+
+void Trainer::save_async(std::function<void()> fn) {
+    GAI_CHECK(ckpt_writer_thread_.joinable(), "checkpoint writer is not running");
+    {
+        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+        pending_saves_.push_back(std::move(fn));
+    }
+    ckpt_cv_.notify_one();
+}
+
+void Trainer::wait_for_save() {
+    std::unique_lock<std::mutex> lk(ckpt_mutex_);
+    ckpt_cv_.wait(lk, [this]{ return pending_saves_.empty() && !ckpt_busy_; });
+    if (ckpt_failed_) GAI_FAIL("checkpoint save failed: " + ckpt_error_);
+}
+
+// ============================================================
+// Phase 1C — Async Prefetch DataLoader
+// ============================================================
+// start_prefetch() spawns a thread that calls train_loader_.next() in the
+// background and signals prefetch_ready_ when done. next_train_batch() swaps
+// in the ready buffer and immediately enqueues the next prefetch so the GPU
+// is never idle waiting for disk I/O. Thread-safety: train_loader_ is accessed
+// only by this thread after training starts (the main thread uses
+// next_train_batch instead of train_loader_.next directly).
+
+void Trainer::start_prefetch() {
+    {
+        std::lock_guard<std::mutex> lk(prefetch_mutex_);
+        if (prefetch_running_) return;
+        prefetch_ready_ = false;
+        prefetch_stop_ = false;
+        prefetch_pause_ = false;
+        prefetch_in_io_ = false;
+        prefetch_running_ = true;
+    }
+    prefetch_thread_ = std::thread([this]() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(prefetch_mutex_);
+            prefetch_cv_.wait(lk, [this] {
+                return prefetch_stop_ || (!prefetch_pause_ && !prefetch_ready_);
+            });
+            if (prefetch_stop_) break;
+            prefetch_in_io_ = true;
+            lk.unlock();
+
+            bool ok = false;
+            try {
+                ok = train_loader_.next(prefetch_batch_);
+            } catch (const std::exception&) {
+                std::lock_guard<std::mutex> fail_lock(prefetch_mutex_);
+                prefetch_stop_ = true;
+                prefetch_ready_ = false;
+                break;
+            }
+
+            lk.lock();
+            prefetch_in_io_ = false;
+            if (prefetch_stop_) break;
+            prefetch_ready_ = ok;
+            lk.unlock();
+            prefetch_cv_.notify_all();
+
+            lk.lock();
+            prefetch_cv_.wait(lk, [this] {
+                return prefetch_stop_ || prefetch_pause_ || !prefetch_ready_;
+            });
+            if (prefetch_stop_) break;
+        }
+        std::lock_guard<std::mutex> done_lock(prefetch_mutex_);
+        prefetch_in_io_ = false;
+        prefetch_running_ = false;
+    });
+}
+
+void Trainer::stop_prefetch() {
+    {
+        std::lock_guard<std::mutex> lk(prefetch_mutex_);
+        if (!prefetch_running_ && !prefetch_thread_.joinable()) return;
+        prefetch_stop_ = true;
+        prefetch_pause_ = false;
+        prefetch_ready_ = false;
+    }
+    prefetch_cv_.notify_all();
+    if (prefetch_thread_.joinable()) prefetch_thread_.join();
+    std::lock_guard<std::mutex> lk(prefetch_mutex_);
+    prefetch_running_ = false;
+}
+
+void Trainer::quiesce_prefetch() {
+    std::unique_lock<std::mutex> lk(prefetch_mutex_);
+    if (!prefetch_running_) return;
+    prefetch_pause_ = true;
+    prefetch_cv_.wait(lk, [this] { return !prefetch_in_io_; });
+}
+
+void Trainer::resume_prefetch() {
+    {
+        std::lock_guard<std::mutex> lk(prefetch_mutex_);
+        if (!prefetch_running_) return;
+        prefetch_pause_ = false;
+    }
+    prefetch_cv_.notify_all();
+}
+
+bool Trainer::next_train_batch(Batch& out) {
+    {
+        std::unique_lock<std::mutex> lk(prefetch_mutex_);
+        if (!prefetch_running_) {
+            lk.unlock();
+            return train_loader_.next(out);
+        }
+        prefetch_cv_.wait(lk, [this] { return prefetch_ready_ || prefetch_stop_; });
+        if (!prefetch_ready_) GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
+        out = std::move(prefetch_batch_);
+        prefetch_ready_ = false;
+    }
+    prefetch_cv_.notify_all();
+    return true;
 }
 
 } // namespace gai

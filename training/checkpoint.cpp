@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <unordered_set>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -24,10 +25,14 @@ static constexpr u32 CKPT_MAGIC   = 0x54504B47u;   // "GKPT"
 //     past lr_at(N). Loader accepts v3..v8; v<8 gets sched_total=0 (unknown).
 // v9 (Pro): persists moe_aux_free + rope_yarn_low/high + sliding_window +
 //     rope_type. Loader accepts v3..v9; v<=8 files get Pro defaults (off).
-static constexpr u32 CKPT_VERSION = 9u;
+static constexpr u32 CKPT_VERSION = 10u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
+
+static bool checkpoint_version_supported(u32 version) {
+    return version >= 3u && version <= CKPT_VERSION;
+}
 
 template <typename T> static void wr(std::ostream& o, const T& v) {
     o.write(reinterpret_cast<const char*>(&v), sizeof(T));
@@ -186,78 +191,154 @@ static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
     return true;
 }
 
+static CheckpointSnapshot capture_common(const Model& model, const TrainState& state) {
+    CheckpointSnapshot snapshot;
+    snapshot.config = model.config();
+    snapshot.state = state;
+    snapshot.weights.reserve(model.parameters().size());
+    snapshot.parameter_names.reserve(model.parameters().size());
+    for (const Parameter* p : model.parameters()) {
+        Tensor cpu = p->w.device() == Device::CPU ? p->w.clone() : p->w.to(Device::CPU);
+        snapshot.weights.push_back(std::move(cpu));
+        snapshot.parameter_names.push_back(p->name);
+    }
+    snapshot.moe_bias = model.moe_bias_all();
+    return snapshot;
+}
+
+CheckpointSnapshot Checkpoint::capture(const Model& model,
+                                       const AdamW& opt,
+                                       const TrainState& state) {
+    CheckpointSnapshot snapshot = capture_common(model, state);
+    snapshot.optimizer = opt.snapshot_state();
+    return snapshot;
+}
+
+CheckpointSnapshot Checkpoint::capture(const Model& model,
+                                       const Lion& opt,
+                                       const TrainState& state) {
+    CheckpointSnapshot snapshot = capture_common(model, state);
+    snapshot.optimizer = opt.snapshot_state();
+    return snapshot;
+}
+
+CheckpointSnapshot Checkpoint::capture(const Model& model,
+                                       const Muon& opt,
+                                       const TrainState& state) {
+    CheckpointSnapshot snapshot = capture_common(model, state);
+    snapshot.optimizer = opt.snapshot_state();
+    return snapshot;
+}
+
+static void write_optimizer_snapshot(std::ostream& f, const OptimizerStateSnapshot& opt) {
+    const u8 fmt = 1;
+    const i64 step = opt.step;
+    const size_t count = opt.first.size();
+    switch (opt.kind) {
+        case OptimizerSnapshotKind::AdamW:
+            f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            f.write(reinterpret_cast<const char*>(&step), sizeof(step));
+            f.write(reinterpret_cast<const char*>(&fmt), sizeof(fmt));
+            wr(f, opt.adamw.lr); wr(f, opt.adamw.beta1); wr(f, opt.adamw.beta2);
+            wr(f, opt.adamw.eps); wr(f, opt.adamw.weight_decay); wr(f, opt.adamw.grad_clip);
+            for (size_t i = 0; i < count; ++i) {
+                u8 has = opt.first[i].defined() ? 1 : 0;
+                wr(f, has);
+                if (!has) continue;
+                u64 ne = static_cast<u64>(opt.first[i].numel());
+                wr(f, ne);
+                f.write(reinterpret_cast<const char*>(opt.first[i].data_ptr()),
+                        static_cast<std::streamsize>(opt.first[i].nbytes()));
+                f.write(reinterpret_cast<const char*>(opt.second[i].data_ptr()),
+                        static_cast<std::streamsize>(opt.second[i].nbytes()));
+            }
+            break;
+        case OptimizerSnapshotKind::Lion:
+            f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            f.write(reinterpret_cast<const char*>(&step), sizeof(step));
+            f.write(reinterpret_cast<const char*>(&fmt), sizeof(fmt));
+            wr(f, opt.lion.lr); wr(f, opt.lion.beta1); wr(f, opt.lion.beta2);
+            wr(f, opt.lion.weight_decay); wr(f, opt.lion.grad_clip);
+            for (const Tensor& t : opt.first) {
+                u8 has = t.defined() ? 1 : 0;
+                wr(f, has);
+                if (!has) continue;
+                u64 ne = static_cast<u64>(t.numel());
+                wr(f, ne);
+                f.write(reinterpret_cast<const char*>(t.data_ptr()),
+                        static_cast<std::streamsize>(t.nbytes()));
+            }
+            break;
+        case OptimizerSnapshotKind::Muon:
+            f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            f.write(reinterpret_cast<const char*>(&step), sizeof(step));
+            f.write(reinterpret_cast<const char*>(&fmt), sizeof(fmt));
+            wr(f, opt.muon.lr); wr(f, opt.muon.vec_lr_ratio); wr(f, opt.muon.beta1);
+            wr(f, opt.muon.beta2); wr(f, opt.muon.eps); wr(f, opt.muon.weight_decay);
+            wr(f, opt.muon.grad_clip);
+            {
+                i32 ns = opt.muon.ns_steps;
+                wr(f, ns);
+            }
+            for (size_t i = 0; i < count; ++i) {
+                u8 mask = 0;
+                if (opt.first[i].defined()) mask |= 1u;
+                if (i < opt.second.size() && opt.second[i].defined()) mask |= 2u;
+                wr(f, mask);
+                if (mask & 1u) {
+                    u64 ne = static_cast<u64>(opt.first[i].numel());
+                    wr(f, ne);
+                    f.write(reinterpret_cast<const char*>(opt.first[i].data_ptr()),
+                            static_cast<std::streamsize>(opt.first[i].nbytes()));
+                }
+                if (mask & 2u) {
+                    u64 ne = static_cast<u64>(opt.second[i].numel());
+                    wr(f, ne);
+                    f.write(reinterpret_cast<const char*>(opt.second[i].data_ptr()),
+                            static_cast<std::streamsize>(opt.second[i].nbytes()));
+                }
+            }
+            break;
+        case OptimizerSnapshotKind::None:
+            break;
+    }
+}
+
+static void publish_file(const std::string& path, const std::string& tmp) {
+    const fs::path target(path);
+    const fs::path staged(tmp);
+    const fs::path backup(path + ".bak");
+    GAI_CHECK(target != staged, "checkpoint temp path aliases destination");
+    std::error_code ec;
+    if (fs::exists(target, ec) && !ec) {
+        GAI_CHECK(!fs::is_directory(target, ec), "checkpoint path is a directory: " + path);
+        if (fs::exists(backup, ec) && !ec) {
+            fs::remove(backup, ec);
+            GAI_CHECK(!ec, "cannot clear stale checkpoint backup: " + ec.message());
+        }
+        fs::rename(target, backup, ec);
+        GAI_CHECK(!ec, "cannot stage previous checkpoint: " + ec.message());
+    }
+    fs::rename(staged, target, ec);
+    if (ec) {
+        const std::string reason = ec.message();
+        std::error_code restore_ec;
+        if (fs::exists(backup, restore_ec) && !restore_ec) fs::rename(backup, target, restore_ec);
+        GAI_CHECK(false, "cannot finalise checkpoint: " + reason);
+    }
+    fs::remove(backup, ec);
+    if (ec) log_warn("checkpoint backup cleanup failed: " + ec.message());
+}
+
 void Checkpoint::save(const std::string& path, const Model& model,
                       const AdamW& opt, const TrainState& state) {
-    fs::path p(path);
-    if (p.has_parent_path()) fs::create_directories(p.parent_path());
-
-    // write to a temp file then rename: a crash mid-write never corrupts the
-    // last good checkpoint.
-    std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        GAI_CHECK(f.good(), "cannot write checkpoint: " + tmp);
-
-        wr(f, CKPT_MAGIC);
-        wr(f, CKPT_VERSION);
-        wr_config(f, model.config());
-        wr(f, state.step);
-        wr(f, state.tokens_seen);
-        wr(f, state.best_val);
-        wr(f, state.last_loss);
-        wr(f, state.seed);
-        wr_loader_v5(f, state.loader);
-        wr(f, state.loss_scale);
-        wr(f, state.clean_steps);
-        wr(f, state.tok_vocab);
-        wr_sched_v8(f, state);
-
-        // weights
-        const auto& params = const_cast<Model&>(model).parameters();
-        u64 n = static_cast<u64>(params.size());
-        wr(f, n);
-        for (const Parameter* pp : params) {
-            u32 len = static_cast<u32>(pp->name.size());
-            wr(f, len);
-            f.write(pp->name.data(), len);
-            u64 ne = static_cast<u64>(pp->numel());
-            wr(f, ne);
-            Tensor cpu = pp->w.to(Device::CPU);
-            f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
-                    static_cast<std::streamsize>(cpu.nbytes()));
-        }
-
-        u8 has_opt = 1;
-        wr(f, has_opt);
-        u8 kind = OPT_ADAMW;
-        wr(f, kind);
-        opt.save_state(f);
-
-        GAI_CHECK(f.good(), "checkpoint write failed");
-        f.flush();
-        // NOTE: f closes here (RAII) BEFORE rename below — data is on disk.
-    }
-    // FIX: atomic publish. Old code did remove(path)+rename(tmp,path): a
-    // SIGKILL/preemption (Kaggle) in that window DELETED last.ckpt with no
-    // replacement (*.tmp is ignored by latest_in) -> hours of training lost.
-    // POSIX rename() overwrites atomically, so never unlink first. On Windows
-    // rename fails if dst exists -> fallback to remove+rename only there.
-    {
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-#if defined(_WIN32)
-            fs::remove(path, ec);
-            ec.clear();
-            fs::rename(tmp, path, ec);
-#endif
-            GAI_CHECK(!ec, "cannot finalise checkpoint: " + ec.message());
-        }
-    }
+    save(capture(model, opt, state), path);   }
 }
 
 void Checkpoint::save(const std::string& path, const Model& model,
                       const Lion& opt, const TrainState& state) {
+    save(capture(model, opt, state), path);
+    return;
     fs::path p(path);
     if (p.has_parent_path()) fs::create_directories(p.parent_path());
 
@@ -320,6 +401,8 @@ void Checkpoint::save(const std::string& path, const Model& model,
 
 void Checkpoint::save(const std::string& path, const Model& model,
                       const Muon& opt, const TrainState& state) {
+    save(capture(model, opt, state), path);
+    return;
     // Same atomic-publish contract as the AdamW/Lion overloads; only the
     // kind tag and the moments payload differ.
     fs::path p(path);
@@ -381,6 +464,86 @@ void Checkpoint::save(const std::string& path, const Model& model,
     }
 }
 
+void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& path) {
+    fs::path p(path);
+    if (p.has_parent_path()) fs::create_directories(p.parent_path());
+    std::error_code pre_ec;
+    if (fs::exists(p, pre_ec) && !pre_ec) {
+        GAI_CHECK(!fs::is_directory(p, pre_ec), "checkpoint path is a directory: " + path);
+    }
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        GAI_CHECK(f.good(), "cannot write checkpoint: " + tmp);
+        wr(f, CKPT_MAGIC);
+        wr(f, CKPT_VERSION);
+        wr_config(f, snapshot.config);
+        const TrainState& state = snapshot.state;
+        wr(f, state.step);
+        wr(f, state.tokens_seen);
+        wr(f, state.best_val);
+        wr(f, state.last_loss);
+        wr(f, state.seed);
+        wr_loader_v5(f, state.loader);
+        wr(f, state.loss_scale);
+        wr(f, state.clean_steps);
+        wr(f, state.tok_vocab);
+        wr_sched_v8(f, state);
+
+        u64 bias_layers = snapshot.moe_bias.size();
+        wr(f, bias_layers);
+        for (const auto& bias : snapshot.moe_bias) {
+            u32 count = static_cast<u32>(bias.size());
+            wr(f, count);
+            f.write(reinterpret_cast<const char*>(bias.data()),
+                    static_cast<std::streamsize>(bias.size() * sizeof(float)));
+        }
+
+        u64 n = snapshot.weights.size();
+        GAI_CHECK(n == snapshot.parameter_names.size(), "checkpoint snapshot parameter count mismatch");
+        wr(f, n);
+        for (size_t i = 0; i < snapshot.weights.size(); ++i) {
+            const std::string& name = snapshot.parameter_names[i];
+            u32 len = static_cast<u32>(name.size());
+            wr(f, len);
+            f.write(name.data(), len);
+            u64 ne = static_cast<u64>(snapshot.weights[i].numel());
+            wr(f, ne);
+            f.write(reinterpret_cast<const char*>(snapshot.weights[i].data_ptr()),
+                    static_cast<std::streamsize>(snapshot.weights[i].nbytes()));
+        }
+
+        u8 has_opt = snapshot.optimizer.kind == OptimizerSnapshotKind::None ? 0 : 1;
+        wr(f, has_opt);
+        if (has_opt) {
+            u8 kind = snapshot.optimizer.kind == OptimizerSnapshotKind::Lion ? OPT_LION :
+                      snapshot.optimizer.kind == OptimizerSnapshotKind::Muon ? OPT_MUON : OPT_ADAMW;
+            wr(f, kind);
+            write_optimizer_snapshot(f, snapshot.optimizer);
+        }
+        GAI_CHECK(f.good(), "checkpoint write failed");
+        f.flush();
+    }
+    publish_file(path, tmp);
+}
+
+static bool read_moe_bias(std::istream& f, Model& model, bool present) {
+    if (!present) return true;
+    u64 layers = 0;
+    if (!rd(f, layers) || layers > static_cast<u64>(model.config().num_layers)) return false;
+    const int ne = model.config().num_experts;
+    for (u64 l = 0; l < layers; ++l) {
+        u32 count = 0;
+        if (!rd(f, count) || count != static_cast<u32>(ne)) return false;
+        std::vector<float> bias(count);
+        if (count && !f.read(reinterpret_cast<char*>(bias.data()),
+                             static_cast<std::streamsize>(count * sizeof(float)))) return false;
+        for (float v : bias) if (!std::isfinite(v)) return false;
+        model.set_moe_bias(static_cast<int>(l), bias.data(), bias.size());
+    }
+    return true;
+}
+
 bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainState& state,
                       bool* out_moments_restored) {
     if (out_moments_restored) *out_moments_restored = false;
@@ -389,9 +552,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
 
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
-    if (!rd(f, version) ||
-        (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
-        return false;
+    if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
 
     ModelConfig cfg{};
     if (version >= 9u) {
@@ -430,6 +591,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     }
     // tokenizer identity: resuming with a different vocab silently corrupts
     // every embedding row. tok_vocab==0 means "unknown" (never for v3 files).
+    if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
                          state.tok_vocab, model.config().vocab_size));
@@ -505,9 +667,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     // FIX P0-1 (T4 Lion resume): v9 optimizer blob layout is unchanged since v7,
     // so only version < 5 is legacy. The old gate (version != 5..8) wrongly
     // treated v9 (+v4) as legacy and silently dropped Lion/Muon moments.
-    if (!rd(f, version) ||
-        (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
-        return false;
+    if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
@@ -545,6 +705,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
+    if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
                          state.tok_vocab, model.config().vocab_size));
@@ -614,9 +775,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
 
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
-    if (!rd(f, version) ||
-        (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
-        return false;
+    if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
     // FIX P0-1 (Muon too): same v9 gate as Lion loader above.
     bool is_legacy = (version < 5u);
 
@@ -655,6 +814,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
+    if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
                          state.tok_vocab, model.config().vocab_size));
@@ -719,9 +879,7 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     if (!f.good()) return false;
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
-    if (!rd(f, version) ||
-        (version != 9u && version != 8u && version != 7u && version != 6u && version != 5u && version != 4u && version != 3u))
-        return false;
+    if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
     if (version >= 9u) {
         if (!rd_config_v9(f, cfg)) return false;
     } else if (version >= 6u) {
@@ -744,6 +902,8 @@ std::string Checkpoint::latest_in(const std::string& dir) {
     if (!fs::exists(dir, ec)) return "";
     std::string last = (fs::path(dir) / "last.ckpt").string();
     if (fs::exists(last, ec)) return last;
+    const std::string backup = last + ".bak";
+    if (fs::exists(backup, ec)) return backup;
 
     std::vector<std::string> found;
     for (const auto& e : fs::directory_iterator(dir, ec)) {

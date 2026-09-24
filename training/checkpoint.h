@@ -30,6 +30,15 @@ struct TrainState {
 
 // Full training checkpoint: weights + optimizer moments + schedule position +
 // dataloader position + RNG. Resume is bit-exact for the data order.
+struct CheckpointSnapshot {
+    ModelConfig config;
+    TrainState state;
+    std::vector<Tensor> weights;
+    std::vector<std::string> parameter_names;
+    std::vector<std::vector<float>> moe_bias;
+    OptimizerStateSnapshot optimizer;
+};
+
 class Checkpoint {
 public:
     static void save(const std::string& path,
@@ -44,6 +53,16 @@ public:
                      const Model& model,
                      const Muon& opt,
                      const TrainState& state);
+    static CheckpointSnapshot capture(const Model& model,
+                                      const AdamW& opt,
+                                      const TrainState& state);
+    static CheckpointSnapshot capture(const Model& model,
+                                      const Lion& opt,
+                                      const TrainState& state);
+    static CheckpointSnapshot capture(const Model& model,
+                                      const Muon& opt,
+                                      const TrainState& state);
+    static void save(const CheckpointSnapshot& snapshot, const std::string& path);
 
     // out_moments_restored (optional): true iff optimizer moments were
     // actually restored. False on kind mismatch / corrupt blob / legacy /

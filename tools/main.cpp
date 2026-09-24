@@ -8,6 +8,7 @@
 #include "inference/chat.h"
 #include "quantization/quantize.h"
 #include "evaluation/benchmark.h"
+#include "evaluation/perplexity.h"
 #include "training/checkpoint.h"
 #include "dataset/retrieval.h"
 
@@ -31,6 +32,7 @@ static void usage() {
     "  ghassan-ai bench     --model model.gguf [--tokens 128]\n"
     "  ghassan-ai tokenize  --model model.gguf --text \"شنو خبارك\"\n"
     "  ghassan-ai eval      --model model.gguf --suite evaluation/en\n"
+    "  ghassan-ai perplexity --model model.gguf (--text \"held out\" | --shards artifacts/shards_en --prefix val_)\n"
     "  ghassan-ai export    --checkpoint last.ckpt --tokenizer tok.gtok --out model.gguf [--profile fp16|q8_k|q4_0] [--compat native|llama|llama_moe]\n"
     "  ghassan-ai devices\n"
     "  ghassan-ai logits    --model model.gguf --prompt \"salam\" [--out logits.f32]\n\n"
@@ -54,6 +56,7 @@ static void usage() {
     "  --no-stream       print the reply at once\n"
     "  --device auto|cpu|cuda  (metal/vulkan fall back to portable CPU)\n"
     "  --gemm-fp16 0|1        CUDA tensor-core GEMMs (default 1; 0 = pure fp32)\n"
+    "  --no-fp16-cache        disable persistent FP16 inference weights\n"
     "  --mmap              zero-copy file-backed weights (.gai, CPU inference;\n"
     "                      weak PCs: no heap commit for F32 tensors)\n"
     "  --retrieve-index <path>  RAG grounding: QA dir or train-*.json (paraphrase-aware)\n"
@@ -182,6 +185,12 @@ static LoadedModel load_model(const Args& args) {
         lm.model = std::make_unique<Model>(lm.cfg, dev);
         GAI_CHECK(load_model_from_gguf(path, *lm.model),
                   "failed to load weights from: " + path);
+        if (dev == Device::CUDA && ops::gemm_fp16_enabled() &&
+            !args.flag("no-fp16-cache", false)) {
+            lm.model->enable_fp16_weight_cache(true);
+            log_info(strfmt("[prec] persistent fp16 inference cache: %s",
+                            human_bytes(lm.model->fp16_weight_cache_bytes()).c_str()));
+        }
         log_info(strfmt("[load] %s  (%s, %s profile) in %s on %s",
                         path.c_str(), human_bytes(lm.file_bytes).c_str(), lm.quant.c_str(),
                         human_duration(t.seconds()).c_str(), device_name(dev)));
@@ -229,6 +238,12 @@ static LoadedModel load_model(const Args& args) {
         Tensor tt = r.read_tensor_f32(p->name);
         GAI_CHECK(tt.numel() == p->numel(), "tensor size mismatch: " + p->name);
         p->w.copy_from(tt);
+    }
+    if (dev == Device::CUDA && ops::gemm_fp16_enabled() &&
+        !args.flag("no-fp16-cache", false)) {
+        lm.model->enable_fp16_weight_cache(true);
+        log_info(strfmt("[prec] persistent fp16 inference cache: %s",
+                        human_bytes(lm.model->fp16_weight_cache_bytes()).c_str()));
     }
     log_info(strfmt("[load] %s  (%s, %s profile) in %s on %s",
                     path.c_str(), human_bytes(lm.file_bytes).c_str(), lm.quant.c_str(),
@@ -687,6 +702,43 @@ static int cmd_eval(const Args& args) {
     return 0;
 }
 
+static int cmd_perplexity(const Args& args) {
+    LoadedModel lm = load_model(args);
+    const int ctx = args.num_int("ctx", 0);
+    const int seq_len = args.num_int("seq-len", 512);
+    const int batch_size = args.num_int("batch-size", 1);
+    const int max_batches = args.num_int("batches", 20);
+    GAI_CHECK(ctx >= 0 && seq_len > 0 && batch_size > 0 && max_batches > 0,
+              "perplexity options must be positive");
+    if (args.has("rope-scale") || args.has("yarn-mscale")) {
+        float scale = args.has("rope-scale")
+            ? static_cast<float>(args.real_strict("rope-scale")) : lm.model->config().rope_scale;
+        float yarn = args.has("yarn-mscale")
+            ? static_cast<float>(args.real_strict("yarn-mscale")) : lm.model->config().rope_yarn_mscale;
+        lm.model->set_rope_runtime(scale, yarn);
+    }
+    Generator gen(*lm.model, lm.tokenizer, ctx);
+    PerplexityResult result;
+    if (args.has("text")) {
+        std::vector<i32> tokens = lm.tokenizer.encode(args.str("text"), true, false);
+        result = evaluate_perplexity(gen, tokens);
+    } else if (args.has("shards")) {
+        result = evaluate_shard_perplexity(
+            gen, args.str("shards"), args.str("prefix", "val"), batch_size,
+            seq_len, max_batches, args.flag("pack", false),
+            static_cast<u64>(args.num("seed", 42)));
+    } else {
+        GAI_FAIL("perplexity requires --text or --shards");
+    }
+    std::cout << strfmt("  rope_scale  : %.3f\n", (double)lm.model->config().rope_scale);
+    std::cout << strfmt("  yarn_mscale : %.3f\n", (double)rope_mscale(lm.model->config()));
+    std::cout << strfmt("  mean_nll    : %.8f\n", result.mean_nll);
+    std::cout << strfmt("  perplexity  : %.6f\n", result.perplexity);
+    std::cout << strfmt("  tokens      : %lld\n", static_cast<long long>(result.tokens));
+    std::cout << strfmt("  batches     : %lld\n", static_cast<long long>(result.batches));
+    return 0;
+}
+
 static int cmd_devices(const Args&) {
     print_device_report();
     return 0;
@@ -772,6 +824,7 @@ int main(int argc, char** argv) {
         if (cmd == "tokenize") return cmd_tokenize(args);
         if (cmd == "export")   return cmd_export(args);
         if (cmd == "eval")     return cmd_eval(args);
+        if (cmd == "perplexity") return cmd_perplexity(args);
         if (cmd == "devices")  return cmd_devices(args);
         if (cmd == "logits")   return cmd_logits(args);
         std::cerr << "unknown command: " << cmd << "\n\n";

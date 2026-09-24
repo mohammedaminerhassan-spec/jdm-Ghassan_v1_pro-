@@ -52,6 +52,7 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
         }
     }
     cache_ = KVCache(c, max_context_, dev);
+    cache_.set_pinned_prefix(8);
 
     const int d = c.hidden_size;
     x_          = Tensor::empty({d}, DType::F32, dev);
@@ -59,6 +60,9 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     q_          = Tensor::empty({c.q_dim()}, DType::F32, dev);
     k_          = Tensor::empty({c.kv_dim()}, DType::F32, dev);
     v_          = Tensor::empty({c.kv_dim()}, DType::F32, dev);
+    if (model_.fp16_weight_cache_enabled()) {
+        qkv_ = Tensor::empty({c.q_dim() + 2 * c.kv_dim()}, DType::F32, dev);
+    }
     attn_       = Tensor::empty({c.q_dim()}, DType::F32, dev);
     proj_       = Tensor::empty({d}, DType::F32, dev);
     gate_       = Tensor::empty({c.intermediate_size}, DType::F32, dev);
@@ -117,49 +121,60 @@ float* Generator::decode_step_logits(i32 token, int position) {
     device_copy(tok_dev_.data_ptr(), dev, &token, Device::CPU, sizeof(i32));
     ops::embedding_forward(dev, tok_dev_.i32p(), model_.tok_embeddings().w.f32(), x_.f32(), 1, d, V);
 
-    const int cur = cache_.length();          // positions already cached
-    const int slot = cur;                     // this token's slot
-    GAI_CHECK(slot < max_context_, "KV cache overflow");
+    const int slot = cache_.allocate_slot();
 
     for (int l = 0; l < c.num_layers; ++l) {
         LayerParams& L = model_.layer(l);
 
         ops::rmsnorm_forward(dev, x_.f32(), L.attn_norm.w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
 
-        ops::linear_forward(dev, xb_.f32(), L.wq.w.f32(), q_.f32(), 1, d, qd);
-        ops::linear_forward(dev, xb_.f32(), L.wk.w.f32(), k_.f32(), 1, d, kvd);
-        ops::linear_forward(dev, xb_.f32(), L.wv.w.f32(), v_.f32(), 1, d, kvd);
+        float* qp = q_.f32();
+        float* kp = k_.f32();
+        float* vp = v_.f32();
+        if (qkv_.defined()) {
+            ops::linear_forward_fp16(dev, xb_.f32(), model_.fused_qkv_ptr(l),
+                                     qkv_.f32(), 1, d, qd + 2 * kvd);
+            qp = qkv_.f32();
+            kp = qp + qd;
+            vp = kp + kvd;
+        } else {
+            ops::linear_forward(dev, xb_.f32(), L.wq.w.f32(), qp, 1, d, qd);
+            ops::linear_forward(dev, xb_.f32(), L.wk.w.f32(), kp, 1, d, kvd);
+            ops::linear_forward(dev, xb_.f32(), L.wv.w.f32(), vp, 1, d, kvd);
+        }
 
         // QK-Norm (must mirror Model::forward exactly, otherwise train/inference
         // mismatch on use_qk_norm models). Single token layout [H,hd]/[KV,hd]
         // is contiguous so rmsnorm applies in-place directly.
         if (c.use_qk_norm && L.qk_qnorm.w.defined()) {
-            ops::rmsnorm_forward(dev, q_.f32(), L.qk_qnorm.w.f32(), q_.f32(),
+            ops::rmsnorm_forward(dev, qp, L.qk_qnorm.w.f32(), qp,
                                  nullptr, H, hd, c.rms_eps);
-            ops::rmsnorm_forward(dev, k_.f32(), L.qk_knorm.w.f32(), k_.f32(),
+            ops::rmsnorm_forward(dev, kp, L.qk_knorm.w.f32(), kp,
                                  nullptr, KV, hd, c.rms_eps);
         }
 
-        const float theta_eff = rope_theta_eff(c);
+        const float* rope_freq = model_.rope_inv_freq_ptr();
+        GAI_CHECK(rope_freq != nullptr, "decode: RoPE frequency cache is missing");
         // T4-P1-25: the position value is loop-invariant — upload once per
         // decode step, not once per layer (was 36 tiny H2D copies/token).
         if (l == 0)
             device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
-        ops::rope_forward_ex(dev, q_.f32(), k_.f32(), pos_dev_.i32p(), 1, H, KV, hd, theta_eff,
-                             c.rope_type, c.rope_yarn_low, c.rope_yarn_high, c.rope_scale);
+        ops::rope_forward_cached(dev, qp, kp, pos_dev_.i32p(), rope_freq, 1, H, KV, hd,
+                                 c.rope_type);
 
         // write into the cache (same-device D2D via device_copy)
         {
             size_t bytes = sizeof(float) * static_cast<size_t>(kvd);
             char* kdst = reinterpret_cast<char*>(cache_.k(l)) + static_cast<size_t>(slot) * bytes;
             char* vdst = reinterpret_cast<char*>(cache_.v(l)) + static_cast<size_t>(slot) * bytes;
-            device_copy(kdst, dev, k_.f32(), dev, bytes);
-            device_copy(vdst, dev, v_.f32(), dev, bytes);
+            device_copy(kdst, dev, kp, dev, bytes);
+            device_copy(vdst, dev, vp, dev, bytes);
         }
 
-        ops::attention_decode_ex(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
-                                 H, KV, hd, slot + 1, max_context_, scale, scores_.f32(),
-                                 c.sliding_window);
+        ops::attention_decode_ring(dev, q_.f32(), cache_.k(l), cache_.v(l), attn_.f32(),
+                                   H, KV, hd, cache_.ring_start(), cache_.pinned_prefix(),
+                                   cache_.length(), cache_.capacity(), scale, scores_.f32(),
+                                   c.sliding_window);
 
         ops::linear_forward(dev, attn_.f32(), L.wo.w.f32(), proj_.f32(), 1, qd, d);
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
@@ -184,8 +199,6 @@ float* Generator::decode_step_logits(i32 token, int position) {
         ops::add_inplace(dev, x_.f32(), proj_.f32(), d);
     }
 
-    cache_.advance(1);
-
     ops::rmsnorm_forward(dev, x_.f32(), model_.final_norm().w.f32(), xb_.f32(), nullptr, 1, d, c.rms_eps);
     ops::linear_forward(dev, xb_.f32(), model_.lm_head().w.f32(), logits_dev_.f32(), 1, d, V);
     return logits_dev_.f32();
@@ -209,7 +222,6 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     // decode_step when the cache already holds context (rare: continuation).
     if (tokens.empty() || cache_.length() != 0 || start_pos != 0) {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
             decode_step(tokens[i], start_pos + static_cast<int>(i));
             push_history(tokens[i]);
         }
@@ -237,6 +249,10 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     Tensor q({(i64)P * qd}, DType::F32, dev);
     Tensor k({(i64)P * kvd}, DType::F32, dev);
     Tensor v({(i64)P * kvd}, DType::F32, dev);
+    Tensor qkv;
+    if (model_.fp16_weight_cache_enabled()) {
+        qkv = Tensor({(i64)P * (qd + 2 * kvd)}, DType::F32, dev);
+    }
     Tensor att({(i64)P * qd}, DType::F32, dev);
     Tensor proj({(i64)P * d}, DType::F32, dev);
     // FIX (10/10): old prefill allocated probs [P*H*P] transient (~1GB at
@@ -252,25 +268,39 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     Tensor atmp({(i64)c.intermediate_size * (c.use_moe ? 1 : P)}, DType::F32, dev);
 
     ops::embedding_forward(dev, d_ids.i32p(), model_.tok_embeddings().w.f32(), x.f32(), P, d, c.vocab_size);
+    const float* rope_freq = model_.rope_inv_freq_ptr();
+    GAI_CHECK(rope_freq != nullptr, "prefill: RoPE frequency cache is missing");
     for (int l = 0; l < c.num_layers; ++l) {
         LayerParams& L = model_.layer(l);
         ops::rmsnorm_forward(dev, x.f32(), L.attn_norm.w.f32(), xb.f32(), nullptr, P, d, c.rms_eps);
-        ops::linear_forward(dev, xb.f32(), L.wq.w.f32(), q.f32(), P, d, qd);
-        ops::linear_forward(dev, xb.f32(), L.wk.w.f32(), k.f32(), P, d, kvd);
-        ops::linear_forward(dev, xb.f32(), L.wv.w.f32(), v.f32(), P, d, kvd);
+        float* qp = q.f32();
+        float* kp = k.f32();
+        float* vp = v.f32();
+        if (qkv.defined()) {
+            ops::linear_forward_fp16(dev, xb.f32(), model_.fused_qkv_ptr(l),
+                                     qkv.f32(), P, d, qd + 2 * kvd);
+            ops::split_qkv(dev, qkv.f32(), q.f32(), k.f32(), v.f32(), P, qd, kvd);
+            qp = q.f32();
+            kp = k.f32();
+            vp = v.f32();
+        } else {
+            ops::linear_forward(dev, xb.f32(), L.wq.w.f32(), qp, P, d, qd);
+            ops::linear_forward(dev, xb.f32(), L.wk.w.f32(), kp, P, d, kvd);
+            ops::linear_forward(dev, xb.f32(), L.wv.w.f32(), vp, P, d, kvd);
+        }
         // QK-Norm batched: [P,H,hd] == [P*H,hd] contiguous, same for K.
         if (c.use_qk_norm && L.qk_qnorm.w.defined()) {
-            ops::rmsnorm_forward(dev, q.f32(), L.qk_qnorm.w.f32(), q.f32(),
+            ops::rmsnorm_forward(dev, qp, L.qk_qnorm.w.f32(), qp,
                                  nullptr, (i64)P * H, hd, c.rms_eps);
-            ops::rmsnorm_forward(dev, k.f32(), L.qk_knorm.w.f32(), k.f32(),
+            ops::rmsnorm_forward(dev, kp, L.qk_knorm.w.f32(), kp,
                                  nullptr, (i64)P * KV, hd, c.rms_eps);
         }
-        ops::rope_forward_ex(dev, q.f32(), k.f32(), d_pos.i32p(), P, H, KV, hd, rope_theta_eff(c),
-                             c.rope_type, c.rope_yarn_low, c.rope_yarn_high, c.rope_scale);
+        ops::rope_forward_cached(dev, qp, kp, d_pos.i32p(), rope_freq, P, H, KV, hd,
+                                 c.rope_type);
         // fill cache rows [0,P)
-        device_copy(cache_.k(l), dev, k.f32(), dev, sizeof(float) * (size_t)P * kvd);
-        device_copy(cache_.v(l), dev, v.f32(), dev, sizeof(float) * (size_t)P * kvd);
-        ops::attention_forward_ex(dev, q.f32(), k.f32(), v.f32(), att.f32(), nullptr,
+        device_copy(cache_.k(l), dev, kp, dev, sizeof(float) * (size_t)P * kvd);
+        device_copy(cache_.v(l), dev, vp, dev, sizeof(float) * (size_t)P * kvd);
+        ops::attention_forward_ex(dev, qp, kp, vp, att.f32(), nullptr,
                                   1, P, H, KV, hd, scale, c.sliding_window);
         ops::linear_forward(dev, att.f32(), L.wo.w.f32(), proj.f32(), P, qd, d);
         ops::add_inplace(dev, x.f32(), proj.f32(), (i64)P * d);
@@ -344,7 +374,6 @@ void Generator::prefill(const std::vector<i32>& tokens) {
                 forward_prefill(head, 0);
                 absolute_pos_ = static_cast<int64_t>(head.size());
                 for (size_t i = PREFILL_CHUNK; i < work.size(); ++i) {
-                    if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
                     decode_step(work[i], static_cast<int>(absolute_pos_));
                     ++absolute_pos_;
                     push_history(work[i]);
@@ -373,10 +402,6 @@ void Generator::prefill(const std::vector<i32>& tokens) {
         }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (cache_.length() >= max_context_) {
-                // slide the window, keeping the first 8 tokens (BOS + system prefix)
-                cache_.evict_front(max_context_ / 4, 8);
-            }
             // P0-03: pass absolute_pos_, not (start + i) which would also be
             // wrong after eviction; absolute_pos_ is always monotonically increasing.
             decode_step(tokens[i], static_cast<int>(absolute_pos_));
@@ -469,9 +494,8 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
         }
         if (hit) break;
 
-        if (cache_.length() >= max_context_) cache_.evict_front(max_context_ / 4, 8);
         // P0-03: pass absolute_pos_ (true monotonic coordinate) instead of
-        // cache_.length() which shrinks after evict_front, corrupting RoPE.
+        // cache_.length(), which stays capped after the ring wraps, corrupting RoPE.
         // Fast path leaves logits on device (no full-vocab D2H); legacy keeps
         // the host copy the sampler reads next iteration.
         GAI_CHECK(absolute_pos_ >= 0 && absolute_pos_ <= (i64)std::numeric_limits<int>::max(),
@@ -523,7 +547,7 @@ std::string Generator::chat(const std::vector<Message>& msgs, const GenerationCo
 // (ذروة ~64MB) ونجمع sum/n عبر البلوكات — نفس المتوسط تماماً مع الحفاظ على
 // إزاحة RoPE الأصلية عند كل بلوك.
 double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask,
-                               i64* out_ntok) {
+                               i64* out_ntok, const std::vector<i32>* segment_ids) {
     GAI_CHECK(model_.device() == expected_device_,
               "model device changed after Generator construction; rebuild the Generator");
     if (tokens.size() < 2) { if (out_ntok) *out_ntok = 0; return 0.0; }
@@ -531,6 +555,8 @@ double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector
     // Fail fast instead of reading past the vector (training/eval safety).
     GAI_CHECK(!mask || mask->size() >= tokens.size(), "score_tokens: mask shorter than tokens");
     const int T = static_cast<int>(std::min<size_t>(tokens.size(), static_cast<size_t>(model_.config().max_seq_len)));
+    GAI_CHECK(!segment_ids || segment_ids->size() >= static_cast<size_t>(T),
+              "score_tokens: segment_ids shorter than scored tokens");
 
     static constexpr int SCORE_CHUNK = 512;  // ~64MB logits عند V=32k
     Device dev = model_.device();
@@ -560,8 +586,18 @@ double Generator::score_tokens(const std::vector<i32>& tokens, const std::vector
         std::memcpy(d_tgt.data_ptr(), tgt.data(), sizeof(i32) * tgt.size());
         Tensor dev_tgt({Tn}, DType::I32, dev);
         dev_tgt.copy_from(d_tgt);
+        Tensor dev_segments;
+        if (segment_ids) {
+            Tensor h_segments({Tn}, DType::I32, Device::CPU);
+            for (int i = 0; i < Tn; ++i) {
+                h_segments.i32p()[i] = (*segment_ids)[static_cast<size_t>(off + i)];
+            }
+            dev_segments = Tensor({Tn}, DType::I32, dev);
+            dev_segments.copy_from(h_segments);
+        }
 
-        Tensor& logits = model_.forward(dev_ids.i32p(), 1, Tn, act);
+        Tensor& logits = model_.forward(dev_ids.i32p(), 1, Tn, act,
+                                        segment_ids ? dev_segments.i32p() : nullptr);
         double sum = 0.0;
         i64 n = 0;
         ops::softmax_cross_entropy(dev, logits.f32(), dev_tgt.i32p(), nullptr,

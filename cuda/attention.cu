@@ -37,7 +37,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 // pressure stays flat regardless of head_dim.
 __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict__ k,
                            const float* __restrict__ v, float* __restrict__ out,
-                           float* __restrict__ probs,
+                           float* __restrict__ probs, const i32* __restrict__ segment_ids,
                            int T, int H, int KV, int hd, float scale) {
     extern __shared__ float sh[];
     float* sQ   = sh;
@@ -52,6 +52,7 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
     const int group = H / KV;
     const int kvh = h / group;
     const int lane = threadIdx.x;
+    const i32 seg_t = segment_ids ? segment_ids[size_t(b) * T + t] : 0;
 
     const size_t qs  = size_t(T) * H * hd;
     const size_t kvs = size_t(T) * KV * hd;
@@ -79,16 +80,22 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
         // scores for this tile
         float tmax = -FLT_MAX;
         for (int j = lane; j < tile; j += WARP_A) {
-            const float* kj = sK + j * hd;
+            int pos = base + j;
+            i32 seg_j = segment_ids ? segment_ids[size_t(b) * T + pos] : 0;
             float s = 0.0f;
-            #pragma unroll 4
-            for (int c = 0; c < hd; ++c) s += sQ[c] * kj[c];
-            s *= scale;
+            if (!segment_ids || seg_t < 0 || seg_j == seg_t) {
+                const float* kj = sK + j * hd;
+                #pragma unroll 4
+                for (int c = 0; c < hd; ++c) s += sQ[c] * kj[c];
+                s *= scale;
+            } else {
+                s = -FLT_MAX;
+            }
             sS[j] = s;
             tmax = fmaxf(tmax, s);
             // Raw scores are cached; the row is exponentiated and normalised once at
             // the end, because the running max is only final after the last tile.
-            if (probs) probs[((size_t(b) * H + h) * T + t) * T + base + j] = s;
+            if (probs) probs[((size_t(b) * H + h) * T + t) * T + pos] = s;
         }
         #pragma unroll
         for (int o = WARP_A / 2; o > 0; o >>= 1)
@@ -146,7 +153,7 @@ void attention_forward(const float* q, const float* k, const float* v,
     // Fail fast with a clear message instead of illegal launch.
     size_t sh = sizeof(float) * (size_t(hd) + size_t(KV_TILE) * hd * 2 + KV_TILE + size_t(hd));
     GAI_CHECK(sh <= 48 * 1024, "cuda attention_forward: shared memory over T4 limit (use smaller head_dim)");
-    k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, T, H, KV, hd, scale);
+    k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, nullptr, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
 }
 
@@ -154,7 +161,7 @@ void attention_forward(const float* q, const float* k, const float* v,
 // window==0 delegates to the flash tiled path above (zero regression risk).
 __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restrict__ k,
                                const float* __restrict__ v, float* __restrict__ out,
-                               float* __restrict__ probs,
+                               float* __restrict__ probs, const i32* __restrict__ segment_ids,
                                int T, int H, int KV, int hd, float scale, int window) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -162,6 +169,7 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     const int group = H / KV;
     const int kvh = h / group;
     const int lane = threadIdx.x;
+    const i32 seg_t = segment_ids ? segment_ids[size_t(b) * T + t] : 0;
     const size_t qs  = size_t(T) * H * hd;
     const size_t kvs = size_t(T) * KV * hd;
     const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
@@ -175,6 +183,8 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     __syncwarp();
     float mx = -FLT_MAX;
     for (int j = j0 + lane; j <= t; j += WARP_A) {
+        i32 seg_j = segment_ids ? segment_ids[size_t(b) * T + j] : 0;
+        if (segment_ids && seg_t >= 0 && seg_j != seg_t) continue;
         const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
         float d = 0.0f;
         for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
@@ -190,6 +200,11 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     // All lanes already hold identical sum -> use directly, no reduction.
     float sum = 0.0f;
     for (int j = j0; j <= t; ++j) {
+        i32 seg_j = segment_ids ? segment_ids[size_t(b) * T + j] : 0;
+        if (segment_ids && seg_t >= 0 && seg_j != seg_t) {
+            if (probs) probs[((size_t(b) * H + h) * T + t) * T + j] = 0.0f;
+            continue;
+        }
         const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
         float d = 0.0f;
         for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
@@ -213,15 +228,23 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
 
 void attention_forward_ex(const float* q, const float* k, const float* v,
                           float* out, float* probs,
-                          int B, int T, int H, int KV, int hd, float scale, int window) {
-    if (window <= 0) { attention_forward(q, k, v, out, probs, B, T, H, KV, hd, scale); return; }
+                          int B, int T, int H, int KV, int hd, float scale, int window,
+                          const i32* segment_ids) {
     if (B <= 0 || T <= 0) return;
     GAI_CHECK(H > 0 && H <= 65535 && B <= 65535,
               "cuda attention_ex: grid dimensions out of range");
     GAI_CHECK(hd <= MAX_HD, "cuda attention_ex: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_ex: H must be a multiple of KV");
     dim3 grid(T, H, B);
-    k_attn_fwd_swa<<<grid, WARP_A>>>(q, k, v, out, probs, T, H, KV, hd, scale, window);
+    if (window <= 0) {
+        size_t sh = sizeof(float) * (size_t(hd) + size_t(KV_TILE) * hd * 2 + KV_TILE + size_t(hd));
+        GAI_CHECK(sh <= 48 * 1024, "cuda attention_forward_ex: shared memory over T4 limit");
+        k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, segment_ids,
+                                         T, H, KV, hd, scale);
+    } else {
+        k_attn_fwd_swa<<<grid, WARP_A>>>(q, k, v, out, probs, segment_ids,
+                                         T, H, KV, hd, scale, window);
+    }
     CU_CHECK2(cudaGetLastError());
 }
 
@@ -510,6 +533,79 @@ __global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __res
     }
 }
 
+__device__ __forceinline__ size_t decode_ring_slot(int j, int pinned_prefix,
+                                                     int ring_start, int ring_capacity) {
+    if (j < pinned_prefix) return (size_t)j;
+    return (size_t)pinned_prefix + (size_t)((ring_start + (j - pinned_prefix)) % ring_capacity);
+}
+
+__global__ void k_attn_decode_ring(const float* __restrict__ q, const float* __restrict__ kc,
+                                   const float* __restrict__ vc, float* __restrict__ out,
+                                   int H, int KV, int hd, int cur_len, int ring_start,
+                                   int pinned_prefix, int ring_capacity, float scale,
+                                   float* __restrict__ scratch, int j0) {
+    extern __shared__ float sm[];
+    const int h = blockIdx.x;
+    const int group = H / KV;
+    const int kvh = h / group;
+    const float* qh = q + size_t(h) * hd;
+    float* s = scratch + size_t(h) * cur_len;
+
+    float local_max = -FLT_MAX;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+        const float* kh = kc + (slot * size_t(KV) + kvh) * hd;
+        float d = 0.0f;
+#pragma unroll 4
+        for (int c = 0; c < hd; ++c) d += qh[c] * kh[c];
+        d *= scale;
+        s[j] = d;
+        local_max = fmaxf(local_max, d);
+    }
+    int lane = threadIdx.x % WARP_A, wid = threadIdx.x / WARP_A;
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if (lane == 0) sm[wid] = local_max;
+    __syncthreads();
+    int nw = (blockDim.x + WARP_A - 1) / WARP_A;
+    if (threadIdx.x == 0) {
+        float m = sm[0];
+        for (int i = 1; i < nw; ++i) m = fmaxf(m, sm[i]);
+        sm[32] = m;
+    }
+    __syncthreads();
+    float mx = sm[32];
+
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x + j0; j < cur_len; j += blockDim.x) {
+        float p = __expf(s[j] - mx);
+        s[j] = p;
+        local_sum += p;
+    }
+#pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1) local_sum += __shfl_xor_sync(0xffffffffu, local_sum, o);
+    if (lane == 0) sm[wid] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int i = 0; i < nw; ++i) t += sm[i];
+        sm[33] = t;
+    }
+    __syncthreads();
+    float inv = 1.0f / sm[33];
+
+    float* o = out + size_t(h) * hd;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float a = 0.0f;
+        for (int j = j0; j < cur_len; ++j) {
+            size_t slot = decode_ring_slot(j, pinned_prefix, ring_start, ring_capacity);
+            a += s[j] * vc[(slot * size_t(KV) + kvh) * hd + c];
+        }
+        o[c] = a * inv;
+    }
+}
+
 void attention_decode_ex(const float* q, const float* kc, const float* vc,
                          float* out, int H, int KV, int hd, int cur_len, int max_len,
                          float scale, float* scratch, int window) {
@@ -522,6 +618,31 @@ void attention_decode_ex(const float* q, const float* kc, const float* vc,
     int block = 128;
     size_t sh = sizeof(float) * 40;
     k_attn_decode_ex<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, scale, scratch, j0);
+    CU_CHECK2(cudaGetLastError());
+}
+
+void attention_decode_ring(const float* q, const float* kc, const float* vc,
+                           float* out, int H, int KV, int hd, int ring_start,
+                           int pinned_prefix, int cur_len, int cache_max,
+                           float scale, float* scratch, int window) {
+    GAI_CHECK(H > 0 && KV > 0 && hd > 0, "cuda attention_decode_ring: empty shape");
+    GAI_CHECK(H % KV == 0, "cuda attention_decode_ring: H must be a multiple of KV");
+    GAI_CHECK(cur_len >= 0 && cache_max >= 0 && cur_len <= cache_max,
+              "cuda attention_decode_ring: length exceeds cache capacity");
+    GAI_CHECK(pinned_prefix >= 0 && pinned_prefix <= cur_len,
+              "cuda attention_decode_ring: pinned prefix out of range");
+    const int ring_capacity = cache_max - pinned_prefix;
+    if (cur_len > pinned_prefix) {
+        GAI_CHECK(ring_capacity > 0, "cuda attention_decode_ring: ring has no rolling slots");
+        GAI_CHECK(ring_start >= 0 && ring_start < ring_capacity,
+                  "cuda attention_decode_ring: ring start out of range");
+    }
+    if (H <= 0 || cur_len <= 0) return;
+    int j0 = (window > 0 && cur_len > window) ? cur_len - window : 0;
+    int block = 128;
+    size_t sh = sizeof(float) * 40;
+    k_attn_decode_ring<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, ring_start,
+                                         pinned_prefix, ring_capacity, scale, scratch, j0);
     CU_CHECK2(cudaGetLastError());
 }
 

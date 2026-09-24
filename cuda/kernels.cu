@@ -264,6 +264,67 @@ void linear_forward(const float* x, const float* w, float* y, int M, int K, int 
     gemm(false, true, M, N, K, 1.0f, x, K, w, K, 0.0f, y, N);
 }
 
+__global__ void k_f32_to_f16_flat(const float* src, __half* dst, i64 n) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) dst[i] = __float2half(src[i]);
+}
+
+void convert_f32_to_f16(const float* src, u16* dst, i64 n) {
+    if (n <= 0) return;
+    k_f32_to_f16_flat<<<grid_for(n, 256), 256>>>(src, reinterpret_cast<__half*>(dst), n);
+    CU_CHECK(cudaGetLastError());
+}
+
+void linear_forward_fp16(const float* x, const u16* w, float* y, int M, int K, int N) {
+    if (M <= 0 || N <= 0) return;
+    if (K <= 0) {
+        CU_CHECK(cudaMemset(y, 0, sizeof(float) * static_cast<size_t>(M) * N));
+        return;
+    }
+    __half* xh = static_cast<__half*>(workspace(sizeof(__half) * static_cast<size_t>(M) * K));
+    convert_f32_to_f16(x, reinterpret_cast<u16*>(xh), static_cast<i64>(M) * K);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+    cublasStatus_t status = cublasGemmEx(h,
+                                         CUBLAS_OP_T, CUBLAS_OP_N,
+                                         N, M, K,
+                                         &alpha,
+                                         w, CUDA_R_16F, K,
+                                         xh, CUDA_R_16F, K,
+                                         &beta,
+                                         y, CUDA_R_32F, N,
+                                         CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx fp16 linear failed");
+}
+
+__global__ void k_split_qkv(const float* qkv, float* q, float* k, float* v,
+                            i64 n, int qd, int kvd) {
+    const i64 width = (i64)qd + 2 * kvd;
+    i64 idx = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; idx < n * width; idx += stride) {
+        i64 t = idx / width;
+        int c = (int)(idx % width);
+        float value = qkv[idx];
+        if (c < qd) {
+            q[t * qd + c] = value;
+        } else if (c < qd + kvd) {
+            k[t * kvd + (c - qd)] = value;
+        } else {
+            v[t * kvd + (c - qd - kvd)] = value;
+        }
+    }
+}
+
+void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, int kvd) {
+    if (n <= 0) return;
+    k_split_qkv<<<grid_for(n * ((i64)qd + 2 * kvd), 256), 256>>>(qkv, q, k, v, n, qd, kvd);
+    CU_CHECK(cudaGetLastError());
+}
+
 void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N) {
     if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, w, K, 1.0f, dx, K);
@@ -542,6 +603,43 @@ __global__ void k_rope_ex(float* q, float* k, const i32* pos, i64 ntok,
     }
 }
 
+__global__ void k_rope_freq(float* q, float* k, const i32* pos, const float* inv_freq,
+                            i64 ntok, int n_heads, int n_kv, int hd, int rope_type,
+                            float sign) {
+    const int half = hd / 2;
+    i64 t = blockIdx.x;
+    if (t >= ntok) return;
+    const int total = (n_heads + n_kv) * half;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        int i = idx % half;
+        int h = idx / half;
+        float angle = static_cast<float>(pos[t]) * inv_freq[i];
+        float sn;
+        float cs;
+        sincosf(angle, &sn, &cs);
+        sn *= sign;
+        float* base;
+        if (h < n_heads) {
+            if (!q) continue;
+            base = q + (t * n_heads + h) * hd;
+        } else {
+            if (!k) continue;
+            base = k + (t * n_kv + (h - n_heads)) * hd;
+        }
+        if (rope_type == 1) {
+            float a = base[i];
+            float b = base[i + half];
+            base[i] = a * cs - b * sn;
+            base[i + half] = a * sn + b * cs;
+        } else {
+            float a = base[2 * i];
+            float b = base[2 * i + 1];
+            base[2 * i] = a * cs - b * sn;
+            base[2 * i + 1] = a * sn + b * cs;
+        }
+    }
+}
+
 void rope_forward_ex(float* q, float* k, const i32* pos, i64 ntok,
                      int n_heads, int n_kv, int hd, float theta,
                      int rope_type, float yarn_low, float yarn_high, float yarn_scale) {
@@ -559,6 +657,24 @@ void rope_backward_ex(float* dq, float* dk, const i32* pos, i64 ntok,
     GAI_CHECK(ntok <= 2147483647LL, "rope_backward_ex: ntok exceeds INT_MAX");
     k_rope_ex<<<static_cast<int>(ntok), 256>>>(dq, dk, pos, ntok, n_heads, n_kv, hd, theta, -1.0f,
                                                rope_type, yarn_low, yarn_high, yarn_scale);
+    CU_CHECK(cudaGetLastError());
+}
+
+void rope_forward_cached(float* q, float* k, const i32* pos, const float* inv_freq,
+                         i64 ntok, int n_heads, int n_kv, int hd, int rope_type) {
+    if (ntok <= 0) return;
+    GAI_CHECK(ntok <= 2147483647LL, "rope_forward_cached: ntok exceeds INT_MAX");
+    k_rope_freq<<<static_cast<int>(ntok), 256>>>(q, k, pos, inv_freq, ntok,
+                                                 n_heads, n_kv, hd, rope_type, 1.0f);
+    CU_CHECK(cudaGetLastError());
+}
+
+void rope_backward_cached(float* dq, float* dk, const i32* pos, const float* inv_freq,
+                          i64 ntok, int n_heads, int n_kv, int hd, int rope_type) {
+    if (ntok <= 0) return;
+    GAI_CHECK(ntok <= 2147483647LL, "rope_backward_cached: ntok exceeds INT_MAX");
+    k_rope_freq<<<static_cast<int>(ntok), 256>>>(dq, dk, pos, inv_freq, ntok,
+                                                 n_heads, n_kv, hd, rope_type, -1.0f);
     CU_CHECK(cudaGetLastError());
 }
 
