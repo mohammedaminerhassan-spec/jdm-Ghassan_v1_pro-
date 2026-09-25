@@ -329,139 +329,19 @@ static void publish_file(const std::string& path, const std::string& tmp) {
     fs::remove(backup, ec);
     if (ec) log_warn("checkpoint backup cleanup failed: " + ec.message());
 }
-
 void Checkpoint::save(const std::string& path, const Model& model,
                       const AdamW& opt, const TrainState& state) {
-    save(capture(model, opt, state), path);   }
+    save(capture(model, opt, state), path);
 }
 
 void Checkpoint::save(const std::string& path, const Model& model,
                       const Lion& opt, const TrainState& state) {
     save(capture(model, opt, state), path);
-    return;
-    fs::path p(path);
-    if (p.has_parent_path()) fs::create_directories(p.parent_path());
-
-    std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        GAI_CHECK(f.good(), "cannot write checkpoint: " + tmp);
-
-        wr(f, CKPT_MAGIC);
-        wr(f, CKPT_VERSION);
-        wr_config(f, model.config());
-        wr(f, state.step);
-        wr(f, state.tokens_seen);
-        wr(f, state.best_val);
-        wr(f, state.last_loss);
-        wr(f, state.seed);
-        wr_loader_v5(f, state.loader);
-        wr(f, state.loss_scale);
-        wr(f, state.clean_steps);
-        wr(f, state.tok_vocab);
-        wr_sched_v8(f, state);
-
-        const auto& params = const_cast<Model&>(model).parameters();
-        u64 n = static_cast<u64>(params.size());
-        wr(f, n);
-        for (const Parameter* pp : params) {
-            u32 len = static_cast<u32>(pp->name.size());
-            wr(f, len);
-            f.write(pp->name.data(), len);
-            u64 ne = static_cast<u64>(pp->numel());
-            wr(f, ne);
-            Tensor cpu = pp->w.to(Device::CPU);
-            f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
-                    static_cast<std::streamsize>(cpu.nbytes()));
-        }
-
-        u8 has_opt = 1;
-        wr(f, has_opt);
-        u8 kind = OPT_LION;
-        wr(f, kind);
-        opt.save_state(f);
-
-        GAI_CHECK(f.good(), "checkpoint write failed");
-        f.flush();
-    }
-    // Same atomic-publish contract as the AdamW overload (see above).
-    {
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-#if defined(_WIN32)
-            fs::remove(path, ec);
-            ec.clear();
-            fs::rename(tmp, path, ec);
-#endif
-            GAI_CHECK(!ec, "cannot finalise checkpoint: " + ec.message());
-        }
-    }
 }
 
 void Checkpoint::save(const std::string& path, const Model& model,
                       const Muon& opt, const TrainState& state) {
     save(capture(model, opt, state), path);
-    return;
-    // Same atomic-publish contract as the AdamW/Lion overloads; only the
-    // kind tag and the moments payload differ.
-    fs::path p(path);
-    if (p.has_parent_path()) fs::create_directories(p.parent_path());
-
-    std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        GAI_CHECK(f.good(), "cannot write checkpoint: " + tmp);
-
-        wr(f, CKPT_MAGIC);
-        wr(f, CKPT_VERSION);
-        wr_config(f, model.config());
-        wr(f, state.step);
-        wr(f, state.tokens_seen);
-        wr(f, state.best_val);
-        wr(f, state.last_loss);
-        wr(f, state.seed);
-        wr_loader_v5(f, state.loader);
-        wr(f, state.loss_scale);
-        wr(f, state.clean_steps);
-        wr(f, state.tok_vocab);
-        wr_sched_v8(f, state);
-
-        const auto& params = const_cast<Model&>(model).parameters();
-        u64 n = static_cast<u64>(params.size());
-        wr(f, n);
-        for (const Parameter* pp : params) {
-            u32 len = static_cast<u32>(pp->name.size());
-            wr(f, len);
-            f.write(pp->name.data(), len);
-            u64 ne = static_cast<u64>(pp->numel());
-            wr(f, ne);
-            Tensor cpu = pp->w.to(Device::CPU);
-            f.write(reinterpret_cast<const char*>(cpu.data_ptr()),
-                    static_cast<std::streamsize>(cpu.nbytes()));
-        }
-
-        u8 has_opt = 1;
-        wr(f, has_opt);
-        u8 kind = OPT_MUON;
-        wr(f, kind);
-        opt.save_state(f);
-
-        GAI_CHECK(f.good(), "checkpoint write failed");
-        f.flush();
-    }
-    {
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-#if defined(_WIN32)
-            fs::remove(path, ec);
-            ec.clear();
-            fs::rename(tmp, path, ec);
-#endif
-            GAI_CHECK(!ec, "cannot finalise checkpoint: " + ec.message());
-        }
-    }
 }
 
 void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& path) {
@@ -545,7 +425,7 @@ static bool read_moe_bias(std::istream& f, Model& model, bool present) {
 }
 
 bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainState& state,
-                      bool* out_moments_restored) {
+                      bool* out_moments_restored, bool strict) {
     if (out_moments_restored) *out_moments_restored = false;
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
@@ -623,10 +503,16 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         seen.insert(name);
     }
     // New params (e.g. qk_qnorm/qk_knorm) missing from old checkpoints keep
-    // their fresh init instead of failing the whole resume.
+    // their fresh init instead of failing the whole resume — unless the caller
+    // asked for an exact resume, where that would be silent corruption.
     for (Parameter* pp : model.parameters()) {
-        if (seen.find(pp->name) == seen.end())
+        if (seen.find(pp->name) == seen.end()) {
+            if (strict) {
+                log_error("exact resume: checkpoint lacks param " + pp->name);
+                return false;
+            }
             log_warn("checkpoint lacks param " + pp->name + "; keeping fresh init");
+        }
     }
 
     u8 has_opt = 0;
@@ -635,6 +521,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         // legacy v3: payload is always AdamW
         if (has_opt && opt) {
             if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+                if (strict) { log_error("exact resume: legacy v3 optimizer state unreadable"); return false; }
                 log_warn("optimizer state could not be restored; continuing with fresh moments");
             } else if (out_moments_restored) *out_moments_restored = true;
         }
@@ -644,18 +531,26 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_ADAMW) {
+            if (strict) {
+                log_error("exact resume: checkpoint holds a different optimizer kind");
+                return false;
+            }
             log_warn("checkpoint holds lion moments but trainer uses adamw; starting fresh moments");
             return true;
         }
         if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+            if (strict) { log_error("exact resume: adamw state unreadable"); return false; }
             log_warn("optimizer state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
+    } else if (has_opt && !opt && strict) {
+        log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
+        return false;
     }
     return true;
 }
 
 bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainState& state,
-                      bool* out_moments_restored) {
+                      bool* out_moments_restored, bool strict) {
     if (out_moments_restored) *out_moments_restored = false;
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
@@ -737,8 +632,13 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         seen_lion.insert(name);
     }
     for (Parameter* pp : model.parameters()) {
-        if (seen_lion.find(pp->name) == seen_lion.end())
+        if (seen_lion.find(pp->name) == seen_lion.end()) {
+            if (strict) {
+                log_error("exact resume: checkpoint lacks param " + pp->name);
+                return false;
+            }
             log_warn("checkpoint lacks param " + pp->name + "; keeping fresh init");
+        }
     }
 
     u8 has_opt = 0;
@@ -746,27 +646,40 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     if (is_legacy) {
         // v3/v4 payload may be AdamW: weights already restored above,
         // moments can't be reused for Lion -> fresh start for opt only.
-        if (has_opt)
+        if (has_opt) {
+            if (strict) {
+                log_error("exact resume: legacy checkpoint cannot supply lion moments");
+                return false;
+            }
             log_warn("checkpoint is legacy (v3/v4) but trainer uses lion; "
                      "weights/schedule restored, moments restart fresh");
+        }
         return true;
     }
     u8 kind = OPT_ADAMW;
     if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_LION) {
+            if (strict) {
+                log_error("exact resume: checkpoint holds a different optimizer kind");
+                return false;
+            }
             log_warn("checkpoint holds adamw moments but trainer uses lion; starting fresh moments");
             return true;
         }
         if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+            if (strict) { log_error("exact resume: lion state unreadable"); return false; }
             log_warn("lion state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
+    } else if (has_opt && !opt && strict) {
+        log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
+        return false;
     }
     return true;
 }
 
 bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainState& state,
-                      bool* out_moments_restored) {
+                      bool* out_moments_restored, bool strict) {
     if (out_moments_restored) *out_moments_restored = false;
     // Mirrors the Lion loader exactly (weights + schedule + kind gate); only
     // the expected kind tag and the moments call differ.
@@ -846,8 +759,13 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         seen_muon.insert(name);
     }
     for (Parameter* pp : model.parameters()) {
-        if (seen_muon.find(pp->name) == seen_muon.end())
+        if (seen_muon.find(pp->name) == seen_muon.end()) {
+            if (strict) {
+                log_error("exact resume: checkpoint lacks param " + pp->name);
+                return false;
+            }
             log_warn("checkpoint lacks param " + pp->name + "; keeping fresh init");
+        }
     }
 
     u8 has_opt = 0;
@@ -855,21 +773,34 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     if (is_legacy) {
         // v3/v4 payloads predate Muon: weights already restored above,
         // moments restart fresh for the optimizer only.
-        if (has_opt)
+        if (has_opt) {
+            if (strict) {
+                log_error("exact resume: legacy checkpoint cannot supply muon moments");
+                return false;
+            }
             log_warn("checkpoint is legacy but trainer uses muon; "
                      "weights/schedule restored, moments restart fresh");
+        }
         return true;
     }
     u8 kind = OPT_ADAMW;
     if (has_opt && !rd(f, kind)) return false;
     if (has_opt && opt) {
         if (kind != OPT_MUON) {
+            if (strict) {
+                log_error("exact resume: checkpoint holds a different optimizer kind");
+                return false;
+            }
             log_warn("checkpoint holds other-optimizer moments but trainer uses muon; starting fresh moments");
             return true;
         }
         if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+            if (strict) { log_error("exact resume: muon state unreadable"); return false; }
             log_warn("muon state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
+    } else if (has_opt && !opt && strict) {
+        log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
+        return false;
     }
     return true;
 }

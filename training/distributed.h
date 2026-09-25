@@ -49,6 +49,7 @@ public:
     // `buffer` must be on the current CUDA device, size = numel * sizeof(float)
     void all_reduce_sum(float* buffer, size_t numel);
     void all_reduce_sum(void* buffer, size_t numel, int dtype_size);
+    void all_reduce_sum_i64(int64_t* buffer, size_t numel);
 
     // Broadcast from root to all
     void broadcast(void* buffer, size_t numel, int dtype_size, int root = 0);

@@ -7,6 +7,7 @@
 #include "dataset/cleaner.h"
 #include "dataset/dedup.h"
 #include "dataset/english_logic.h"
+#include "dataset/english_synth.h"
 #include "dataset/langid.h"
 #include "dataset/synth.h"
 #include "dataset/corpus_stats.h"
@@ -131,7 +132,59 @@ struct PipelineCounters {
     std::map<std::string, u64> lang_kept;
 };
 
+// ================================================================ synth-en command
+// English dialogue-behavior synthesizer: composes the authored exchanges in
+// dataset/english_dialogue_data.h into SFT-ready chat JSONL (same schema as
+// `synth`, so `build --chat` consumes it unchanged). This is the behavior
+// layer the Hermes lake does not carry: persona, honesty, refusal, and
+// dialogue flow. Every assistant turn passed the english_logic discipline
+// gate at generation time.
+static int cmd_synth_en(const Args& args) {
+    english_synth::EnglishSynthConfig cfg;
+    cfg.seed = args.num_u64("seed", 4321);
+    cfg.num_conversations = args.num_int("n", 20000);
+    cfg.max_template_uses = args.num_int("max-template-uses", 40);
+    cfg.min_turns = args.num_int("min-turns", 2);
+    cfg.max_turns = args.num_int("max-turns", 10);
+    GAI_CHECK(cfg.num_conversations >= 0, "--n must be >= 0");
+    GAI_CHECK(cfg.max_template_uses > 0, "--max-template-uses must be > 0");
+
+    std::string out = args.str("out", "data/synth_en.jsonl");
+    fs::create_directories(fs::path(out).has_parent_path() ? fs::path(out).parent_path() : ".");
+
+    log_info(strfmt("[synth-en] target %d conversations, seed %llu (%d behavior domains)",
+                    cfg.num_conversations, (unsigned long long)cfg.seed,
+                    english_synth::EnglishSynthGenerator::domain_count()));
+    Timer t;
+    english_synth::EnglishSynthGenerator gen(cfg);
+    auto convs = gen.generate_many(cfg.num_conversations);
+    write_conversations_jsonl(out, convs);
+
+    log_info("[synth-en] " + gen.stats().summary());
+    log_info(strfmt("[synth-en] wrote %s conversations to %s in %s",
+                    human_count(convs.size()).c_str(), out.c_str(),
+                    human_duration(t.seconds()).c_str()));
+
+    log_info("  -- by domain --");
+    for (const auto& [d, n] : gen.stats().by_domain)
+        log_info(strfmt("    %-28s %s", d.c_str(), human_count(n).c_str()));
+
+    log_info("\n  -- sample conversation --");
+    if (!convs.empty()) {
+        for (const auto& m : convs[0].messages) {
+            const char* r = m.role == Role::System ? "system" :
+                            m.role == Role::User ? "user" : "assistant";
+            log_info(strfmt("    %-9s : %s", r, m.content.c_str()));
+        }
+    }
+    return 0;
+}
+
 static int cmd_synth(const Args& args) {
+    const std::string lang = args.str("lang", "darija");
+    if (lang != "darija" && lang != "en")
+        GAI_FAIL("--lang must be 'darija' or 'en' (got '" + lang + "')");
+    if (lang == "en") return cmd_synth_en(args);
     SynthConfig cfg;
     cfg.seed = args.num_u64("seed", 1234);
     cfg.num_conversations = args.num_int("n", 20000);

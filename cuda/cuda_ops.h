@@ -136,6 +136,19 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
 
+// F-10: device-side loss/count accumulation (see core/ops.h). The accumulators
+// are persistent device memory (16 bytes, monotonic by design). accumulate()
+// folds one chunk with no host traffic; end() performs the single D2H.
+void sce_acc_begin();
+void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale = 0.0f);
+void sce_acc_end(double* out_loss_sum, i64* out_count);
+
+// F-02: acc[e] += 1 per routed slot, atomic, on device. Called once per MoE
+// layer per microbatch into the model's persistent [L*ne] counter; the only
+// host traffic is the single [L*ne] read per optimizer step.
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
+
 // ---- inference fast sampling (audit P1). topk: exact top-K descending
 // (ties: lowest id). argmax: full-vocab first-max + single-int D2H.
 // penalties: in-place CTRL mirror (hist H2D is fire-and-forget, no stall).
@@ -162,8 +175,14 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
 
 // Scratch pools used by reduction/MoE kernels. Pools grow monotonically
 // during the run (by design, not a leak) and are released here / at shutdown.
+// F-16: reserve_workspaces() pre-sizes both pools from the configured recipe
+// BEFORE the first step, so the run never pays a cudaFree+cudaMalloc resize
+// stall (cudaFree can force a full device synchronization) mid-training.
+// Sizes come from Model::workspace_plan() (pure arithmetic, no allocation).
 void  free_workspace();
 void  moe_free_workspace();
+void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
+void  moe_reserve_workspace(size_t bytes);
 
 } // namespace cuda_ops
 } // namespace gai

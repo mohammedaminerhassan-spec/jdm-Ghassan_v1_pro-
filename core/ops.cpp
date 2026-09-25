@@ -94,15 +94,61 @@ static std::atomic<u64> g_perf_gemm{0};
 static std::atomic<u64> g_perf_fp16{0};
 static std::atomic<u64> g_perf_h2d{0};
 static std::atomic<u64> g_perf_d2h{0};
+static std::atomic<u64> g_perf_moe_fwd{0};
+static std::atomic<u64> g_perf_moe_fwd_us{0};
+static std::atomic<u64> g_perf_moe_bwd{0};
+static std::atomic<u64> g_perf_moe_bwd_us{0};
+static std::atomic<u64> g_perf_sce{0};
+static std::atomic<u64> g_perf_sce_us{0};
+static std::atomic<u64> g_perf_sync{0};
+static std::atomic<u64> g_perf_opt{0};
+static std::atomic<u64> g_perf_opt_us{0};
+static std::atomic<u64> g_perf_muon_ns{0};
+static std::atomic<u64> g_perf_muon_ns_iters{0};
+static std::atomic<u64> g_perf_muon_ns_us{0};
 void perf_note_fp16_gemm() { g_perf_fp16.fetch_add(1, std::memory_order_relaxed); }
 void perf_note_h2d(size_t n) { g_perf_h2d.fetch_add(static_cast<u64>(n), std::memory_order_relaxed); }
 void perf_note_d2h(size_t n) { g_perf_d2h.fetch_add(static_cast<u64>(n), std::memory_order_relaxed); }
+void perf_note_sync() { g_perf_sync.fetch_add(1, std::memory_order_relaxed); }
+void perf_note_moe_fwd(u64 us) {
+    g_perf_moe_fwd.fetch_add(1, std::memory_order_relaxed);
+    g_perf_moe_fwd_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_moe_bwd(u64 us) {
+    g_perf_moe_bwd.fetch_add(1, std::memory_order_relaxed);
+    g_perf_moe_bwd_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_sce(u64 us) {
+    g_perf_sce.fetch_add(1, std::memory_order_relaxed);
+    g_perf_sce_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_opt_step(u64 us) {
+    g_perf_opt.fetch_add(1, std::memory_order_relaxed);
+    g_perf_opt_us.fetch_add(us, std::memory_order_relaxed);
+}
+void perf_note_muon_ns(int iters, u64 us) {
+    g_perf_muon_ns.fetch_add(1, std::memory_order_relaxed);
+    g_perf_muon_ns_iters.fetch_add(static_cast<u64>(iters), std::memory_order_relaxed);
+    g_perf_muon_ns_us.fetch_add(us, std::memory_order_relaxed);
+}
 PerfCounters perf_counters() {
     PerfCounters c;
     c.gemm_calls      = g_perf_gemm.load(std::memory_order_relaxed);
     c.gemm_fp16_calls = g_perf_fp16.load(std::memory_order_relaxed);
     c.h2d_bytes       = g_perf_h2d.load(std::memory_order_relaxed);
     c.d2h_bytes       = g_perf_d2h.load(std::memory_order_relaxed);
+    c.moe_fwd_calls   = g_perf_moe_fwd.load(std::memory_order_relaxed);
+    c.moe_bwd_calls   = g_perf_moe_bwd.load(std::memory_order_relaxed);
+    c.moe_fwd_us      = g_perf_moe_fwd_us.load(std::memory_order_relaxed);
+    c.moe_bwd_us      = g_perf_moe_bwd_us.load(std::memory_order_relaxed);
+    c.sce_calls       = g_perf_sce.load(std::memory_order_relaxed);
+    c.sce_us          = g_perf_sce_us.load(std::memory_order_relaxed);
+    c.sync_calls      = g_perf_sync.load(std::memory_order_relaxed);
+    c.opt_steps       = g_perf_opt.load(std::memory_order_relaxed);
+    c.opt_step_us     = g_perf_opt_us.load(std::memory_order_relaxed);
+    c.muon_ns_calls   = g_perf_muon_ns.load(std::memory_order_relaxed);
+    c.muon_ns_iters   = g_perf_muon_ns_iters.load(std::memory_order_relaxed);
+    c.muon_ns_us      = g_perf_muon_ns_us.load(std::memory_order_relaxed);
     return c;
 }
 void perf_reset() {
@@ -110,14 +156,35 @@ void perf_reset() {
     g_perf_fp16.store(0, std::memory_order_relaxed);
     g_perf_h2d.store(0, std::memory_order_relaxed);
     g_perf_d2h.store(0, std::memory_order_relaxed);
+    g_perf_moe_fwd.store(0, std::memory_order_relaxed);
+    g_perf_moe_fwd_us.store(0, std::memory_order_relaxed);
+    g_perf_moe_bwd.store(0, std::memory_order_relaxed);
+    g_perf_moe_bwd_us.store(0, std::memory_order_relaxed);
+    g_perf_sce.store(0, std::memory_order_relaxed);
+    g_perf_sce_us.store(0, std::memory_order_relaxed);
+    g_perf_sync.store(0, std::memory_order_relaxed);
+    g_perf_opt.store(0, std::memory_order_relaxed);
+    g_perf_opt_us.store(0, std::memory_order_relaxed);
+    g_perf_muon_ns.store(0, std::memory_order_relaxed);
+    g_perf_muon_ns_iters.store(0, std::memory_order_relaxed);
+    g_perf_muon_ns_us.store(0, std::memory_order_relaxed);
 }
 std::string perf_report() {
     PerfCounters c = perf_counters();
-    return strfmt("gemm=%s (fp16 %s) h2d=%s d2h=%s",
+    auto ms = [](u64 us, u64 n) -> double { return n ? static_cast<double>(us) / 1000.0 / static_cast<double>(n) : 0.0; };
+    return strfmt("gemm=%s (fp16 %s) h2d=%s d2h=%s | moe fwd=%s (%.1fms) bwd=%s (%.1fms) | "
+                  "ce=%s (%.1fms) | sync=%s | opt=%s (%.1fms) | muon-ns=%s/%sit (%.1fms)",
                   human_count(c.gemm_calls).c_str(),
                   human_count(c.gemm_fp16_calls).c_str(),
                   human_bytes(c.h2d_bytes).c_str(),
-                  human_bytes(c.d2h_bytes).c_str());
+                  human_bytes(c.d2h_bytes).c_str(),
+                  human_count(c.moe_fwd_calls).c_str(), ms(c.moe_fwd_us, c.moe_fwd_calls),
+                  human_count(c.moe_bwd_calls).c_str(), ms(c.moe_bwd_us, c.moe_bwd_calls),
+                  human_count(c.sce_calls).c_str(), ms(c.sce_us, c.sce_calls),
+                  human_count(c.sync_calls).c_str(),
+                  human_count(c.opt_steps).c_str(), ms(c.opt_step_us, c.opt_steps),
+                  human_count(c.muon_ns_calls).c_str(), human_count(c.muon_ns_iters).c_str(),
+                  ms(c.muon_ns_us, c.muon_ns_calls));
 }
 
 void gemm(Device dev, bool ta, bool tb, int M, int N, int K, float alpha,
@@ -382,6 +449,9 @@ void attention_decode_ex(Device dev,
 }
 
 // MoE has CPU + CUDA backends only (T4-only build).
+// Telemetry: a steady_clock read per dispatch (~20ns) is invisible next to a
+// per-layer expert launch, and it is what makes launch storms observable in
+// the training log instead of only in Nsight.
 void moe_forward(Device dev,
                  const float* x, const float* router_w,
                  const float* gates, const float* ups, const float* downs,
@@ -390,11 +460,13 @@ void moe_forward(Device dev,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
                  i64 N, int d, int E, int ne, int K) {
+    Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                               out, probs_cache, idx_cache, w_cache,
                               s_gate, s_up, s_act, N, d, E, ne, K);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
 #endif
@@ -402,6 +474,7 @@ void moe_forward(Device dev,
     cpu::moe_forward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
                      out, probs_cache, idx_cache, w_cache,
                      s_gate, s_up, s_act, N, d, E, ne, K);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
 }
 
 void moe_forward_bias(Device dev,
@@ -413,15 +486,19 @@ void moe_forward_bias(Device dev,
                       float* s_gate, float* s_up, float* s_act,
                       i64 N, int d, int E, int ne, int K) {
     if (!router_bias) {
+        // Delegates to moe_forward, which already counts itself: do not note
+        // here or the decode/aux-free path would double-count.
         moe_forward(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                     probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K);
         return;
     }
+    Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
                                    out, probs_cache, idx_cache, w_cache,
                                    s_gate, s_up, s_act, N, d, E, ne, K);
+        perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
 #endif
@@ -429,6 +506,7 @@ void moe_forward_bias(Device dev,
     cpu::moe_forward_bias(x, router_w, router_bias, gates, ups, downs, sh_g, sh_u, sh_d,
                           out, probs_cache, idx_cache, w_cache,
                           s_gate, s_up, s_act, N, d, E, ne, K);
+    perf_note_moe_fwd(static_cast<u64>(t.elapsed_us()));
 }
 
 void moe_backward(Device dev,
@@ -444,6 +522,7 @@ void moe_backward(Device dev,
                   float* dsh_g, float* dsh_u, float* dsh_d,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K) {
+    Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
         cuda_ops::moe_backward(x, router_w, gates, ups, downs, sh_g, sh_u, sh_d,
@@ -451,6 +530,7 @@ void moe_backward(Device dev,
                                aux_frac, aux_scale, dout, dx,
                                drouter_w, dgates, dups, ddowns,
                                dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K);
+        perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
         return;
     }
 #endif
@@ -460,6 +540,7 @@ void moe_backward(Device dev,
                       aux_frac, aux_scale, dout, dx,
                       drouter_w, dgates, dups, ddowns,
                       dsh_g, dsh_u, dsh_d, s_dact, N, d, E, ne, K);
+    perf_note_moe_bwd(static_cast<u64>(t.elapsed_us()));
 }
 
 bool moe_aux_gpu(Device dev,
@@ -498,7 +579,71 @@ void softmax_cross_entropy(Device dev, const float* logits, const i32* targets,
                            float* dlogits, i64 n, int V,
                            double* out_loss_sum, i64* out_count,
                            float z_scale) {
-    GAI_DISPATCH(dev, softmax_cross_entropy(logits, targets, dlogits, n, V, out_loss_sum, out_count, z_scale));
+    // Hand-rolled dispatch (not GAI_DISPATCH): the timer note must fire on
+    // BOTH the CUDA and CPU paths, and the macro returns early on CUDA.
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::softmax_cross_entropy(logits, targets, dlogits, n, V, out_loss_sum, out_count, z_scale);
+        perf_note_sce(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::softmax_cross_entropy(logits, targets, dlogits, n, V, out_loss_sum, out_count, z_scale);
+    perf_note_sce(static_cast<u64>(t.elapsed_us()));
+}
+
+// F-10: device-side accumulate API. The timer note fires per accumulate call
+// (it measures dispatch+kernel time, not the deferred reduction).
+void sce_acc_begin(Device dev) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_acc_begin();
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_acc_begin();
+}
+
+void sce_accumulate(Device dev,
+                    const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale) {
+    Timer t;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_accumulate(logits, targets, dlogits, n, V, z_scale);
+        perf_note_sce(static_cast<u64>(t.elapsed_us()));
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_accumulate(logits, targets, dlogits, n, V, z_scale);
+    perf_note_sce(static_cast<u64>(t.elapsed_us()));
+}
+
+void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::sce_acc_end(out_loss_sum, out_count);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::sce_acc_end(out_loss_sum, out_count);
+}
+
+// F-02: on-device slot counting for the aux-free bias (zero D2H per layer).
+void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne) {
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) {
+        cuda_ops::moe_count_slots(idx, acc, NK, ne);
+        return;
+    }
+#endif
+    (void)dev;
+    cpu::moe_count_slots(idx, acc, NK, ne);
 }
 
 void adamw_step(Device dev, float* w, const float* g, float* m, float* v, i64 n,

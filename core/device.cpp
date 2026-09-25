@@ -170,7 +170,10 @@ void device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, siz
 
 void device_synchronize(Device dev) {
 #ifdef GAI_CUDA
-    if (dev == Device::CUDA) cuda::synchronize();
+    if (dev == Device::CUDA) {
+        cuda::synchronize();
+        ops::perf_note_sync();
+    }
 #else
     (void)dev;
 #endif

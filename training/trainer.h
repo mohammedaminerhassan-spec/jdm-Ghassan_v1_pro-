@@ -52,6 +52,11 @@ struct TrainerConfig {
     float beta2         = 0.95f;   // lion default overridden to 0.99 when optimizer==lion
     float eps           = 1e-8f;   // adamw only
     float grad_clip     = 1.0f;
+    // F-04: muon-only knobs. ns_steps tunes the Newton-Schulz cost directly;
+    // muon_min_ns_dim gates small matrices out of NS (0 = NS on every decay
+    // matrix, historical). None of the shipped T4 recipes enable muon.
+    int   muon_ns_steps   = 5;    // 1..10, clamped by the Muon ctor
+    int   muon_min_ns_dim = 0;    // >=0
     // scheduler
     std::string scheduler = "cosine";  // cosine | wsd
     float sched_decay_frac = 0.2f;     // wsd: last 20% linearly decays
@@ -102,6 +107,18 @@ struct TrainerConfig {
     // Loss weights (aux/z/jitter) stay warn-only: retuning them on resume is
     // legitimate. true: explicit opt-out for research (--allow-recipe-drift).
     bool  allow_recipe_drift   = false;
+    // F-08 resume contract.
+    //   "migrate" (default): keep the historical forgiving behavior — a math
+    //                      drift warns, a missing parameter keeps its fresh
+    //                      init, an optimizer-kind switch restarts moments at
+    //                      t_=0. Always LOGS exactly what was reset.
+    //   "exact": fail closed on parameter set/shape, tokenizer vocab, model
+    //             math fields, optimizer kind/state, scheduler recipe and DDP
+    //             world size. Use it for production runs where a silently
+    //             different model is worse than a failed start.
+    // --allow-recipe-drift stays the explicit escape hatch in both modes.
+    std::string resume_mode = "migrate";
+    bool resume_exact() const { return resume_mode == "exact"; }
 
     // "pretrain" = LM training on raw shards (masks, if present, still apply).
     // "sft"/"cpt" = instruction tuning on chat shards (requires loss masks).
@@ -217,30 +234,60 @@ private:
     void sync_gradients();  // fused bucketed all-reduce SUM (token-weighted; no /world_size)
     void sync_model();      // broadcast model from rank 0 (for initialization/resume)
     i64 sync_ntok_sum(i64 local); // exact global supervised count (sum over ranks)
+    // F-11: aux-free router bias is optimizer-step-coupled control state, so it
+    // only moves when the optimizer actually applied an update. All-reduces the
+    // [L*ne] slot-count accumulator across ranks, then applies the EMA once.
+    void sync_moe_bias(bool opt_step_applied);
     bool is_main_rank() const;    // rank 0 or single-GPU (logs/writes checkpoints)
+    // F-01: collective helpers. Every rank must call these unconditionally so
+    // the NCCL collective order stays identical across ranks; they are no-ops
+    // for single-process runs.
+    void broadcast_from_main(void* buf, size_t numel, int dtype_size);
+    // F-01: the rank-0-only validation decision is broadcast so that all ranks
+    // agree on whether this step produced a new best checkpoint — and therefore
+    // all enter save() (which contains collectives) the same number of times.
+    void sync_eval_best(bool is_main, bool is_best);
+    // F-07: surface a fatal background-checkpoint failure at the next safe
+    // training boundary instead of letting thousands of steps burn GPU hours
+    // on an unusable disk.
+    void check_ckpt_health();
     // Persistent fused DDP staging (grows monotonically, never per-step alloc).
     Tensor dist_fused_;
-    Tensor dist_ntok_; // persistent 1-float device buffer for ntok sync (no per-step alloc)
+    Tensor dist_ntok_; // persistent 1-i64 device buffer for ntok sync (no per-step alloc)
 
     // ---- Phase 1D: background checkpoint writer ----
     // Serialization runs on a dedicated thread so the training loop never
-    // stalls on disk I/O. The mutex+cv protect pending_save_fn_ (the closure
-    // that captures all state by value at the call site). save_async() returns
-    // immediately; wait_for_save() drains before run() exits or a new save
-    // supersedes the queued one (we keep only the latest pending write).
+    // stalls on disk I/O. The mutex+cv protect pending_saves_ (immutable
+    // snapshots captured by value at the call site). save_async() returns
+    // immediately; wait_for_save() drains before run() exits, and a new save
+    // for the same destination supersedes the queued one.
+    //
+    // F-05: kCkptRamBudgetBytes bounds every LIVE snapshot reference (queued +
+    // in-flight + retained cache). Exceeding it applies backpressure to the
+    // training thread rather than aborting the run.
+    static constexpr size_t kCkptRamBudgetBytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
     std::thread            ckpt_writer_thread_;
     std::mutex             ckpt_mutex_;
     std::condition_variable ckpt_cv_;
-    std::deque<std::function<void()>> pending_saves_;
+    struct QueuedSave {
+        std::string path;
+        i64 step = -1;   // model step, so a second name can reuse the file (F-06)
+        std::shared_ptr<CheckpointSnapshot> snapshot;
+    };
+    std::vector<QueuedSave> pending_saves_;
     bool                   ckpt_stop_ = false;
     bool                   ckpt_busy_ = false;
     bool                   ckpt_failed_ = false;
     std::string            ckpt_error_;
+    // Snapshot currently being serialized (counted in the RAM budget).
+    std::shared_ptr<CheckpointSnapshot> ckpt_active_;
+    // Committed step -> path, bounded to the newest few (F-06 reuse source).
+    std::map<i64, std::string>          ckpt_committed_;
     std::shared_ptr<CheckpointSnapshot> snapshot_cache_;
     i64                    snapshot_step_ = -1;
     void start_ckpt_writer();
     void stop_ckpt_writer();
-    void save_async(std::function<void()> fn);  // enqueue; drops superseded writes
+    void save_async(const std::string& path, std::shared_ptr<CheckpointSnapshot> snapshot);  // enqueue; drops superseded writes
     void wait_for_save();                       // block until queue is empty
 
     // ---- Phase 1C: prefetch batch ----

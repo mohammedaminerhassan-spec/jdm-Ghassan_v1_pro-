@@ -51,6 +51,12 @@ static void* moe_workspace(size_t bytes) {
     return g_moe_ws;
 }
 
+// F-16: pre-size the MoE pool before the first step (see reserve_workspaces).
+void moe_reserve_workspace(size_t bytes) {
+    if (bytes == 0) return;
+    moe_workspace(bytes);
+}
+
 // Persistent grouped-slot buffers: avoids cudaMalloc/cudaFree on every
 // layer in every micro-batch (was 1600+ allocs per optimizer step) and
 // avoids the old read_slots() host roundtrip of N*K ints per layer.
@@ -335,6 +341,166 @@ __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
     }
 }
 
+// ================================================================ F-03 fused grouped elementwise
+// Each kernel below runs ONCE per layer over all NK grouped slots instead of
+// once per expert. The math is identical to the per-expert sequence it
+// replaces (same indexing, same grouped-slot layout as moe_build_groups);
+// only the launch count changes (~72 -> ~31 launches/layer at ne=8, K=2).
+// The fusion LOGIC is proven bit-exact on CPU by tests/test_moe_fused.cpp
+// (cpu::moe_pack_all / moe_save3_all / moe_scatter_add_all), so these bodies
+// are mechanical translations of validated code. The GEMMs stay per-expert:
+// cuBLAS has no variable-m batched API, and padding every expert to max_ns
+// would waste compute exactly when the router is imbalanced.
+
+// Xpack[s] = x[grouped[s]/K] — pack every expert's input rows in one pass.
+__global__ void k_pack_all(const float* x, const i32* grouped, float* out,
+                           i64 NK, int d, int K) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= NK) return;
+    i32 t = grouped[s] / K;
+    const float* r = x + (i64)t * d;
+    float* o = out + s * d;
+    int j = 0;
+    if ((d & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (; j < d / 4; ++j) o4[j] = r4[j];
+    } else {
+        for (; j < d; ++j) o[j] = r[j];
+    }
+}
+
+// s_*[grouped[s]] = block[s] for G/U/A — save every expert's activations once.
+// Destination order is slot-major, exactly as the per-expert k_scatter_copy
+// sequence produced it (the backward pass reads s_* in slot order).
+__global__ void k_save3_all(const float* G, const float* U, const float* A,
+                            const i32* grouped,
+                            float* s_gate, float* s_up, float* s_act,
+                            i64 NK, int E) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= NK) return;
+    i64 slot = grouped[s];
+    const float* g = G + s * E;
+    const float* u = U + s * E;
+    const float* a = A + s * E;
+    float* og = s_gate + slot * E;
+    float* ou = s_up + slot * E;
+    float* oa = s_act + slot * E;
+    int j = 0;
+    if ((E & 3) == 0) {
+        const float4* g4 = reinterpret_cast<const float4*>(g);
+        const float4* u4 = reinterpret_cast<const float4*>(u);
+        const float4* a4 = reinterpret_cast<const float4*>(a);
+        float4* og4 = reinterpret_cast<float4*>(og);
+        float4* ou4 = reinterpret_cast<float4*>(ou);
+        float4* oa4 = reinterpret_cast<float4*>(oa);
+        for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+    } else {
+        for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+    }
+}
+
+// out[t] += w[t,k] * Y[s] over every grouped slot at once. K slots of one
+// token share the destination row, so (like k_scatter_add) this accumulates;
+// the caller zeroes `out` for the routed contribution before launching.
+__global__ void k_scatter_add_all(float* out, const float* Y, const i32* grouped,
+                                  const float* w, i64 NK, int d, int K) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= NK) return;
+    i32 slot = grouped[s];
+    i32 t = slot / K;
+    i32 k = slot % K;
+    float wv = w ? w[(i64)t * K + k] : 1.0f;
+    float* o = out + (i64)t * d;
+    const float* r = Y + s * d;
+    if ((d & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        for (int j = 0; j < d / 4; ++j) {
+            float4 v = r4[j];
+            atomicAdd(&o[j * 4 + 0], wv * v.x);
+            atomicAdd(&o[j * 4 + 1], wv * v.y);
+            atomicAdd(&o[j * 4 + 2], wv * v.z);
+            atomicAdd(&o[j * 4 + 3], wv * v.w);
+        }
+    } else {
+        for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
+    }
+}
+
+// G/U/A[s] = s_*[grouped[s]] — gather every expert's saved activations in one
+// pass (inverse of k_save3_all, for the backward pass).
+__global__ void k_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
+                              const i32* grouped, float* G, float* U, float* A,
+                              i64 NK, int E) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= NK) return;
+    i64 slot = grouped[s];
+    const float* g = s_gate + slot * E;
+    const float* u = s_up + slot * E;
+    const float* a = s_act + slot * E;
+    float* og = G + s * E;
+    float* ou = U + s * E;
+    float* oa = A + s * E;
+    int j = 0;
+    if ((E & 3) == 0) {
+        const float4* g4 = reinterpret_cast<const float4*>(g);
+        const float4* u4 = reinterpret_cast<const float4*>(u);
+        const float4* a4 = reinterpret_cast<const float4*>(a);
+        float4* og4 = reinterpret_cast<float4*>(og);
+        float4* ou4 = reinterpret_cast<float4*>(ou);
+        float4* oa4 = reinterpret_cast<float4*>(oa);
+        for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+    } else {
+        for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+    }
+}
+
+// S[s] = dout[t] * w[t,k] — pack and scale the upstream grads in one pass.
+__global__ void k_scale_all(const float* dout, const float* w, const i32* grouped,
+                            float* S, i64 NK, int d, int K) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= NK) return;
+    i64 slot = grouped[s];
+    i64 t = slot / K;
+    i64 k = slot % K;
+    float wv = w ? w[t * K + k] : 1.0f;
+    const float* r = dout + t * d;
+    float* o = S + s * d;
+    int j = 0;
+    if ((d & 3) == 0) {
+        const float4* r4 = reinterpret_cast<const float4*>(r);
+        float4* o4 = reinterpret_cast<float4*>(o);
+        for (; j < d / 4; ++j) {
+            float4 v = r4[j];
+            v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
+            o4[j] = v;
+        }
+    } else {
+        for (; j < d; ++j) o[j] = r[j] * wv;
+    }
+}
+
+// ================================================================ F-02 on-device slot counting
+// acc[e] += 1 for every routed slot. One atomic per slot into a persistent
+// [L*ne] device counter — this is what removes the per-layer/per-microbatch
+// N*K-int D2H from the aux-free bias path (3,328 copies/step at 26L/acc128).
+// ne <= 64 keeps every counter in L2; K <= 8 bounds the per-slot work.
+__global__ void k_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (; s < NK; s += stride) {
+        int e = idx[s];
+        if (e >= 0 && e < ne) atomicAdd(&acc[e], 1.0f);
+    }
+}
+
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+    if (NK <= 0 || ne <= 0) return;
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe_count_slots: ne out of kernel range [1,64]");
+    k_count_slots<<<grid_for(NK, 256), 256>>>(idx, acc, NK, ne);
+    CU_CHECK(cudaGetLastError());
+}
+
 // dst[s] = src[t] * w[t,k]
 __global__ void k_scale_rows(const float* src, const float* w, const i32* slots,
                              float* dst, i64 nslots, int d, int K) {
@@ -585,33 +751,39 @@ void moe_forward(const float* x, const float* router_w,
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
 
-    // 4. routed experts, grouped on the GPU (tiny ne-only host sync).
+    // 4. routed experts, grouped on the GPU (tiny ne-only host sync for the
+    // GEMM pointer arithmetic below; every elementwise op is a single launch).
+    // F-03: one pack over all NK slots, per-expert GEMMs on packed blocks, one
+    // swiglu, one save, one scatter-add. Xblk doubles as the down-GEMM output
+    // (Ypack): the gate/up loop is fully complete before the down loop starts,
+    // and each expert owns a disjoint block, so the reuse is safe on one stream.
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
     moe_build_groups(idx_use, N, K, ne, &grouped, h_cnt, h_off);
     if (h_off[ne] <= 0) return;
 
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        i32* d_slots = grouped + h_off[e];
         const float* ge = gates + (size_t)e * E * d;
         const float* ue = ups   + (size_t)e * E * d;
-        const float* de = downs + (size_t)e * d * E;
-        k_gather_tok<<<grid_for(ns, 256), 256>>>(x, d_slots, Xblk, ns, d, K);
-        CU_CHECK(cudaGetLastError());
-        linear_forward(Xblk, ge, Gblk, (int)ns, d, E);
-        linear_forward(Xblk, ue, Ublk, (int)ns, d, E);
-        k_swiglu<<<grid_for(ns * E, 256), 256>>>(Gblk, Ublk, Ablk, ns * E);
-        CU_CHECK(cudaGetLastError());
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Gblk, d_slots, s_gate, ns, E);
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Ublk, d_slots, s_up, ns, E);
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Ablk, d_slots, s_act, ns, E);
-        CU_CHECK(cudaGetLastError());
-        linear_forward(Ablk, de, Xblk, (int)ns, E, d);
-        k_scatter_add<<<grid_for(ns, 256), 256>>>(out, Xblk, d_slots, w_use, ns, d, K);
-        CU_CHECK(cudaGetLastError());
+        linear_forward(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E);
+        linear_forward(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E);
     }
+    k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
+    CU_CHECK(cudaGetLastError());
+    k_save3_all<<<grid_for(NK, 256), 256>>>(Gblk, Ublk, Ablk, grouped, s_gate, s_up, s_act, NK, E);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const float* de = downs + (size_t)e * d * E;
+        linear_forward(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d);
+    }
+    k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
+    CU_CHECK(cudaGetLastError());
 }
 
 void moe_forward_bias(const float* x, const float* router_w, const float* router_bias,
@@ -668,27 +840,29 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
     moe_build_groups(idx_use, N, K, ne, &grouped, h_cnt, h_off);
     if (h_off[ne] <= 0) return;
 
+    // F-03 fused form (see moe_forward): identical math, ~60% fewer launches.
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
-        i32* d_slots = grouped + h_off[e];
         const float* ge = gates + (size_t)e * E * d;
         const float* ue = ups   + (size_t)e * E * d;
-        const float* de = downs + (size_t)e * d * E;
-        k_gather_tok<<<grid_for(ns, 256), 256>>>(x, d_slots, Xblk, ns, d, K);
-        CU_CHECK(cudaGetLastError());
-        linear_forward(Xblk, ge, Gblk, (int)ns, d, E);
-        linear_forward(Xblk, ue, Ublk, (int)ns, d, E);
-        k_swiglu<<<grid_for(ns * E, 256), 256>>>(Gblk, Ublk, Ablk, ns * E);
-        CU_CHECK(cudaGetLastError());
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Gblk, d_slots, s_gate, ns, E);
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Ublk, d_slots, s_up, ns, E);
-        k_scatter_copy<<<grid_for(ns, 256), 256>>>(Ablk, d_slots, s_act, ns, E);
-        CU_CHECK(cudaGetLastError());
-        linear_forward(Ablk, de, Xblk, (int)ns, E, d);
-        k_scatter_add<<<grid_for(ns, 256), 256>>>(out, Xblk, d_slots, w_use, ns, d, K);
-        CU_CHECK(cudaGetLastError());
+        linear_forward(Xblk + (size_t)h_off[e] * d, ge, Gblk + (size_t)h_off[e] * E, (int)ns, d, E);
+        linear_forward(Xblk + (size_t)h_off[e] * d, ue, Ublk + (size_t)h_off[e] * E, (int)ns, d, E);
     }
+    k_swiglu<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Ablk, NK * E);
+    CU_CHECK(cudaGetLastError());
+    k_save3_all<<<grid_for(NK, 256), 256>>>(Gblk, Ublk, Ablk, grouped, s_gate, s_up, s_act, NK, E);
+    CU_CHECK(cudaGetLastError());
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const float* de = downs + (size_t)e * d * E;
+        linear_forward(Ablk + (size_t)h_off[e] * E, de, Xblk + (size_t)h_off[e] * d, (int)ns, E, d);
+    }
+    k_scatter_add_all<<<grid_for(NK, 256), 256>>>(out, Xblk, grouped, w_use, NK, d, K);
+    CU_CHECK(cudaGetLastError());
 }
 
 // ================================================================ backward
@@ -750,11 +924,38 @@ void moe_backward(const float* x, const float* router_w,
         linear_backward(x, sh_u, shdu, dx, dsh_u, (int)N, d, E);
     }
 
-    // ---- routed experts, grouped on the GPU (tiny ne-only host sync).
+    // ---- routed experts, grouped on the GPU (tiny ne-only host sync for the
+    // GEMM pointer arithmetic; every elementwise op is a single launch).
+    // F-03: one gather3 + one pack + one scale over all NK slots, per-expert
+    // GEMMs on packed blocks, one swiglu_bwd, then the per-expert weight-grad
+    // GEMMs and dx scatter-adds (which have true per-expert dependencies).
     CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
     moe_build_groups(idx, N, K, ne, &grouped, h_cnt, h_off);
+
+    k_gather3_all<<<grid_for(NK, 256), 256>>>(s_gate, s_up, s_act, grouped, Gblk, Ublk, Ablk, NK, E);
+    CU_CHECK(cudaGetLastError());
+    k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+    k_scale_all<<<grid_for(NK, 256), 256>>>(dout, tw, grouped, Sblk, NK, d, K);
+    CU_CHECK(cudaGetLastError());
+
+    // dact for every slot: one GEMM per expert on packed blocks, then a single
+    // swiglu_bwd over the whole block (Dblk is fully populated at that point).
+    for (int e = 0; e < ne; ++e) {
+        i64 ns = (i64)h_cnt[e];
+        if (ns == 0) continue;
+        const float* de = downs + (size_t)e * d * E;
+        // dact[ns,E] = Sblk[ns,d] @ de[d,E] (NO transpose): direct GEMM.
+        gemm(false, false, (int)ns, E, d, 1.0f,
+             Sblk + (size_t)h_off[e] * d, d, de, E, 0.0f,
+             Dblk + (size_t)h_off[e] * E, E);
+    }
+    k_swiglu_bwd_assign<<<grid_for(NK * E, 256), 256>>>(Gblk, Ublk, Dblk,
+                                                        Gblk, Ublk, NK * E);
+    CU_CHECK(cudaGetLastError());
+    // Gblk/Ublk now hold dg/du for every slot.
 
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
@@ -766,40 +967,33 @@ void moe_backward(const float* x, const float* router_w,
         float* dge = dgates + (size_t)e * E * d;
         float* due = dups   + (size_t)e * E * d;
         float* dde = ddowns + (size_t)e * d * E;
+        const float* Gp = Gblk + (size_t)h_off[e] * E;
+        const float* Up = Ublk + (size_t)h_off[e] * E;
+        const float* Ap = Ablk + (size_t)h_off[e] * E;
+        const float* Xp = Xblk + (size_t)h_off[e] * d;
+        const float* Sp = Sblk + (size_t)h_off[e] * d;
 
-        k_gather<<<grid_for(ns, 256), 256>>>(s_act, d_slots, Ablk, ns, E);
-        k_gather<<<grid_for(ns, 256), 256>>>(s_gate, d_slots, Gblk, ns, E);
-        k_gather<<<grid_for(ns, 256), 256>>>(s_up, d_slots, Ublk, ns, E);
-        k_gather_tok<<<grid_for(ns, 256), 256>>>(x, d_slots, Xblk, ns, d, K);
-        k_scale_rows<<<grid_for(ns, 256), 256>>>(dout, tw, d_slots, Sblk, ns, d, K);
-        CU_CHECK(cudaGetLastError());
-
-        // dact[ns,E] = Sblk[ns,d] @ de[d,E] (NO transpose): direct GEMM.
-        gemm(false, false, (int)ns, E, d, 1.0f, Sblk, d, de, E, 0.0f, Dblk, E);
-        k_swiglu_bwd_assign<<<grid_for(ns * E, 256), 256>>>(Gblk, Ublk, Dblk,
-                                                     Gblk, Ublk, ns * E);
-        CU_CHECK(cudaGetLastError());
-        // Gblk/Ublk now hold dg/du. Down weight grad only (dx=NULL):
+        // Down weight grad only (dx=NULL):
         // dde[d,E] += Sblk[ns,d]^T @ Ablk[ns,E].
-        linear_backward(Ablk, de, Sblk, nullptr, dde, (int)ns, E, d);
+        linear_backward(Ap, de, Sp, nullptr, dde, (int)ns, E, d);
         // Gate path: dx piece [ns,d] into Sblk. Sblk still holds scaled-dout
         // and linear_backward accumulates (beta=1), so it must be zeroed first.
         // dge[E,d] += Gblk[ns,E]^T @ Xblk[ns,d].
-        zero(Sblk, (i64)ns * d);
-        linear_backward(Xblk, ge, Gblk, Sblk, dge, (int)ns, d, E);
-        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk, d_slots,
+        zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
+        linear_backward(Xp, ge, Gp, Sblk + (size_t)h_off[e] * d, dge, (int)ns, d, E);
+        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
                                                   nullptr, ns, d, K);
         CU_CHECK(cudaGetLastError());
         // Up path: same Sblk reuse (re-zero: it holds the gate dx-piece now).
-        zero(Sblk, (i64)ns * d);
-        linear_backward(Xblk, ue, Ublk, Sblk, due, (int)ns, d, E);
-        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk, d_slots,
+        zero(Sblk + (size_t)h_off[e] * d, (i64)ns * d);
+        linear_backward(Xp, ue, Up, Sblk + (size_t)h_off[e] * d, due, (int)ns, d, E);
+        k_scatter_add<<<grid_for(ns, 256), 256>>>(dx, Sblk + (size_t)h_off[e] * d, d_slots,
                                                   nullptr, ns, d, K);
         CU_CHECK(cudaGetLastError());
 
         // expert outputs for the router gradient: out_e = A @ de^T
-        linear_forward(Ablk, de, Sblk, (int)ns, E, d);
-        k_dp_dot<<<grid_for(ns, 256), 256>>>(dout, Sblk, d_slots, Pblk, ns, d, K);
+        linear_forward(Ap, de, Sblk + (size_t)h_off[e] * d, (int)ns, E, d);
+        k_dp_dot<<<grid_for(ns, 256), 256>>>(dout, Sblk + (size_t)h_off[e] * d, d_slots, Pblk, ns, d, K);
         k_scatter_copy<<<grid_for(ns, 256), 256>>>(Pblk, d_slots, dpfull, ns, 1);
         CU_CHECK(cudaGetLastError());
     }

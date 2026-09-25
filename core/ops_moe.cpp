@@ -408,5 +408,218 @@ void moe_backward(const float* x, const float* router_w,
     }
 }
 
+// ---------------------------------------------------------------- F-03 fused grouped helpers
+// CPU reference for the fused CUDA kernels in cuda/moe.cu (k_pack_all,
+// k_save3_all, k_scatter_add_all). Same grouped-slot layout, same indexing,
+// verified bit-exact against moe_forward() by tests/test_moe_fused.cpp.
+
+void moe_group_slots(const i32* idx, i64 N, int K, int ne,
+                     i32* grouped, int* counts, int* offsets) {
+    // Mirrors k_group_hist + k_group_offsets + k_group_fill exactly:
+    // histogram over experts, exclusive prefix sum, stable fill.
+    for (int e = 0; e < ne; ++e) counts[e] = 0;
+    const i64 NK = N * K;
+    for (i64 s = 0; s < NK; ++s) {
+        const int e = idx[s];
+        if (e >= 0 && e < ne) counts[e]++;
+    }
+    offsets[0] = 0;
+    for (int e = 0; e < ne; ++e) offsets[e + 1] = offsets[e] + counts[e];
+    std::vector<int> cursor(static_cast<size_t>(ne));
+    for (int e = 0; e < ne; ++e) cursor[static_cast<size_t>(e)] = offsets[e];
+    for (i64 t = 0; t < N; ++t) {
+        for (int k = 0; k < K; ++k) {
+            const int e = idx[static_cast<size_t>(t) * K + k];
+            if (e < 0 || e >= ne) continue;
+            grouped[cursor[static_cast<size_t>(e)]++] = static_cast<i32>(t * K + k);
+        }
+    }
+}
+
+void moe_pack_all(const float* x, const i32* grouped, float* out,
+                  i64 NK, int d, int K) {
+    // out[s] = x[grouped[s]/K]. One pass over every grouped slot.
+    for (i64 s = 0; s < NK; ++s) {
+        const i64 t = static_cast<i64>(grouped[s]) / K;
+        std::memcpy(out + s * d, x + t * d, sizeof(float) * static_cast<size_t>(d));
+    }
+}
+
+void moe_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
+                     const i32* grouped, float* G, float* U, float* A,
+                     i64 NK, int E) {
+    // G/U/A[s] = s_*[grouped[s]]. Inverse of moe_save3_all.
+    for (i64 s = 0; s < NK; ++s) {
+        const i64 slot = grouped[s];
+        std::memcpy(G + s * E, s_gate + slot * E, sizeof(float) * static_cast<size_t>(E));
+        std::memcpy(U + s * E, s_up + slot * E, sizeof(float) * static_cast<size_t>(E));
+        std::memcpy(A + s * E, s_act + slot * E, sizeof(float) * static_cast<size_t>(E));
+    }
+}
+
+void moe_scale_all(const float* dout, const float* w, const i32* grouped,
+                   float* S, i64 NK, int d, int K) {
+    // S[s] = dout[t] * w[t,k]. Fused pack+scale of the upstream grads.
+    for (i64 s = 0; s < NK; ++s) {
+        const i64 slot = grouped[s];
+        const i64 t = slot / K;
+        const i64 k = slot % K;
+        const float wv = w ? w[t * K + k] : 1.0f;
+        const float* r = dout + t * d;
+        float* o = S + s * d;
+        for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
+    }
+}
+
+void moe_save3_all(const float* G, const float* U, const float* A,
+                   const i32* grouped, float* s_gate, float* s_up, float* s_act,
+                   i64 NK, int E) {
+    // s_*[grouped[s]] = block[s]. Same destination order as the per-expert
+    // k_scatter_copy sequence (slot-major), just emitted in one pass.
+    for (i64 s = 0; s < NK; ++s) {
+        const i64 slot = grouped[s];
+        std::memcpy(s_gate + slot * E, G + s * E, sizeof(float) * static_cast<size_t>(E));
+        std::memcpy(s_up + slot * E, U + s * E, sizeof(float) * static_cast<size_t>(E));
+        std::memcpy(s_act + slot * E, A + s * E, sizeof(float) * static_cast<size_t>(E));
+    }
+}
+
+void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
+                         const float* w, i64 NK, int d, int K) {
+    // out[t] += w[t,k] * Y[s], single pass. K=2 slots of one token share the
+    // destination row, so (like the CUDA kernel) this accumulates; the caller
+    // must have zeroed `out` for the routed contribution first.
+    for (i64 s = 0; s < NK; ++s) {
+        const i64 slot = grouped[s];
+        const i64 t = slot / K;
+        const i64 k = slot % K;
+        const float wv = w ? w[t * K + k] : 1.0f;
+        float* o = out + t * d;
+        const float* r = Y + s * d;
+        for (int j = 0; j < d; ++j) o[j] += wv * r[j];
+    }
+}
+
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
+    // F-02 CPU reference: identical math to k_count_slots in cuda/moe.cu.
+    for (i64 s = 0; s < NK; ++s) {
+        const int e = idx[s];
+        if (e >= 0 && e < ne) acc[e] += 1.0f;
+    }
+}
+
+void moe_forward_fused(const float* x, const float* router_w,
+                       const float* gates, const float* ups, const float* downs,
+                       const float* sh_g, const float* sh_u, const float* sh_d,
+                       float* out,
+                       float* probs_cache, i32* idx_cache, float* w_cache,
+                       float* s_gate, float* s_up, float* s_act,
+                       float* Xpack, float* Gpack, float* Upack, float* Apack,
+                       float* Ypack, i32* grouped, int* counts, int* offsets,
+                       i64 N, int d, int E, int ne, int K) {
+    if (N <= 0) return;
+    GAI_CHECK(K >= 1 && K <= 8, "moe_forward_fused: K must be in [1,8]");
+    GAI_CHECK(ne > 0 && ne <= 64, "moe_forward_fused: ne out of range");
+    const i64 NK = N * K;
+
+    // 1. route exactly like moe_forward (same router math, same caches).
+    // NOTE: this duplicates the routing loop rather than calling moe_forward
+    // because the fused path needs idx/w in hand before packing; the math is
+    // copied verbatim so a divergence is a compile-visible diff, not drift.
+    {
+        FwdScratch sc;
+        sc.ensure(ne, E, d);
+        for (i64 t = 0; t < N; ++t) {
+            const float* xt = x + t * d;
+            for (int e = 0; e < ne; ++e)
+                sc.logits[e] = dot_row(xt, router_w + (size_t)e * d, d);
+            {
+                float jj = g_jitter_cpu.load(std::memory_order_relaxed);
+                if (jj > 0.0f && probs_cache) {
+                    for (int e = 0; e < ne; ++e)
+                        sc.logits[e] *= (1.0f + jj * 2.0f * jitter_u_cpu(t, e));
+                }
+            }
+            softmax_row(sc.logits.data(), ne);
+            i32 t_idx[8];
+            float t_w[8];
+            topk_pick(sc.logits.data(), ne, K, t_idx, t_w);
+            float sum_w = 0.0f;
+            for (int k = 0; k < K; ++k) sum_w += t_w[k];
+            float inv_w = sum_w > 1e-8f ? (1.0f / sum_w) : 0.0f;
+            for (int k = 0; k < K; ++k) t_w[k] *= inv_w;
+            if (probs_cache) std::memcpy(probs_cache + t * ne, sc.logits.data(),
+                                         sizeof(float) * (size_t)ne);
+            if (idx_cache) std::memcpy(idx_cache + t * K, t_idx, sizeof(i32) * (size_t)K);
+            if (w_cache) std::memcpy(w_cache + t * K, t_w, sizeof(float) * (size_t)K);
+        }
+    }
+
+    const i32* idx_use = idx_cache ? idx_cache : nullptr;
+    const float* w_use = w_cache ? w_cache : nullptr;
+    // The fused path needs materialized routing; without caches there is no
+    // grouped layout to pack from.
+    GAI_CHECK(idx_use != nullptr && w_use != nullptr,
+              "moe_forward_fused requires idx/w caches (training/inference always pass them)");
+
+    // 2. shared expert first (writes the base `out`, like the reference).
+    if (sh_g && sh_u && sh_d) {
+        std::vector<float> g(static_cast<size_t>(N) * E), u(static_cast<size_t>(N) * E),
+            a(static_cast<size_t>(N) * E);
+        for (i64 t = 0; t < N; ++t) {
+            linear_forward(x + t * d, sh_g, g.data() + t * E, 1, d, E);
+            linear_forward(x + t * d, sh_u, u.data() + t * E, 1, d, E);
+        }
+        swiglu_forward(g.data(), u.data(), a.data(), N * E);
+        for (i64 t = 0; t < N; ++t)
+            linear_forward(a.data() + t * E, sh_d, out + t * d, 1, E, d);
+    } else {
+        for (i64 t = 0; t < N; ++t)
+            std::fill(out + t * d, out + t * d + d, 0.0f);
+    }
+
+    // 3. group on the (already routed) indices.
+    moe_group_slots(idx_use, N, K, ne, grouped, counts, offsets);
+
+    // 4. pack every expert's input rows in one pass.
+    moe_pack_all(x, grouped, Xpack, NK, d, K);
+
+    // 5. per-expert gate/up GEMMs on packed blocks (same math as reference,
+    //    only the input layout changed from token-major to grouped).
+    for (int e = 0; e < ne; ++e) {
+        const int ns = counts[e];
+        if (ns == 0) continue;
+        const float* ge = gates + (size_t)e * E * d;
+        const float* ue = ups   + (size_t)e * E * d;
+        float* Gp = Gpack + (size_t)offsets[e] * E;
+        float* Up = Upack + (size_t)offsets[e] * E;
+        const float* Xp = Xpack + (size_t)offsets[e] * d;
+        for (int s = 0; s < ns; ++s) {
+            linear_forward(Xp + (size_t)s * d, ge, Gp + (size_t)s * E, 1, d, E);
+            linear_forward(Xp + (size_t)s * d, ue, Up + (size_t)s * E, 1, d, E);
+        }
+    }
+
+    // 6. one swiglu over the whole packed block.
+    swiglu_forward(Gpack, Upack, Apack, NK * E);
+
+    // 7. one save of every expert's G/U/A.
+    moe_save3_all(Gpack, Upack, Apack, grouped, s_gate, s_up, s_act, NK, E);
+
+    // 8. per-expert down GEMMs into the packed output block.
+    for (int e = 0; e < ne; ++e) {
+        const int ns = counts[e];
+        if (ns == 0) continue;
+        const float* de = downs + (size_t)e * d * E;
+        const float* Ap = Apack + (size_t)offsets[e] * E;
+        float* Yp = Ypack + (size_t)offsets[e] * d;
+        for (int s = 0; s < ns; ++s)
+            linear_forward(Ap + (size_t)s * E, de, Yp + (size_t)s * d, 1, E, d);
+    }
+
+    // 9. one weighted scatter-add over every slot.
+    moe_scatter_add_all(out, Ypack, grouped, w_use, NK, d, K);
+}
+
 } // namespace cpu
 } // namespace gai

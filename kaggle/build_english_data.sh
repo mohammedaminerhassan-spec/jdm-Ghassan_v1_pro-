@@ -99,14 +99,40 @@ echo "[2/2] english_instruction -> ${SHARD_EN} ..."
     --shard-tokens 50000000 --seq-len "${SHARD_SEQ_LEN}" \
     --report "${SHARD_EN}/report_instruction.txt"
 
+# ---- [3/3] behavior seasoning: authored persona/discipline dialogues --------
+# The Hermes lake teaches knowledge, not persona. These ~15k authored
+# conversations (greetings, honesty, refusal, neutrality, dialogue flow) are
+# what make the model behave like Ghassan instead of generic Hermes output.
+# Small on purpose (~2M tokens): seasoning, not the meal. SFT samples it at
+# 0.15 (see sft_en_pro.yaml mix); pretrain ignores it (lake dominates there).
+# Set SKIP_BEHAVIOR=1 to skip (not recommended for the English-Pro model).
+BEHAVIOR_N="${BEHAVIOR_N:-15000}"
+if [[ "${SKIP_BEHAVIOR:-0}" == "1" ]]; then
+    echo ""
+    echo "[3/3] behavior SKIPPED (SKIP_BEHAVIOR=1) — SFT mix expects english_behavior/* !"
+else
+    echo ""
+    echo "[3/3] english_behavior (${BEHAVIOR_N} authored conversations) -> ${SHARD_EN} ..."
+    BEHAVIOR_JSON="${SHARD_EN}/synth_en_behavior.jsonl"
+    "${BIN}" synth --lang en --n "${BEHAVIOR_N}" --seed 4321 \
+        --max-template-uses 400 --out "${BEHAVIOR_JSON}"
+    "${BIN}" build --chat "${BEHAVIOR_JSON}" \
+        --tokenizer "${TOK}" --expect-vocab 32000 \
+        --out "${SHARD_EN}" --domain english_behavior \
+        --style-mode en --keep-case \
+        --shard-tokens 50000000 --seq-len "${SHARD_SEQ_LEN}" \
+        --report "${SHARD_EN}/report_behavior.txt"
+    rm -f "${BEHAVIOR_JSON}"
+fi
+
 echo ""
 echo "---- inspect (MEASURED totals are the source of truth) ----"
 "${BIN}" inspect --shards "${SHARD_EN}" --tokenizer "${TOK}" || true
 
 echo ""
-echo "---- domain inventory vs configs/en_pro.yaml mix ----"
+echo "---- domain inventory vs configs/en_pro.yaml + sft_en_pro.yaml mix ----"
 MIX_MISSING=0
-for domain in english_chat english_instruction; do
+for domain in english_chat english_instruction english_behavior; do
     n=$(find "${SHARD_EN}" -name "train_${domain}_*.gbin" 2>/dev/null | wc -l)
     if [[ "$n" -eq 0 ]]; then
         echo "  [MISSING] train_${domain}_*.gbin"; MIX_MISSING=1

@@ -31,7 +31,11 @@ static void usage() {
     "  --optimizer adamw|lion|muon --scheduler cosine|wsd --ckpt-segments <n>\n"
     "  --ce-chunks <n>        chunked CE row-blocks, 0/1=off (default 4)\n"
     "  --strict-config        unknown/dead config keys fail instead of warning\n"
+    "  --dry-run              arithmetic-only memory/schedule estimate (allocates nothing)\n"
+    "  --max-vram-mb <n>      pre-flight gate: fail if the predicted peak exceeds n MiB\n"
+    "                         or leaves <10% headroom (use with --dry-run)\n"
   "  --allow-recipe-drift   resume despite rope/eps/ctx recipe drift (research only)\n"
+    "  --resume-mode exact|migrate   # exact: fail closed on any recipe/state drift\n"
     "  --gemm-fp16 0|1           # force CUDA fp16 GEMMs off/on\n"
     "  --device auto|cpu|cuda   --threads <n>\n"
     "  --export <path> --export-profile fp16|q8_k|q4_0|q4_k_m|q6_k --tokenizer <path>\n"
@@ -77,6 +81,12 @@ int main(int argc, char** argv) {
         if (args.has("checkpoint-dir"))  tcfg.checkpoint_dir = args.str("checkpoint-dir");
         if (args.has("resume"))          tcfg.resume = args.str("resume");
         if (args.flag("allow-recipe-drift")) tcfg.allow_recipe_drift = true;
+if (args.has("resume-mode")) {
+    const std::string rm = args.str("resume-mode");
+    if (rm != "exact" && rm != "migrate")
+        GAI_FAIL("--resume-mode must be 'exact' or 'migrate' (got '" + rm + "')");
+    tcfg.resume_mode = rm;
+}
         if (args.has("batch-size"))      tcfg.batch_size = strict_args ? args.num_int_strict("batch-size") : args.num_int("batch-size");
         if (args.has("seq-len"))         tcfg.seq_len = strict_args ? args.num_int_strict("seq-len") : args.num_int("seq-len");
         if (args.has("grad-accum"))      tcfg.grad_accum = strict_args ? args.num_int_strict("grad-accum") : args.num_int("grad-accum");
@@ -151,13 +161,20 @@ print_device_report();
              }
          }
          if (!tok_path.empty()) {
-             Tokenizer tok;
-             GAI_CHECK(tok.load(tok_path), "cannot load tokenizer: " + tok_path);
-             GAI_CHECK(tok.vocab_size() == mcfg.vocab_size,
-                       strfmt("tokenizer vocab_size %d != model.vocab_size %d "
-                              "(training would produce corrupt embeddings)",
-                              tok.vocab_size(), mcfg.vocab_size));
-             log_info(strfmt("[tok ] validated %s (vocab=%d matches model)", tok_path.c_str(), tok.vocab_size()));
+             if (args.flag("dry-run")) {
+                 // F-23: a memory/schedule estimate tokenizes nothing, so do
+                 // not make it depend on a 32k tokenizer being present. The
+                 // vocab gate still runs on the real (non-dry) path below.
+                 log_info(strfmt("[tok ] dry-run: skipping tokenizer load (%s)", tok_path.c_str()));
+             } else {
+                 Tokenizer tok;
+                 GAI_CHECK(tok.load(tok_path), "cannot load tokenizer: " + tok_path);
+                 GAI_CHECK(tok.vocab_size() == mcfg.vocab_size,
+                           strfmt("tokenizer vocab_size %d != model.vocab_size %d "
+                                  "(training would produce corrupt embeddings)",
+                                  tok.vocab_size(), mcfg.vocab_size));
+                 log_info(strfmt("[tok ] validated %s (vocab=%d matches model)", tok_path.c_str(), tok.vocab_size()));
+             }
          }
 
          Device dev = Device::CPU;
@@ -191,38 +208,47 @@ print_device_report();
         // FP16 cores, no BF16 cores). No TPU/bf16 path exists in this build.
         log_info(strfmt("[prec] compute precision: %s", tcfg.precision_name().c_str()));
 
-        Model model(mcfg, dev);
-        model.print_parameter_report();
-
         if (args.flag("dry-run")) {
-            size_t act = model.estimate_activation_bytes(tcfg.batch_size, tcfg.seq_len, true, tcfg.ce_chunks);
+            // F-23: ARITHMETIC ONLY. The old dry-run constructed the Model
+            // first, so a 1B CPU dry-run exhausted host RAM (exit 137) before
+            // printing the estimate it exists to print. Nothing is allocated
+            // here; Model::count_parameters() mirrors the constructor and
+            // tests/test_memory_plan.cpp keeps the two honest.
+            const Model::MemoryPlan plan = Model::plan_memory(
+                mcfg, tcfg.batch_size, tcfg.seq_len, /*with_grad=*/true, tcfg.ce_chunks,
+                tcfg.fp16_weight_cache);
+            size_t act = plan.activations;
             if (tcfg.activation_checkpointing && tcfg.batch_size > 1) {
                 int seg = tcfg.ckpt_segments > 1 ? tcfg.ckpt_segments : 2;
                 if (seg > tcfg.batch_size) seg = tcfg.batch_size;
                 act = (act + static_cast<size_t>(seg) - 1) / static_cast<size_t>(seg);
             }
-            u64 params = static_cast<u64>(model.num_parameters());
-            bool lion = (tcfg.optimizer == "lion");
-            bool muon = (tcfg.optimizer == "muon");
+            const u64 params = plan.params;
+            const bool lion = (tcfg.optimizer == "lion");
+            const bool muon = (tcfg.optimizer == "muon");
             // muon moments ~= lion (m everywhere + v on tiny norms) + NS scratch
             size_t opt_b = (lion || muon) ? params * 4 : params * 8;
             // P2-3: frozen embeddings carry no moments; don't overestimate.
             if (tcfg.freeze_embeddings) {
-                Parameter* fe = model.find_parameter("tok_embeddings");
-                if (fe) {
-                    const size_t frozen_b = static_cast<size_t>(fe->numel()) * ((lion || muon) ? 4 : 8);
-                    opt_b = (opt_b >= frozen_b) ? opt_b - frozen_b : 0;
-                }
+                const size_t frozen = static_cast<size_t>(mcfg.vocab_size) *
+                                      static_cast<size_t>(mcfg.hidden_size) *
+                                      ((lion || muon) ? 4 : 8);
+                opt_b = (opt_b >= frozen) ? opt_b - frozen : 0;
             }
+            const size_t total = plan.static_total + opt_b + act;
+
             log_info("---------------- dry run: memory estimate ----------------");
-            log_info(strfmt("  weights (fp32)      : %s", human_bytes(params * 4).c_str()));
-            log_info(strfmt("  gradients (fp32)    : %s", human_bytes(params * 4).c_str()));
+            log_info(strfmt("  parameters          : %s (%s without embeddings)",
+                            human_count(params).c_str(),
+                            human_count(plan.params_no_embedding).c_str()));
+            log_info(strfmt("  weights (fp32)      : %s", human_bytes(plan.weights).c_str()));
+            log_info(strfmt("  gradients (fp32)    : %s", human_bytes(plan.grads).c_str()));
             log_info(strfmt("  %s (fp32)    : %s",
                             muon ? "muon m+v+NS " : lion ? "lion m      " : "adamw m+v   ",
                             human_bytes(opt_b).c_str()));
-            size_t fp16_cache = tcfg.fp16_weight_cache ? static_cast<size_t>(params * 2) : 0;
-            log_info(strfmt("  fp16 weight cache  : %s",
-                            human_bytes(fp16_cache).c_str()));
+            log_info(strfmt("  fp16 weight cache  : %s%s",
+                            human_bytes(plan.fp16_cache).c_str(),
+                            tcfg.fp16_weight_cache ? "" : " (disabled)"));
             log_info(strfmt("  activations b=%d t=%d%s%s : %s",
                             tcfg.batch_size, tcfg.seq_len,
                             tcfg.activation_checkpointing ? " [ckpt]" : "",
@@ -230,8 +256,7 @@ print_device_report();
                             human_bytes(act).c_str()));
             log_info(strfmt("  sched %s | opt %s",
                             tcfg.scheduler.c_str(), tcfg.optimizer.c_str()));
-            log_info(strfmt("  TOTAL               : %s",
-                            human_bytes(params * 8 + fp16_cache + opt_b + act).c_str()));
+            log_info(strfmt("  TOTAL               : %s", human_bytes(total).c_str()));
             log_info(strfmt("  tokens per step     : %s",
                             human_count(static_cast<u64>(tcfg.tokens_per_step())).c_str()));
             if (tcfg.max_steps > 0)
@@ -242,8 +267,37 @@ print_device_report();
             else
                 log_info(strfmt("  schedule            : epochs mode (%d epochs; steps from data size)",
                                 tcfg.epochs));
+
+            // T4 pre-flight gate (acceptance criterion 10): a pilot must fail
+            // BEFORE burning GPU hours if the predicted peak leaves too little
+            // headroom. The trainer repeats a live check, but only after the
+            // model is already resident.
+            if (args.has("max-vram-mb")) {
+                const i64 budget_mb = args.num_int("max-vram-mb", 0);
+                if (budget_mb <= 0) GAI_FAIL("--max-vram-mb needs a positive MiB value");
+                const size_t budget = static_cast<size_t>(budget_mb) * 1024u * 1024u;
+                const double used_pct = 100.0 * static_cast<double>(total) / static_cast<double>(budget);
+                const double margin_pct = 100.0 - used_pct;
+                log_info(strfmt("  VRAM budget         : %s (predicted %.1f%% used, margin %.1f%%)",
+                                human_bytes(budget).c_str(), used_pct, margin_pct));
+                if (total > budget)
+                    GAI_FAIL(strfmt("predicted peak %s exceeds the VRAM budget %s by %s; "
+                                    "reduce batch/seq/chunks, enable activation checkpointing, "
+                                    "or pick a smaller recipe",
+                                    human_bytes(total).c_str(), human_bytes(budget).c_str(),
+                                    human_bytes(total - budget).c_str()));
+                if (margin_pct < 10.0)
+                    GAI_FAIL(strfmt("predicted peak %s leaves only %.1f%% headroom under %s "
+                                    "(need >=10%%: allocator fragmentation + NCCL + cuBLAS "
+                                    "workspaces push the real peak higher)",
+                                    human_bytes(total).c_str(), margin_pct,
+                                    human_bytes(budget).c_str()));
+            }
             return 0;
         }
+
+        Model model(mcfg, dev);
+        model.print_parameter_report();
 
         model.init_weights(tcfg.seed);
         model.enable_grad(true);

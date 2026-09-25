@@ -86,6 +86,56 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K);
 
+// ---- F-03 fused grouped helpers -------------------------------------------
+// These mirror the CUDA fused kernels in cuda/moe.cu one-to-one (same
+// indexing, same grouped-slot layout) so tests/test_moe_fused.cpp can prove
+// the fusion logic bit-exact against moe_forward() above. They are the CPU
+// reference for the fusion, not the production CPU path (which stays with the
+// token-major reference above).
+//
+// Grouped-slot layout (identical to moe_build_groups in cuda/moe.cu):
+//   grouped[s] for s in [0,NK) holds the token-space slot t*K+k, packed so
+//   that expert e owns grouped[offsets[e] .. offsets[e+1]).
+//   counts[e] = offsets[e+1]-offsets[e]; NK = N*K.
+//
+// slot: token-space position t*K+k (which token/k). grouped-position s: rank
+// in the grouped order. All three helpers iterate grouped positions.
+void moe_group_slots(const i32* idx, i64 N, int K, int ne,
+                     i32* grouped, int* counts, int* offsets);
+// out[s] = x[grouped[s]/K]  (pack every expert's input rows in one pass)
+void moe_pack_all(const float* x, const i32* grouped, float* out,
+                  i64 NK, int d, int K);
+// G/U/A[s] = s_*[grouped[s]]  (gather every expert's saved activations once;
+// the inverse of moe_save3_all, for the backward pass)
+void moe_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
+                     const i32* grouped, float* G, float* U, float* A,
+                     i64 NK, int E);
+// S[s] = dout[t] * w[t,k]  (pack + scale the upstream grads in one pass)
+void moe_scale_all(const float* dout, const float* w, const i32* grouped,
+                   float* S, i64 NK, int d, int K);
+// s_*[slot] = block[s]  (save every expert's G/U/A in one pass)
+void moe_save3_all(const float* G, const float* U, const float* A,
+                   const i32* grouped, float* s_gate, float* s_up, float* s_act,
+                   i64 NK, int E);
+// out[t] += w[t,k] * Y[s]  (weighted scatter-add over every slot at once)
+void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
+                         const float* w, i64 NK, int d, int K);
+// F-02: acc[e] += 1 for every slot assigned to expert e. The CUDA backend runs
+// this as one atomic kernel into a persistent [L*ne] device buffer (zero D2H
+// per layer/micro); the loop below is the CPU reference for the same math.
+void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
+// Full fused forward (same contract as moe_forward): pack once, per-expert
+// GEMMs on packed blocks, one swiglu, one save, one scatter-add.
+void moe_forward_fused(const float* x, const float* router_w,
+                       const float* gates, const float* ups, const float* downs,
+                       const float* sh_g, const float* sh_u, const float* sh_d,
+                       float* out,
+                       float* probs_cache, i32* idx_cache, float* w_cache,
+                       float* s_gate, float* s_up, float* s_act,
+                       float* Xpack, float* Gpack, float* Upack, float* Apack,
+                       float* Ypack, i32* grouped, int* counts, int* offsets,
+                       i64 N, int d, int E, int ne, int K);
+
 void attention_forward(const float* q, const float* k, const float* v,
                        float* out, float* probs,
                        int B, int T, int H, int KV, int hd, float scale);
@@ -116,6 +166,12 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
+// F-10: host-side accumulate API (trivial: file-static doubles). The CUDA
+// backend keeps the accumulators on device; see cuda/kernels.cu.
+void sce_acc_begin();
+void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale = 0.0f);
+void sce_acc_end(double* out_loss_sum, i64* out_count);
 
 void adamw_step(float* w, const float* g, float* m, float* v, i64 n,
                 float lr, float beta1, float beta2, float eps, float weight_decay,

@@ -1,8 +1,9 @@
 #include "dataset/english_logic.h"
 #include "core/unicode.h"
-
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+
 
 namespace gai {
 namespace english_logic {
@@ -79,8 +80,23 @@ bool is_coding(const std::string& user_text) {
         "return", "import", "script", "program", "debug", "compile",
         "algorithm", "plainformat",
     };
+    // "return" alone is ambiguous ("return a product" vs "return a value"):
+    // it only signals code alongside another code word. Found by the English
+    // behavior-data audit (a shopping exchange misclassified as Coding).
+    int hits = 0;
+    bool has_return = false;
     for (const char* w : kCodeWords) {
-        if (has_word(l, w)) return true;
+        if (!has_word(l, w)) continue;
+        if (std::strcmp(w, "return") == 0) { has_return = true; continue; }
+        ++hits;
+    }
+    if (hits > 0) return true;
+    if (has_return) {
+        // bare "return" + code markers already handled above; otherwise it is
+        // only code with an explicit code noun nearby (value/statement/type).
+        static const char* kReturnCtx[] = {"value", "statement", "type", "keyword"};
+        for (const char* w : kReturnCtx)
+            if (has_word(l, w)) return true;
     }
     return false;
 }

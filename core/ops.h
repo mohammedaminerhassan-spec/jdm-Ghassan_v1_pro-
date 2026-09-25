@@ -34,15 +34,34 @@ bool gemm_bf16_enabled();
 void set_gemm_fp16_mnk_threshold(i64 mnk);
 i64  gemm_fp16_mnk_threshold();
 
-// PERF telemetry (audit P2-2): lightweight global counters for launch/memory
-// analysis. Counting is unconditional and cheap (relaxed atomics); report via
+// PERF telemetry (audit P2-2, extended for the repair-prompt acceptance
+// criterion 9): lightweight global counters for launch/memory analysis.
+// Counting is unconditional and cheap (relaxed atomics); report via
 // perf_report() on the main rank at log cadence. All counters are lifetime
 // totals — call perf_reset() to delimit a window (e.g. per eval).
+//
+// What is (and is not) measured: these count host-side dispatches and payload
+// bytes, not GPU-side cycles. `moe_*_us` is host dispatch time around the
+// (possibly asynchronous) launch, which still bounds framework overhead and
+// launch storms; `sync_calls` counts the host-visible synchronizations that
+// stall the training thread.
 struct PerfCounters {
     u64 gemm_calls      = 0;   // ops::gemm dispatches (both backends)
     u64 gemm_fp16_calls = 0;   // GEMMs routed to the fp16 tensor-core path
     u64 h2d_bytes       = 0;   // host->device payload bytes (device_copy)
     u64 d2h_bytes       = 0;   // device->host payload bytes
+    u64 moe_fwd_calls   = 0;   // MoE forward dispatches (one per layer/micro)
+    u64 moe_bwd_calls   = 0;   // MoE backward dispatches
+    u64 moe_fwd_us      = 0;   // host dispatch microseconds (fwd)
+    u64 moe_bwd_us      = 0;   // host dispatch microseconds (bwd)
+    u64 sce_calls       = 0;   // softmax_cross_entropy (loss) evaluations
+    u64 sce_us          = 0;   // host time inside the loss op
+    u64 sync_calls      = 0;   // host-visible device synchronizations
+    u64 opt_steps       = 0;   // optimizer update calls
+    u64 opt_step_us     = 0;   // host microseconds inside the optimizer
+    u64 muon_ns_calls   = 0;   // Newton-Schulz orthogonalize() invocations
+    u64 muon_ns_iters   = 0;   // NS iterations executed (calls x ns_steps)
+    u64 muon_ns_us      = 0;   // host microseconds inside orthogonalize()
 };
 PerfCounters perf_counters();
 void         perf_reset();
@@ -52,6 +71,12 @@ std::string  perf_report();
 void perf_note_fp16_gemm();
 void perf_note_h2d(size_t nbytes);
 void perf_note_d2h(size_t nbytes);
+void perf_note_sync();                          // one host-visible sync happened
+void perf_note_moe_fwd(u64 us);                 // timed MoE forward dispatch
+void perf_note_moe_bwd(u64 us);                 // timed MoE backward dispatch
+void perf_note_sce(u64 us);                     // timed loss evaluation
+void perf_note_opt_step(u64 us);                // timed optimizer update
+void perf_note_muon_ns(int iters, u64 us);      // one orthogonalize() call
 
 // DeepSeek-V2 router jitter (train-only noise on router logits for expert
 // exploration). 0 = deterministic. Set once per run from ModelConfig.
@@ -250,6 +275,24 @@ void softmax_cross_entropy(Device dev,
                            float* dlogits, i64 n, int V,
                            double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
+// F-10: device-side loss/count accumulation for the chunked training loop.
+// softmax_cross_entropy() above performs one host sync per call; with
+// grad_accum=128 that is 128+ blocking reductions per optimizer step. The
+// accumulate API folds loss+count into a persistent device-side accumulator
+// across all chunks/micros with ZERO host traffic, and sce_acc_end() performs
+// the single synchronized reduction per optimizer step. dlogits are still
+// written per chunk (the backward needs them immediately); only the scalar
+// loss/count stay on device. The old single-shot op is unchanged and stays
+// for eval/inference ( Generator::score_tokens, Trainer::evaluate ).
+void sce_acc_begin(Device dev);      // zero the persistent accumulators
+void sce_accumulate(Device dev,
+                    const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale = 0.0f);
+void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count);
+// F-02: acc[e] += 1 per routed slot (atomic on CUDA). The aux-free bias path
+// counts on-device into the model's persistent [L*ne] buffer; the host loop
+// in cpu::moe_count_slots is the reference.
+void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne);
 
 // ---------------------------------------------------------------- optimizer
 void adamw_step(Device dev, float* w, const float* g, float* m, float* v,

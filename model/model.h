@@ -241,15 +241,61 @@ public:
     // dout_scale amplifies dlogits for FP16 loss scaling (grads come out scaled
     // by the same factor; the caller unscales via the optimizer grad_scale).
     double  forward_backward(const i32* ids, const i32* targets, int B, int T,
-                             Activations& act, i64* out_ntok = nullptr,
-                             float dout_scale = 1.0f, bool want_aux_stats = false,
-                             const i32* segment_ids = nullptr);
+                              Activations& act, i64* out_ntok = nullptr,
+                              float dout_scale = 1.0f, bool want_aux_stats = false,
+                              const i32* segment_ids = nullptr,
+                              // F-10: optional HOST mirror of `targets` (the
+                              // trainer's batch.targets). Used ONLY to skip
+                              // fully-masked CE blocks on the host without a
+                              // device sync; never dereferenced on device and
+                              // never affects numerics. Null = always compute.
+                              const i32* host_targets = nullptr);
+
 
     // ce_chunks: row-blocks for the chunked loss in forward_backward
     // (1 = legacy full [N,V] logits; >1 = compact [Cc,V] scratch where
-    // Cc = ceil(N/ce_chunks)). Callers of forward() must keep 1.
+    // Cc = ceil(N/chunks)). Callers of forward() must keep 1.
     Activations make_activations(int B, int T, bool with_grad, int ce_chunks = 1) const;
     size_t estimate_activation_bytes(int B, int T, bool with_grad, int ce_chunks = 1) const;
+
+    // ---- arithmetic-only accounting (no tensor is allocated) --------------
+    // F-23: `gai_train --dry-run` used to construct the full Model first, so a
+    // 1B CPU dry-run died (OOM) before printing the estimate it exists to
+    // print. These mirror the constructor's allocation formulas and the fp16
+    // cache, using pure arithmetic, so any machine can price any recipe.
+    // tests/test_memory_plan.cpp cross-checks them against a real Model for the
+    // shipped configs, which is what keeps the duplication honest.
+    struct MemoryPlan {
+        u64    params = 0;             // total parameter elements
+        u64    params_no_embedding = 0;
+        size_t weights = 0;            // fp32 master weights
+        size_t grads = 0;              // fp32 gradients (training only)
+        size_t fp16_cache = 0;         // persistent fp16 weight cache (F-14)
+        size_t activations = 0;        // peak activation arena for (B,T)
+        size_t static_total = 0;       // weights + grads + fp16_cache
+        size_t total = 0;              // static_total + activations
+    };
+    static u64    count_parameters(const ModelConfig& cfg);
+    // F-14: the per-layer FUSED qkv fp16 cache (wqkv_fp16) was missing from
+    // the runtime accounting, under-reporting persistent VRAM by
+    // L*(qd+2*kvd)*d*2 bytes.
+    static size_t count_fp16_cache_bytes(const ModelConfig& cfg);
+    static MemoryPlan plan_memory(const ModelConfig& cfg, int B, int T,
+                                  bool with_grad, int ce_chunks,
+                                  bool fp16_weight_cache);
+    static size_t estimate_activation_bytes_for(const ModelConfig& cfg,
+                                                bool fp16_weight_cache_on,
+                                                int B, int T, bool with_grad,
+                                                int ce_chunks);
+    // F-16: worst-case CUDA workspace sizes for (B,T), pure arithmetic. The
+    // trainer pre-sizes both pools from this before the first step so the run
+    // never pays a cudaFree+cudaMalloc resize stall mid-training. Values mirror
+    // the moe_workspace()/workspace() call sites (forward + backward) with
+    // headroom; over-estimating is safe (monotonic pools), under-estimating
+    // just falls back to the historical grow-on-demand path.
+    struct WorkspacePlan { size_t gemm_bytes = 0; size_t moe_bytes = 0; };
+    static WorkspacePlan workspace_plan(const ModelConfig& cfg, int B, int T);
+
 
     // Raw (unscaled) DeepSeek-style load-balance aux loss summed over layers,
     // measured from the routing caches of the last forward() call. Refills the
@@ -268,6 +314,37 @@ public:
     void update_moe_bias(int layer, const float* frac_host, int ne);
     void set_moe_bias(int layer, const float* values, size_t count);
     const std::vector<std::vector<float>>& moe_bias_all() const { return moe_bias_; }
+
+    // Two-phase aux-free bias update (DDP-safe, once-per-optimizer-step):
+    //
+    // Phase 1 (per microbatch): accumulate_moe_bias_fracs() adds RAW routed
+    // slot counts into moe_bias_acc_ [L*ne]. Counts, not fractions: fractions
+    // cannot be summed across microbatches/ranks without re-weighting.
+    //
+    // Phase 2 (once per optimizer step, after the DDP all-reduce):
+    // apply_moe_bias_step() converts the globally summed counts to per-layer
+    // fractions and runs the EMA update exactly once.
+    //
+    // F-12 (population contract): the denominator is DERIVED from the same
+    // counts (row_sum == routed tokens * K) instead of an externally supplied
+    // token count, so the load fraction is counts[e] / row_sum. Every routed
+    // token contributes exactly top_k slots, so numerator and denominator can
+    // never describe different populations (the old ntok_global denominator
+    // mixed supervised loss tokens with all-token routing counts, which
+    // silently mis-scaled the bias under SFT masks).
+    void accumulate_moe_bias_fracs(Activations& act, int B, int T);
+    // `global_count_sum`: DDP-summed [L*ne] slot counts for this step.
+    // `apply=false` discards the accumulator WITHOUT applying the EMA update
+    // (F-11: the optimizer skipped this step on a non-finite grad norm, so no
+    // optimizer-step-coupled control state may move). The accumulator is always
+    // cleared so counts can never leak into a later step.
+    void apply_moe_bias_step(const float* global_count_sum, bool apply);
+    // Raw [L * ne] slot-count accumulator for Trainer to all-reduce.
+    std::vector<float>& moe_bias_acc_host() { return moe_bias_acc_; }
+    // F-02: device-side twin of the accumulator. On CUDA the per-microbatch
+    // counts stay on device (moe_count_slots, zero D2H) and only the [L*ne]
+    // summary crosses the host once per optimizer step. Null/undefined on CPU.
+    Tensor& moe_bias_acc_dev() { return moe_bias_acc_dev_; }
 
     // ---- weights io (raw f32 dump; the .gai format lives in format/)
     void save_raw(const std::string& path) const;
@@ -305,8 +382,14 @@ private:
     // aux-loss-free steering bias [layer][expert] (host master; mirrored to
     // device on demand in forward). Empty unless moe_aux_free is on.
     std::vector<std::vector<float>> moe_bias_;
-    std::vector<Tensor> moe_bias_dev_;
-    float moe_bias_lr_ = 0.001f;
+    std::vector<Tensor>             moe_bias_dev_;
+    float                           moe_bias_lr_ = 0.001f;
+    // Per-step accumulator for DDP-safe two-phase aux-free bias update:
+    // [L * ne] flat; zeroed at start of each optimizer step.
+    std::vector<float>              moe_bias_acc_;
+    // F-02: device-side twin, [L * ne] f32 on the model device. Undefined
+    // unless the CUDA counting path populated it this step.
+    Tensor                          moe_bias_acc_dev_;
     Device      device_ = Device::CPU;
     bool        grad_enabled_ = false;
     bool        fp16_weight_cache_ = false;

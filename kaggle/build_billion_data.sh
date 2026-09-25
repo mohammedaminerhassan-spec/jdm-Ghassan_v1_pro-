@@ -106,8 +106,22 @@ for i in $(seq 0 13); do
   if [[ -f "$OUT" ]]; then echo "  skip part $i (exists)"; continue; fi
   SEED=$((1234 + i * 7919))
   echo "  batch $i/13 seed=${SEED} -> $OUT"
-  "${BIN}" synth --out "$OUT" --n 50000 --seed "$SEED" \
-    --max-template-uses 500 || { echo "[WARN] batch $i failed, retry with fresh seed"; continue; }
+  # F-17: the old code printed "retry with fresh seed" and then did NOT retry
+  # (bare `continue`), so a failed batch silently shrank the corpus and every
+  # later stage trained anyway. Synth is MANDATORY for this route: try once
+  # more with a genuinely fresh seed, then fail closed so the operator sees it.
+  if ! "${BIN}" synth --out "$OUT" --n 50000 --seed "$SEED" \
+       --max-template-uses 500; then
+    SEED=$((SEED + 1000003))
+    echo "  [retry] batch $i failed, retrying with fresh seed=${SEED}"
+    if ! "${BIN}" synth --out "$OUT" --n 50000 --seed "$SEED" \
+         --max-template-uses 500; then
+      echo "[ERROR] synth batch $i failed twice (seed exhausted); aborting."
+      echo "  Missing batches would silently shrink the corpus below the recipe."
+      echo "  Fix the failure (disk? binary?) and re-run; existing parts resume."
+      exit 1
+    fi
+  fi
 done
 echo "[1/4] merging..."
 cat "${SYNTH_DIR}"/synth_1b_part*.jsonl > "${SYNTH_DIR}/synthetic_1b.jsonl"
@@ -124,7 +138,13 @@ for i in 0 1; do
   OUT="${SYNTH_DIR}/synth_1b_sft_part0${i}.jsonl"
   if [[ -f "$OUT" ]]; then echo "  skip sft part $i (exists)"; continue; fi
   SEED=$((9999 + i * 104729))
-  "${BIN}" synth --out "$OUT" --n 75000 --seed "$SEED" --max-template-uses 300
+  # F-17: same fail-closed contract as the pretrain loop above.
+  if ! "${BIN}" synth --out "$OUT" --n 75000 --seed "$SEED" --max-template-uses 300; then
+    SEED=$((SEED + 1000003))
+    echo "  [retry] sft part $i failed, retrying with fresh seed=${SEED}"
+    "${BIN}" synth --out "$OUT" --n 75000 --seed "$SEED" --max-template-uses 300 || {
+      echo "[ERROR] sft synth part $i failed twice; aborting (see above)."; exit 1; }
+  fi
 done
 cat "${SYNTH_DIR}"/synth_1b_sft_part*.jsonl > "${SYNTH_DIR}/synthetic_1b_sft.jsonl"
 rm -f "${SYNTH_DIR}"/synth_1b_sft_part*.jsonl
@@ -299,11 +319,19 @@ check_mix() {
 }
 check_mix "${REPO_DIR}/configs/ultra_1b.yaml" "${SHARD_1B}"
 check_mix "${REPO_DIR}/configs/sft_ultra_1b.yaml" "${SHARD_SFT}"
+# F-17: a declared mix domain with no shards used to only warn, so the run went
+# ahead on a silently renormalized mixture (wrong data, full GPU cost). Fail
+# closed: either materialize the missing domains (--domain) or remove them from
+# the yaml and re-run this script. Optional domains must be removed from the
+# mix explicitly — never treated as "probably fine".
 if [ "${MIX_MISSING}" -ne 0 ]; then
-  echo "  [WARN] declared-vs-built mix mismatch: either materialize the missing"
-  echo "  domains (--domain) or remove them from the yaml mix. Training will"
-  echo "  renormalize over found domains only (see trainer startup mix log)."
+  echo "  [ERROR] declared-vs-built mix mismatch: either materialize the missing"
+  echo "  domains (--domain) or remove them from the yaml mix. Training would"
+  echo "  renormalize over found domains only (see trainer startup mix log),"
+  echo "  which silently changes the data recipe. Refusing to continue."
+  exit 1
 fi
+echo "  effective mix == declared mix (all declared domains materialized above)"
 echo ""
 echo "============================================================"
 echo "  Done. Record the MEASURED train totals above and scale training configs"

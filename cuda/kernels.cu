@@ -52,6 +52,14 @@ static void* workspace(size_t bytes) {
     return g_ws;
 }
 
+// F-16: pre-size the GEMM/conversion pool before the first step. Called once
+// from the trainer with the recipe's worst-case size; later workspace() calls
+// then hit the fast path (bytes <= g_ws_bytes) and never resize mid-run.
+void reserve_workspaces(size_t gemm_bytes, size_t moe_bytes) {
+    if (gemm_bytes > 0) workspace(gemm_bytes);
+    if (moe_bytes > 0) moe_reserve_workspace(moe_bytes);
+}
+
 void free_sampling_workspace();  // defined with the sampling kernels below
 void free_workspace() {
     if (g_ws) cudaFree(g_ws);
@@ -810,6 +818,78 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     double total = 0.0;
     for (int i = 0; i < red_grid; ++i) total += hred.partial[i];
     if (out_loss_sum) *out_loss_sum = total;
+}
+
+// ================================================================ F-10 device-side CE accumulation
+// The chunked training loop calls the loss once per CE chunk per microbatch;
+// the single-shot op above syncs on every call (128+ blocking reductions per
+// optimizer step at grad_accum=128). These fold loss+count into a persistent
+// 16-byte device accumulator with ZERO host traffic, and sce_acc_end()
+// performs the single synchronized reduction per microbatch. dlogits are
+// still written per chunk (the backward consumes them immediately).
+
+// Packed so loss+count cross the host in ONE 16-byte memcpy.
+struct SceAcc { double loss; long long count; };
+static SceAcc* g_sce_acc = nullptr;   // device, persistent, monotonic by design
+static void sce_acc_ensure() {
+    if (!g_sce_acc) CU_CHECK(cudaMalloc(&g_sce_acc, sizeof(SceAcc)));
+}
+void sce_acc_begin() {
+    sce_acc_ensure();
+    CU_CHECK(cudaMemset(g_sce_acc, 0, sizeof(SceAcc)));
+}
+
+// Single-thread fold: exactly one thread runs (all others return), so no
+// atomics are needed and there is no architecture gate (plain += on device).
+__global__ void k_sce_fold(const float* partial, const int* count,
+                           SceAcc* acc) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    double s = 0.0;
+    for (int i = 0; i < 64; ++i) s += (double)partial[i];
+    acc->loss += s;
+    acc->count += (long long)*count;
+}
+
+void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale) {
+    if (n <= 0) return;
+    sce_acc_ensure();
+    // Same launch shape as softmax_cross_entropy (shared factorization would
+    // couple the two paths; the duplication is 6 lines and keeps the hot
+    // training path independent of the eval/inference path).
+    const int block = 256;
+    const int red_grid = 64;
+    struct CeReduce { int count; float partial[64]; };
+    size_t need = sizeof(float) * size_t(n) + sizeof(CeReduce);
+    char* ws = static_cast<char*>(workspace(need));
+    float* losses = reinterpret_cast<float*>(ws);
+    CeReduce* red = reinterpret_cast<CeReduce*>(ws + sizeof(float) * size_t(n));
+
+    CU_CHECK(cudaMemset(red, 0, sizeof(CeReduce)));
+
+    int ce_block = V >= 2048 ? 512 : 256;
+    size_t ce_sh = sizeof(float) * ((ce_block + WARP - 1) / WARP + 1);
+    size_t sh = sizeof(float) * ((block + WARP - 1) / WARP + 1);
+    k_ce<<<static_cast<int>(n), ce_block, ce_sh>>>(logits, targets, dlogits, V,
+                                                   losses, &red->count, z_scale);
+    CU_CHECK(cudaGetLastError());
+
+    k_sum_partial<<<red_grid, block, sh>>>(losses, n, red->partial);
+    CU_CHECK(cudaGetLastError());
+
+    // Fold into the persistent accumulator. Still no host traffic: the fold
+    // kernel runs on the same stream, in order, after the reduction.
+    k_sce_fold<<<1, 1>>>(red->partial, &red->count, g_sce_acc);
+    CU_CHECK(cudaGetLastError());
+}
+
+void sce_acc_end(double* out_loss_sum, i64* out_count) {
+    sce_acc_ensure();
+    // THE single host sync of the whole accumulation window.
+    SceAcc hacc{0.0, 0};
+    CU_CHECK(cudaMemcpy(&hacc, g_sce_acc, sizeof(SceAcc), cudaMemcpyDeviceToHost));
+    if (out_loss_sum) *out_loss_sum = hacc.loss;
+    if (out_count) *out_count = (i64)hacc.count;
 }
 
 // ================================================================ fast sampling

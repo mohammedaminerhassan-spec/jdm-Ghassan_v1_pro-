@@ -55,6 +55,11 @@ public:
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
     }
     double ms() const { return seconds() * 1000.0; }
+    // Whole microseconds, for the relaxed-atomic perf counters (ops layer).
+    u64 elapsed_us() const {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0_).count());
+    }
 private:
     std::chrono::steady_clock::time_point t0_;
 };

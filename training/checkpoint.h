@@ -37,6 +37,13 @@ struct CheckpointSnapshot {
     std::vector<std::string> parameter_names;
     std::vector<std::vector<float>> moe_bias;
     OptimizerStateSnapshot optimizer;
+
+    size_t bytes() const {
+        size_t b = 0;
+        for (const auto& t : weights) if (t.defined()) b += t.nbytes();
+        b += optimizer.bytes();
+        return b;
+    }
 };
 
 class Checkpoint {
@@ -68,21 +75,31 @@ public:
     // actually restored. False on kind mismatch / corrupt blob / legacy /
     // weights-only (opt==null). Callers MUST reset bias-correction t_=0 when
     // false, else resumed steps are ~10x too small (m≈(1-b)*g, bc≈1).
+    //
+    // F-08 `resume_mode`: strict=true implements `resume_mode: exact`. It turns
+    // every "warn and continue" recovery path into a hard failure (parameter
+    // missing from the file, optimizer kind mismatch, unreadable moments,
+    // moments present but no optimizer supplied), so an exact resume can never
+    // silently run with fresh-init parameters or fresh optimizer moments.
+    // strict=false is the historical `migrate` behavior.
     static bool load(const std::string& path,
                      Model& model,
                      AdamW* opt,          // may be null (inference / eval)
                      TrainState& state,
-                     bool* out_moments_restored = nullptr);
+                     bool* out_moments_restored = nullptr,
+                     bool strict = false);
     static bool load(const std::string& path,
                      Model& model,
                      Lion* opt,
                      TrainState& state,
-                     bool* out_moments_restored = nullptr);
+                     bool* out_moments_restored = nullptr,
+                     bool strict = false);
     static bool load(const std::string& path,
                      Model& model,
                      Muon* opt,
                      TrainState& state,
-                     bool* out_moments_restored = nullptr);
+                     bool* out_moments_restored = nullptr,
+                     bool strict = false);
 
     // reads only the header + config, for `ghassan-ai info`
     static bool peek(const std::string& path, ModelConfig& cfg, TrainState& state);

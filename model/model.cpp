@@ -188,6 +188,95 @@ void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     }
 }
 
+// ---------------------------------------------------------------- two-phase DDP-safe bias update
+void Model::accumulate_moe_bias_fracs(Activations& act, int B, int T) {
+    if (!cfg_.use_moe || !cfg_.moe_aux_free) return;
+    const int L  = cfg_.num_layers;
+    const int ne = cfg_.num_experts;
+    const int K  = cfg_.moe_top_k;
+    const i64 N  = static_cast<i64>(B) * T;
+    ensure_moe_bias();
+    const size_t total = static_cast<size_t>(L) * static_cast<size_t>(ne);
+    if (static_cast<int>(act.saved_moe_probs.size()) != L ||
+        static_cast<int>(act.saved_moe_idx.size())   != L) {
+        return;  // no MoE activations (e.g. dense or inference path)
+    }
+    if (device_ == Device::CUDA) {
+        // F-02: count on device into the persistent [L*ne] counter. First
+        // microbatch of the step (re)sizes and zeroes it; later micros add.
+        // Zero D2H here — the only host traffic is the single summary read
+        // per optimizer step in Trainer::sync_moe_bias().
+        if (!moe_bias_acc_dev_.defined() ||
+            static_cast<size_t>(moe_bias_acc_dev_.numel()) != total) {
+            moe_bias_acc_dev_ = Tensor::zeros({static_cast<i64>(total)}, DType::F32, device_);
+        }
+        float* base = moe_bias_acc_dev_.f32();
+        for (int l = 0; l < L; ++l) {
+            const size_t sl = static_cast<size_t>(l);
+            if (!act.saved_moe_idx[sl].defined()) continue;
+            ops::moe_count_slots(device_, act.saved_moe_idx[sl].i32p(),
+                                 base + sl * static_cast<size_t>(ne),
+                                 N * K, ne);
+        }
+        return;
+    }
+    // CPU path: count locally into the host accumulator.
+    if (moe_bias_acc_.size() != total) moe_bias_acc_.assign(total, 0.0f);
+    for (int l = 0; l < L; ++l) {
+        const size_t sl = static_cast<size_t>(l);
+        if (!act.saved_moe_idx[sl].defined()) continue;
+        // Counts only, so one host copy per layer/micro is enough: the
+        // normalization happens once per optimizer step in apply_moe_bias_step.
+        std::vector<i32> h_idx(static_cast<size_t>(N) * static_cast<size_t>(K));
+        device_copy(h_idx.data(), Device::CPU, act.saved_moe_idx[sl].i32p(), device_,
+                    sizeof(i32) * h_idx.size());
+        float* acc = moe_bias_acc_.data() + sl * static_cast<size_t>(ne);
+        for (i64 t = 0; t < N; ++t) {
+            for (int k = 0; k < K; ++k) {
+                const i32 e = h_idx[static_cast<size_t>(t) * static_cast<size_t>(K) + k];
+                if (e >= 0 && e < ne) acc[e] += 1.0f;
+            }
+        }
+    }
+}
+
+void Model::apply_moe_bias_step(const float* global_count_sum, bool apply) {
+    if (!cfg_.use_moe || !cfg_.moe_aux_free) {
+        moe_bias_acc_.clear();
+        moe_bias_acc_dev_ = Tensor();
+        return;
+    }
+    const int L  = cfg_.num_layers;
+    const int ne = cfg_.num_experts;
+    if (!apply || !global_count_sum || (moe_bias_acc_.empty() && !moe_bias_acc_dev_.defined())) {
+        // Step was rejected (non-finite grad norm) or nothing accumulated:
+        // drop the counts so they cannot leak into the next step.
+        moe_bias_acc_.clear();
+        moe_bias_acc_dev_ = Tensor();
+        return;
+    }
+    ensure_moe_bias();
+    std::vector<float> frac(static_cast<size_t>(ne));
+    for (int l = 0; l < L; ++l) {
+        const size_t base = static_cast<size_t>(l) * static_cast<size_t>(ne);
+        // F-12: the denominator comes from the SAME population as the
+        // numerator. Every routed token contributes exactly top_k slots, so
+        // row_sum == (routed tokens in this layer) * K, and the load fraction
+        // is simply counts[e] / row_sum. No external ntok is involved, so a
+        // masked SFT microbatch can never desync the two.
+        double row_sum = 0.0;
+        for (int e = 0; e < ne; ++e) row_sum += static_cast<double>(global_count_sum[base + e]);
+        const double inv = (row_sum > 0.0) ? 1.0 / row_sum : 0.0;
+        if (inv <= 0.0) continue;   // layer routed nothing this step
+        for (int e = 0; e < ne; ++e)
+            frac[static_cast<size_t>(e)] =
+                static_cast<float>(static_cast<double>(global_count_sum[base + e]) * inv);
+        update_moe_bias(l, frac.data(), ne);
+    }
+    moe_bias_acc_.clear();
+    moe_bias_acc_dev_ = Tensor();
+}
+
 void Model::set_moe_bias(int layer, const float* values, size_t count) {
     if (!cfg_.use_moe || !cfg_.moe_aux_free || !values) return;
     ensure_moe_bias();
@@ -767,6 +856,10 @@ void Model::mark_weights_dirty() {
 size_t Model::fp16_weight_cache_bytes() const {
     size_t bytes = 0;
     for (const Parameter* p : params_) bytes += p->fp16_cache.nbytes();
+    // F-14: the per-layer FUSED qkv fp16 cache is persistent VRAM too and was
+    // missing from this accounting, under-reporting the guard by
+    // L*(qd + 2*kvd)*d*2 bytes (tens of MB at production depth).
+    for (const LayerParams& layer : layers_) bytes += layer.wqkv_fp16.nbytes();
     return bytes;
 }
 
@@ -974,6 +1067,14 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
 }
 
 size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chunks) const {
+    return estimate_activation_bytes_for(cfg_, fp16_weight_cache_, B, T, with_grad, ce_chunks);
+}
+
+// F-23: the activation estimate is pure arithmetic over ModelConfig, so it is
+// exposed as a static for the allocation-free dry-run path. The member above is
+// a one-line forward, which is what keeps the two from drifting.
+size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on,
+                                            int B, int T, bool with_grad, int ce_chunks) {
     // FIX: i64 signed overflow on adversarial B*T*V*L wrapped negative ->
     // "fits" estimate then real OOM on T4 (training killer). Use u64 with
     // saturation (cap at 1TiB elements) so the guard always over-estimates.
@@ -995,17 +1096,17 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
         return p > cap ? cap : p;
     };
     const u64 N   = static_cast<u64>(B) * static_cast<u64>(T);
-    const u64 d   = static_cast<u64>(cfg_.hidden_size);
-    const u64 qd  = static_cast<u64>(cfg_.q_dim());
-    const u64 kvd = static_cast<u64>(cfg_.kv_dim());
-    const u64 F   = cfg_.use_moe ? static_cast<u64>(cfg_.moe_top_k) * static_cast<u64>(cfg_.moe_expert_dim)
-                                 : static_cast<u64>(cfg_.intermediate_size);
-    const u64 V   = static_cast<u64>(cfg_.vocab_size);
-    const u64 L   = static_cast<u64>(cfg_.num_layers);
+    const u64 d   = static_cast<u64>(cfg.hidden_size);
+    const u64 qd  = static_cast<u64>(cfg.q_dim());
+    const u64 kvd = static_cast<u64>(cfg.kv_dim());
+    const u64 F   = cfg.use_moe ? static_cast<u64>(cfg.moe_top_k) * static_cast<u64>(cfg.moe_expert_dim)
+                                 : static_cast<u64>(cfg.intermediate_size);
+    const u64 V   = static_cast<u64>(cfg.vocab_size);
+    const u64 L   = static_cast<u64>(cfg.num_layers);
 
     u64 e = sat_mul(N, (4 * d + qd * 2 + kvd * 2 + F * 3 + V));
-    if (fp16_weight_cache_) e = sat_add(e, sat_mul(N, (qd + 2 * kvd)));
-    if (cfg_.use_moe) e = sat_add(e, sat_mul(N, (static_cast<u64>(cfg_.num_experts) + 2 * static_cast<u64>(cfg_.moe_top_k))));
+    if (fp16_on) e = sat_add(e, sat_mul(N, (qd + 2 * kvd)));
+    if (cfg.use_moe) e = sat_add(e, sat_mul(N, (static_cast<u64>(cfg.num_experts) + 2 * static_cast<u64>(cfg.moe_top_k))));
     // Forward misses pos[N] i32 + xfinal/hnorm/dtmp grad scratch in the old
     // math (systematic under-count ~5-8%). Account for them explicitly.
     e = sat_add(e, N); // pos ids (i32 ~ 1 float)
@@ -1013,15 +1114,15 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
         // Attention probs are recomputed per layer into ONE shared buffer
         // (not stored per layer): single B*H*T*T instead of L*B*H*T*T.
         u64 per_layer = sat_mul(N, (4 * d + qd * 2 + kvd * 2 + F * 3 + 2));
-        if (cfg_.use_moe) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg_.num_experts) + 3 * static_cast<u64>(cfg_.moe_top_k))));
-        if (cfg_.use_qk_norm) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg_.num_heads) + static_cast<u64>(cfg_.num_kv_heads) + qd + kvd)));
+        if (cfg.use_moe) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg.num_experts) + 3 * static_cast<u64>(cfg.moe_top_k))));
+        if (cfg.use_qk_norm) per_layer = sat_add(per_layer, sat_mul(N, (static_cast<u64>(cfg.num_heads) + static_cast<u64>(cfg.num_kv_heads) + qd + kvd)));
         e = sat_add(e, sat_mul(L, per_layer));
-        e = sat_add(e, sat_mul(sat_mul(static_cast<u64>(B), static_cast<u64>(cfg_.num_heads)), sat_mul(static_cast<u64>(T), static_cast<u64>(T)))); // transient recompute buf
-        if (!cfg_.use_moe) {
+        e = sat_add(e, sat_mul(sat_mul(static_cast<u64>(B), static_cast<u64>(cfg.num_heads)), sat_mul(static_cast<u64>(T), static_cast<u64>(T)))); // transient recompute buf
+        if (!cfg.use_moe) {
             e = sat_add(e, sat_mul(N, (5 * d + qd * 2 + kvd * 2 + F * 3 + V + 2)));
         } else {
             e = sat_add(e, sat_mul(N, (5 * d + qd * 2 + kvd * 2 + V + 2)));
-            e = sat_add(e, sat_add(sat_mul(N, sat_mul(static_cast<u64>(cfg_.moe_top_k), static_cast<u64>(cfg_.moe_expert_dim))), static_cast<u64>(cfg_.num_experts)));
+            e = sat_add(e, sat_add(sat_mul(N, sat_mul(static_cast<u64>(cfg.moe_top_k), static_cast<u64>(cfg.moe_expert_dim))), static_cast<u64>(cfg.num_experts)));
         }
         // grad scratch: dx/dxb/dq/dk/dv/dattout/dproj/dtmp/dlogits/xfinal/hnorm
         e = sat_add(e, sat_mul(N, (4 * d + qd * 2 + kvd * 2 + V + d * 2)));
@@ -1039,6 +1140,120 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
     }
     if (e > ((1ull << 40) / 4)) return (1ull << 40);
     return static_cast<size_t>(e) * sizeof(float);
+}
+
+// F-23: mirrors the constructor's alloc_param() list exactly. Cross-checked
+// against Model::num_parameters() by tests/test_memory_plan.cpp.
+u64 Model::count_parameters(const ModelConfig& cfg) {
+    const u64 d   = static_cast<u64>(cfg.hidden_size);
+    const u64 V   = static_cast<u64>(cfg.vocab_size);
+    const u64 qd  = static_cast<u64>(cfg.q_dim());
+    const u64 kvd = static_cast<u64>(cfg.kv_dim());
+    const u64 F   = static_cast<u64>(cfg.intermediate_size);
+    const u64 E   = static_cast<u64>(cfg.moe_expert_dim);
+    const u64 ne  = static_cast<u64>(cfg.num_experts);
+    const u64 L   = static_cast<u64>(cfg.num_layers);
+    const u64 hd  = static_cast<u64>(cfg.head_dim());
+
+    u64 n = V * d;                                    // tok_embeddings
+    for (u64 i = 0; i < L; ++i) {
+        n += d;                                      // attn_norm
+        n += qd * d + kvd * d + kvd * d + d * qd;    // wq, wk, wv, wo
+        n += d;                                      // ffn_norm
+        if (cfg.use_qk_norm) n += 2 * hd;            // qk_qnorm, qk_knorm
+        if (cfg.use_moe) {
+            n += ne * d;                              // moe_router
+            n += ne * E * d + ne * E * d;             // moe_gate, moe_up
+            n += ne * d * E;                          // moe_down
+            if (cfg.moe_shared) n += E * d + E * d + d * E;
+        } else {
+            n += F * d + F * d + d * F;               // w_gate, w_up, w_down
+        }
+    }
+    n += d;                                           // final_norm
+    if (!cfg.tie_embeddings) n += V * d;              // lm_head
+    return n;
+}
+
+// F-14: every persistent fp16 cache tensor: one per 2-D parameter PLUS the
+// per-layer fused QKV cache. The runtime fp16_weight_cache_bytes() missed the
+// fused cache entirely.
+size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
+    const u64 d   = static_cast<u64>(cfg.hidden_size);
+    const u64 V   = static_cast<u64>(cfg.vocab_size);
+    const u64 qd  = static_cast<u64>(cfg.q_dim());
+    const u64 kvd = static_cast<u64>(cfg.kv_dim());
+    const u64 F   = static_cast<u64>(cfg.intermediate_size);
+    const u64 E   = static_cast<u64>(cfg.moe_expert_dim);
+    const u64 ne  = static_cast<u64>(cfg.num_experts);
+    const u64 L   = static_cast<u64>(cfg.num_layers);
+
+    // 2-D parameters (fp16_cache is allocated for shape.size() == 2 only).
+    u64 n2 = 0;
+    n2 += V * d;                                              // tok_embeddings
+    for (u64 i = 0; i < L; ++i) {
+        n2 += qd * d + kvd * d + kvd * d + d * qd;           // wq, wk, wv, wo
+        if (cfg.use_moe) {
+            n2 += ne * d;                                    // router
+            n2 += ne * E * d + ne * E * d;                   // moe_gate, moe_up
+            n2 += ne * d * E;                                // moe_down
+            if (cfg.moe_shared) n2 += E * d + E * d + d * E;
+        } else {
+            n2 += F * d + F * d + d * F;
+        }
+    }
+    if (!cfg.tie_embeddings) n2 += V * d;                    // lm_head
+    // per-layer fused QKV cache: [qd + 2*kvd, d]
+    const u64 fused = L * (qd + 2 * kvd) * d;
+    return static_cast<size_t>((n2 + fused) * sizeof(u16));
+}
+
+Model::MemoryPlan Model::plan_memory(const ModelConfig& cfg, int B, int T,
+                                      bool with_grad, int ce_chunks,
+                                      bool fp16_weight_cache) {
+    MemoryPlan p;
+    p.params = count_parameters(cfg);
+    p.params_no_embedding = p.params - static_cast<u64>(cfg.vocab_size) * static_cast<u64>(cfg.hidden_size);
+    if (!cfg.tie_embeddings)
+        p.params_no_embedding -= static_cast<u64>(cfg.vocab_size) * static_cast<u64>(cfg.hidden_size);
+    p.weights = static_cast<size_t>(p.params) * sizeof(float);
+    p.grads = with_grad ? static_cast<size_t>(p.params) * sizeof(float) : 0;
+    p.fp16_cache = fp16_weight_cache ? count_fp16_cache_bytes(cfg) : 0;
+    p.activations = estimate_activation_bytes_for(cfg, fp16_weight_cache, B, T,
+                                                 with_grad, ce_chunks);
+    p.static_total = p.weights + p.grads + p.fp16_cache;
+    p.total = p.static_total + p.activations;
+    return p;
+}
+
+Model::WorkspacePlan Model::workspace_plan(const ModelConfig& cfg, int B, int T) {
+    // Saturating u64 arithmetic (same discipline as estimate_activation_bytes).
+    const u64 cap = (1ull << 40);
+    auto sat = [&](u64 v) -> u64 { return v > cap ? cap : v; };
+    const u64 N   = static_cast<u64>(B) * static_cast<u64>(T);
+    const u64 NK  = N * static_cast<u64>(cfg.moe_top_k > 0 ? cfg.moe_top_k : 1);
+    const u64 d   = static_cast<u64>(cfg.hidden_size);
+    const u64 V   = static_cast<u64>(cfg.vocab_size);
+    const u64 E   = static_cast<u64>(cfg.moe_expert_dim);
+    const u64 ne  = static_cast<u64>(cfg.num_experts);
+
+    WorkspacePlan p;
+    // GEMM pool: the largest single fp16 conversion pair (lm_head [N,d]x[d,V]
+    // dominates: 2 bytes * (N*d + d*V)) plus the SCE losses+reduce and the
+    // sq-norm partials, with 2x headroom. The pool rounds up to 64 MB anyway.
+    const u64 gemm_conv = sat(2 * sat(N * d + d * V));
+    const u64 sce = sat(N + 260);
+    p.gemm_bytes = static_cast<size_t>(sat(2 * sat(gemm_conv + sce)));
+    if (cfg.use_moe) {
+        // MoE pool: max of the forward and backward call sites in cuda/moe.cu.
+        // Forward: N*ne + 2*NK + 3*NK*E + NK*d floats.
+        const u64 fwd = sat(N * ne + 2 * NK + 3 * NK * E + NK * d);
+        // Backward: 6*N*E + NK + 4*NK*E + 2*NK*d + NK + N*ne floats.
+        const u64 bwd = sat(6 * N * E + NK + 4 * NK * E + 2 * NK * d + NK + N * ne);
+        const u64 peak_floats = fwd > bwd ? fwd : bwd;
+        p.moe_bytes = static_cast<size_t>(sat(4 * peak_floats + (16ull << 20)));
+    }
+    return p;
 }
 
 // ---------------------------------------------------------------- forward
@@ -1312,7 +1527,8 @@ Tensor& Model::forward(const i32* ids, int B, int T, Activations& act,
 // ---------------------------------------------------------------- backward
 double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                Activations& act, i64* out_ntok, float dout_scale,
-                               bool want_aux_stats, const i32* segment_ids) {
+                               bool want_aux_stats, const i32* segment_ids,
+                               const i32* host_targets) {
     GAI_CHECK(act.with_grad, "forward_backward requires gradient activations");
     GAI_CHECK(grad_enabled_, "call enable_grad(true) before forward_backward");
 
@@ -1351,27 +1567,37 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     const float* hnorm_full = act.saved_hnorm.f32();
     float* logits_c = act.logits.f32();
     float* dlogits_c = act.dlogits.f32();
-    double loss_sum = 0.0;
-    i64    ntok = 0;
     ops::zero(dev, act.dxb.f32(), N * d);
+    // F-10: loss+count accumulate on device across all chunks with ZERO host
+    // traffic; the single synchronized reduction happens in sce_acc_end().
+    // Fully-masked blocks are skipped on the HOST (no GEMMs, no kernels) using
+    // the host target mirror when the caller supplied one — this preserves the
+    // old `if (cn == 0) continue` fast path without the per-chunk D2H that
+    // used to provide `cn`. A null mirror means "always compute" (eval/tests).
+    ops::sce_acc_begin(dev);
     for (i64 r0 = 0; r0 < N; r0 += Cc) {
         const i64 Cr = std::min(Cc, N - r0);
         const int Ci = static_cast<int>(Cr); // Cr <= N <= INT_MAX (body checked)
+        if (host_targets) {
+            bool any_supervised = false;
+            for (i64 i = 0; i < Cr; ++i) {
+                if (host_targets[r0 + i] >= 0) { any_supervised = true; break; }
+            }
+            if (!any_supervised) continue; // fully-masked block: nothing to learn
+        }
         ops::linear_forward(dev, hnorm_full + r0 * d, lm_head().w.f32(),
                             logits_c, Ci, d, V);
-        double csum = 0.0;
-        i64 cn = 0;
-        ops::softmax_cross_entropy(dev, logits_c, targets + r0, dlogits_c,
-                                   Cr, V, &csum, &cn, cfg_.z_loss_scale);
-        if (cn == 0) continue; // fully-masked block: nothing to learn here
-        loss_sum += csum;
-        ntok += cn;
+        ops::sce_accumulate(dev, logits_c, targets + r0, dlogits_c,
+                            Cr, V, cfg_.z_loss_scale);
         // P0-05 (sums, not means) + P0-2b (fused single pass), per chunk.
         // SCE already emits eff_scale-ready SUM grads, so no ×cn rescale.
         if (eff_scale != 1.0f) ops::scale_inplace(dev, dlogits_c, eff_scale, Cr * V);
         ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
                              act.dxb.f32() + r0 * d, lm_head().g.f32(), Ci, d, V);
     }
+    double loss_sum = 0.0;
+    i64 ntok = 0;
+    ops::sce_acc_end(dev, &loss_sum, &ntok);
     if (out_ntok) *out_ntok = ntok;
     if (ntok == 0) return 0.0;
 
@@ -1547,25 +1773,10 @@ double Model::moe_aux_loss(Activations& act, int B, int T) {
     // We still measure per-layer load (tiny ne-float host copies) and update
     // the steering bias here. Returns 0 loss; validate enforces aux_scale=0.
     if (cfg_.moe_aux_free) {
-        GAI_CHECK(act.with_grad, "moe_aux_loss needs training Activations (with_grad)");
-        GAI_CHECK(static_cast<int>(act.saved_moe_probs.size()) == cfg_.num_layers,
-                  "moe_aux_loss: stale Activations");
-        GAI_CHECK(act.moe_auxfrac.defined(), "moe_aux_loss: missing auxfrac buffer");
-        const i64 N = static_cast<i64>(B) * T;
-        const int ne = cfg_.num_experts;
-        std::vector<float> h_frac(static_cast<size_t>(ne));
-        std::vector<float> h_psum(static_cast<size_t>(ne));
-        for (int l = 0; l < cfg_.num_layers; ++l) {
-            size_t sl = static_cast<size_t>(l);
-            // want_stats=true forces the tiny host copy we need for the EMA.
-            moe_layer_aux(device_, act.saved_moe_probs[sl].f32(),
-                          act.saved_moe_idx[sl].i32p(),
-                          act.moe_auxfrac.f32(), l, N, cfg_.moe_top_k, ne, true, nullptr);
-            // Re-read fractions from device buffer (ne floats, 1 small sync).
-            device_copy(h_frac.data(), Device::CPU, act.moe_auxfrac.f32(), device_,
-                        sizeof(float) * h_frac.size());
-            update_moe_bias(l, h_frac.data(), ne);
-        }
+        // Accumulate fracs per microbatch (DDP-safe two-phase path).
+        // apply_moe_bias_step() is called by Trainer after all-reducing across
+        // DDP ranks, exactly once per optimizer step.
+        accumulate_moe_bias_fracs(act, B, T);
         return 0.0;
     }
     // FIX: calling after inference forward (with_grad=false) indexed empty

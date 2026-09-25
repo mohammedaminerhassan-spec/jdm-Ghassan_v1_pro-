@@ -1021,6 +1021,33 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     if (out_count)    *out_count = count;
 }
 
+// F-10: host-side loss/count accumulator. Single-threaded by contract (the
+// model loop never calls this concurrently); the CUDA backend is the one that
+// needs to be synchronization-free, and it keeps its accumulators on device.
+namespace {
+double g_sce_acc_loss = 0.0;
+i64 g_sce_acc_count = 0;
+} // namespace
+
+void sce_acc_begin() {
+    g_sce_acc_loss = 0.0;
+    g_sce_acc_count = 0;
+}
+
+void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
+                    i64 n, int V, float z_scale) {
+    double csum = 0.0;
+    i64 cn = 0;
+    softmax_cross_entropy(logits, targets, dlogits, n, V, &csum, &cn, z_scale);
+    g_sce_acc_loss += csum;
+    g_sce_acc_count += cn;
+}
+
+void sce_acc_end(double* out_loss_sum, i64* out_count) {
+    if (out_loss_sum) *out_loss_sum = g_sce_acc_loss;
+    if (out_count) *out_count = g_sce_acc_count;
+}
+
 // ================================================================ optimizer
 void adamw_step(float* w, const float* g, float* m, float* v, i64 n,
                 float lr, float beta1, float beta2, float eps, float weight_decay,

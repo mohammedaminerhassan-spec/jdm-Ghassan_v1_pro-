@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <filesystem>
+#include <chrono>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -76,6 +77,14 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.beta2          = c.get_f32("training.beta2", t.optimizer == "lion" ? 0.99f : t.beta2);
     t.eps            = c.get_f32("training.eps", t.eps);
     t.grad_clip      = c.get_f32("training.grad_clip", t.grad_clip);
+    // F-04: muon NS cost knobs (see MuonConfig::min_ns_dim). Unknown keys fail
+    // under --strict-config via the list below.
+    t.muon_ns_steps   = static_cast<int>(c.get_int("training.ns_steps", t.muon_ns_steps));
+    t.muon_min_ns_dim = static_cast<int>(c.get_int("training.muon_min_ns_dim", t.muon_min_ns_dim));
+    if (t.muon_ns_steps < 1 || t.muon_ns_steps > 10)
+        GAI_FAIL("training.ns_steps must be in 1..10");
+    if (t.muon_min_ns_dim < 0)
+        GAI_FAIL("training.muon_min_ns_dim must be >= 0");
     // precision: fp32 (default), bf16, fp16
     std::string precision = c.get_str("training.precision", "fp32");
     if (precision == "bf16") t.param_dtype = DType::BF16;
@@ -105,6 +114,10 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.allow_no_pretrained   = c.get_bool("training.allow_no_pretrained", t.allow_no_pretrained);
     t.freeze_embeddings    = c.get_bool("training.freeze_embeddings", t.freeze_embeddings);
     t.allow_recipe_drift   = c.get_bool("training.allow_recipe_drift", t.allow_recipe_drift);
+    // F-08: exact vs migrate resume contract (see TrainerConfig::resume_mode).
+    t.resume_mode = c.get_str("training.resume_mode", t.resume_mode);
+    if (t.resume_mode != "migrate" && t.resume_mode != "exact")
+        GAI_FAIL("unknown training.resume_mode '" + t.resume_mode + "' (exact|migrate)");
     // Weighted domain mixture (data.mix.<domain>: <weight>). Keys map to
     // train_<domain>_*.gbin shards. Empty/absent = legacy uniform sampling.
     for (const auto& [k, v] : c.flat()) {
@@ -224,14 +237,17 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
             "training.learning_rate", "training.min_lr_ratio",
             "training.warmup_steps", "training.optimizer", "training.scheduler",
             "training.sched_decay_frac", "training.weight_decay", "training.beta1",
-            "training.beta2", "training.eps", "training.grad_clip",
+             "training.beta2", "training.eps", "training.grad_clip",
+             "training.ns_steps", "training.muon_min_ns_dim",
+
              "training.precision", "training.gemm_fp16", "training.fp16_weight_cache",
              "training.loss_scale_init",
             "training.loss_scale_window", "training.log_every", "training.eval_every",
             "training.eval_batches", "training.save_every", "training.checkpoint_dir",
             "training.resume", "training.seed", "training.device", "training.stage",
             "training.pretrained_checkpoint", "training.allow_no_pretrained",
-            "training.allow_recipe_drift",
+             "training.allow_recipe_drift", "training.resume_mode",
+
             "training.freeze_embeddings", "training.activation_checkpointing",
              "training.ckpt_segments", "training.ce_chunks", "training.pack_sequences",
              "training.ddp",
@@ -289,6 +305,9 @@ static MuonConfig make_muon(const TrainerConfig& c) {
     m.eps          = c.eps;
     m.weight_decay = c.weight_decay;
     m.grad_clip    = c.grad_clip;
+    // F-04: NS cost knobs ride the TrainerConfig so recipes can tune them.
+    m.ns_steps     = c.muon_ns_steps;
+    m.min_ns_dim   = c.muon_min_ns_dim;
     return m;
 }
 
@@ -530,6 +549,33 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 
     if (cfg_.ce_chunks > 1)
         log_info(strfmt("[mem ] chunked CE x%d: [N,V] logits+dlogits shrink to row-block scratch", cfg_.ce_chunks));
+    // F-13: enable the persistent fp16 weight cache BEFORE any activation arena
+    // is built. make_activations() sizes act.qkv for the fused QKV path only
+    // when the cache is already on, so enabling it afterwards left act_ without
+    // that scratch and the forward silently fell back to three separate GEMMs
+    // per layer (a throughput regression, not a numerical one). Enabling it here
+    // also means the cache is populated from the freshly initialized weights
+    // before any resume overwrites them, so the lazy refresh at the top of
+    // forward_body() keeps it consistent.
+    if (cfg_.fp16_weight_cache) {
+        model_.enable_fp16_weight_cache(true);
+        log_info(strfmt("[prec] persistent fp16 weight cache: %s (enabled before arenas)",
+                        human_bytes(model_.fp16_weight_cache_bytes()).c_str()));
+    }
+#ifdef GAI_CUDA
+    // F-16: pre-size the CUDA workspace pools from the recipe BEFORE the first
+    // step, so the run never pays a cudaFree+cudaMalloc resize stall (cudaFree
+    // can force a full device synchronization) mid-training. Pure arithmetic;
+    // over-estimating only reserves monotonic pool memory.
+    if (model_.device() == Device::CUDA) {
+        const Model::WorkspacePlan wsp =
+            Model::workspace_plan(model_.config(), cfg_.batch_size, cfg_.seq_len);
+        cuda_ops::reserve_workspaces(wsp.gemm_bytes, wsp.moe_bytes);
+        log_info(strfmt("[mem ] cuda workspaces pre-sized: gemm %s + moe %s",
+                        human_bytes(wsp.gemm_bytes).c_str(),
+                        human_bytes(wsp.moe_bytes).c_str()));
+    }
+#endif
     // ---- activation checkpointing mode resolved BEFORE arenas (T4-P1-15):
     // the segmented path never touches act_, so allocating the full arena
     // alongside ckpt_act_ wastes exactly the memory checkpointing should save.
@@ -601,7 +647,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         // full arena is no longer allocated in checkpoint mode).
         size_t live_train_act = act_.bytes + (use_ckpt_ ? ckpt_act_.bytes : 0);
         size_t peak_act = live_train_act;
-        size_t fp16_cache = cfg_.fp16_weight_cache ? static_cast<size_t>(params * 2) : 0;
+        // F-14: use the LIVE fp16 cache footprint (params caches + the per-layer
+        // fused QKV cache), not params*2, which under-counted by L*(qd+2kvd)*d*2.
+        // F-13 guarantees the cache is populated before the arenas are built.
+        size_t fp16_cache = cfg_.fp16_weight_cache ? model_.fp16_weight_cache_bytes() : 0;
         size_t need_core = params * 8 + fp16_cache + opt_state_bytes() + peak_act + eval_act_.bytes;
         // params*8 = weights+grads fp32; opt = m+v (adamw) or m (lion); + train/eval acts.
         // Note: with DDP, each GPU has its own full copy of weights/grads/opt state.
@@ -635,8 +684,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     std::string resume_path;
     if (cfg_.resume == "auto")      resume_path = Checkpoint::latest_in(cfg_.checkpoint_dir);
     else if (cfg_.resume != "none") resume_path = cfg_.resume;
-
     if (!resume_path.empty() && fs::exists(resume_path)) {
+        const bool exact = cfg_.resume_exact();
+        log_info(strfmt("[ckpt] resume_mode=%s from %s", cfg_.resume_mode.c_str(),
+                        resume_path.c_str()));
         // P1-36: fail closed on MATH recipe drift (same weights would define
         // a different model function). Peek is a header-only read, so this
         // gate runs before a single weight loads. Loss weights (aux/z/jitter)
@@ -665,12 +716,37 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 }
                 if (!math_same)
                     log_warn("[ckpt] resuming WITH recipe drift (--allow-recipe-drift): numerics differ from save time");
+                // F-08: exact resume also refuses a reshaped schedule. Warn-only
+                // in migrate mode, because extending a run is a normal move.
+                if (peek_st.sched_total > 0) {
+                    const bool sched_same =
+                        peek_st.sched_kind == ((cfg_.scheduler == "wsd") ? 1 : 0) &&
+                        std::fabs(peek_st.sched_peak - cfg_.learning_rate) <=
+                            1e-6f * std::fabs(peek_st.sched_peak) + 1e-30f;
+                    if (!sched_same) {
+                        const std::string why =
+                            "scheduler recipe differs (kind or peak lr) from the checkpoint";
+                        if (exact)
+                            GAI_FAIL("exact resume: " + why +
+                                     ". Restore the original recipe, use resume_mode: migrate, "
+                                     "or pass --allow-recipe-drift");
+                        log_warn("[ckpt] resuming WITH scheduler drift: " + why +
+                                 " (past lr_at(N) values are unchanged; the rest is not)");
+                    }
+                }
             }
         }
         bool moments_restored = false;
-        bool ok = use_muon_ ? Checkpoint::load(resume_path, model_, opt_muon_.get(), state_, &moments_restored)
-                    : use_lion_ ? Checkpoint::load(resume_path, model_, opt_lion_.get(), state_, &moments_restored)
-                                : Checkpoint::load(resume_path, model_, opt_adam_.get(), state_, &moments_restored);
+        const bool strict_load = exact;
+        bool ok = use_muon_ ? Checkpoint::load(resume_path, model_, opt_muon_.get(), state_, &moments_restored, strict_load)
+                    : use_lion_ ? Checkpoint::load(resume_path, model_, opt_lion_.get(),  state_, &moments_restored, strict_load)
+                                : Checkpoint::load(resume_path, model_, opt_adam_.get(),  state_, &moments_restored, strict_load);
+        if (!ok && exact) {
+            GAI_FAIL("exact resume rejected: " + resume_path +
+                     " is not an exact continuation of this recipe "
+                     "(parameter set, tokenizer vocab, optimizer state or architecture differ). "
+                     "Fix the recipe, or use resume_mode: migrate to accept a controlled reset");
+        }
         if (ok) {
             // DeepSeek resume rule: bias-correction t_ must match moments.
             // Fresh moments + t_=N => m_hat≈(1-b)*g (~10x too small first
@@ -683,6 +759,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                                 "optimizer t_=0 with weights at step %lld (loud, not silent)",
                                 (long long)state_.step));
             }
+
             train_loader_.set_state(state_.loader);
             // restore the dynamic loss scaler exactly (v3 checkpoint fields)
             if (cfg_.loss_scale_init > 0.0 && state_.loss_scale >= 1.0) {
@@ -727,11 +804,11 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             log_warn("[ckpt] failed to load " + resume_path + "; model reset before scratch run");
         }
     }
-    if (cfg_.fp16_weight_cache) {
-        model_.enable_fp16_weight_cache(true);
-        log_info(strfmt("[prec] persistent fp16 weight cache: %s",
-                        human_bytes(model_.fp16_weight_cache_bytes()).c_str()));
-    }
+    // F-13: the cache is enabled before the arenas (see the ctor); a resume
+    // overwrote the weights behind it, so mark it dirty and let the lazy
+    // refresh at the top of forward_body() rebuild it from the restored
+    // weights instead of serving stale fp16 copies.
+    if (cfg_.fp16_weight_cache) model_.mark_weights_dirty();
 }
 
 Trainer::~Trainer() {
@@ -787,9 +864,12 @@ double Trainer::forward_backward_micro(const Batch& batch, float dscale, i64* ou
         device_copy(dev_targets_.data_ptr(), model_.device(), batch.targets.data(), Device::CPU, N * sizeof(i32));
         device_copy(dev_segments_.data_ptr(), model_.device(), batch.segment_ids.data(), Device::CPU, N * sizeof(i32));
         i64 ntok = 0;
+        // F-10: pass the host target mirror so fully-masked CE blocks skip on
+        // the host (no GEMMs, no kernels) without a device sync for the count.
         double l = model_.forward_backward(dev_ids_.i32p(), dev_targets_.i32p(),
                                            batch.B, batch.T, act_, &ntok, dscale,
-                                           want_aux_stats, dev_segments_.i32p());
+                                           want_aux_stats, dev_segments_.i32p(),
+                                           batch.targets.data());
         if (frozen_emb_ && frozen_emb_->g.defined()) frozen_emb_->g.zero_();
         if (out_ntok) *out_ntok = ntok;
         return l;
@@ -814,7 +894,8 @@ double Trainer::forward_backward_micro(const Batch& batch, float dscale, i64* ou
         i64 ntok = 0;
         double l = model_.forward_backward(ckpt_ids_.i32p(), ckpt_targets_.i32p(),
                                            curB, T, ckpt_act_, &ntok, dscale,
-                                           want_aux_stats, ckpt_segments_.i32p());
+                                           want_aux_stats, ckpt_segments_.i32p(),
+                                           batch.targets.data() + src);
         if (frozen_emb_ && frozen_emb_->g.defined()) frozen_emb_->g.zero_();
         loss_num += l * static_cast<double>(ntok);
         ntok_tot += ntok;
@@ -830,7 +911,7 @@ double Trainer::evaluate(i64 max_batches) {
     Batch batch;
     for (i64 i = 0; i < max_batches; ++i) {
         if (!val_loader_.next(batch)) break;
-        
+
         i64 N = static_cast<i64>(batch.B) * batch.T;
         device_copy(dev_ids_.data_ptr(), model_.device(), batch.ids.data(), Device::CPU, N * sizeof(i32));
         device_copy(dev_targets_.data_ptr(), model_.device(), batch.targets.data(), Device::CPU, N * sizeof(i32));
@@ -857,18 +938,32 @@ void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok)
     i64 remaining = total_steps_ - state_.step;
     double eta = remaining > 0 ? remaining * dt : 0.0;
     // PERF telemetry (audit P2-2): launch/transfer totals since run start.
-    // Deltas between log lines / grad_accum = per-step launch cost — the
+    // Deltas between log lines / grad_accum = per-step launch cost - the
     // number to drive down alongside tok/s (Nsight on T4 for hotspots).
+    // ckptq reports the background-writer backlog at this log line (acceptance
+    // criterion 9: queue depth/bytes is how the operator sees backpressure).
+    size_t ckpt_depth = 0, ckpt_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+        ckpt_depth = pending_saves_.size();
+        for (const auto& qs : pending_saves_)
+            if (qs.snapshot) ckpt_bytes += qs.snapshot->bytes();
+        if (ckpt_active_) ckpt_bytes += ckpt_active_->bytes();
+    }
     log_info(strfmt("step %6lld | loss %7.4f | ema %7.4f | ppl %8.2f | lr %.3e | gnorm %6.3f "
-                    "| %7.0f tok/s | %s | eta %s | perf [%s]",
+                    "| %7.0f tok/s | %s | eta %s | ckptq %zu (%s) | perf [%s]",
                     static_cast<long long>(state_.step), loss, ema_loss_,
                     std::exp(std::min(20.0, ema_loss_)), lr, gnorm, tps,
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
-                    human_duration(eta).c_str(),
+                    human_duration(eta).c_str(), ckpt_depth,
+                    human_bytes(ckpt_bytes).c_str(),
                     ops::perf_report().c_str()));
 }
 
+
 double Trainer::opt_step(float lr, float grad_scale) {
+    // Telemetry for this lives inside each optimizer's step() so direct
+    // callers (tests, tools) are counted too.
     if (use_muon_) return opt_muon_->step(lr, grad_scale);
     if (use_lion_) return opt_lion_->step(lr, grad_scale);
     return opt_adam_->step(lr, grad_scale);
@@ -887,6 +982,58 @@ void Trainer::opt_set_step(i64 t) {
 }
 
 void Trainer::save(const std::string& name) {
+    quiesce_prefetch();
+    u8 capture_ok = 1;
+    if (is_main_rank()) {
+        try {
+            state_.loader = train_loader_.get_state();
+            state_.loss_scale = loss_scale_;
+            state_.clean_steps = clean_steps_;
+            state_.tok_vocab = model_.config().vocab_size;
+            state_.sched_total = total_steps_ > 0 ? total_steps_ : sched_.total();
+            state_.sched_warmup = sched_.warmup();
+            state_.sched_peak = sched_.peak();
+            state_.sched_min_ratio = cfg_.min_lr_ratio;
+            state_.sched_decay_frac = cfg_.sched_decay_frac;
+            state_.sched_kind = (cfg_.scheduler == "wsd") ? 1 : 0;
+            {
+                int ws = 1;
+#ifdef GAI_CUDA
+                if (dist_ && dist_->world_size() > 1) ws = dist_->world_size();
+#endif
+                state_.ddp_world = ws;
+            }
+            if (!snapshot_cache_ || snapshot_step_ != state_.step) {
+                if (use_muon_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                    Checkpoint::capture(model_, *opt_muon_, state_));
+                else if (use_lion_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                    Checkpoint::capture(model_, *opt_lion_, state_));
+                else snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
+                    Checkpoint::capture(model_, *opt_adam_, state_));
+                snapshot_step_ = state_.step;
+            }
+        } catch (const std::exception& e) {
+            log_error(std::string("Checkpoint capture failed: ") + e.what());
+            capture_ok = 0;
+        } catch (...) {
+            log_error("Checkpoint capture failed with unknown exception");
+            capture_ok = 0;
+        }
+    }
+
+#ifdef GAI_CUDA
+    if (dist_ && dist_->world_size() > 1) {
+        dist_->broadcast(&capture_ok, 1, sizeof(u8), 0);
+    }
+#endif
+
+    if (!capture_ok) {
+        resume_prefetch();
+        GAI_FAIL("Checkpoint capture failed on rank 0");
+    }
+
+    resume_prefetch();
+
     if (!is_main_rank()) {
 #ifdef GAI_CUDA
         if (dist_ && dist_->world_size() > 1) dist_->barrier();
@@ -894,48 +1041,9 @@ void Trainer::save(const std::string& name) {
         return;
     }
 
-    quiesce_prefetch();
-    try {
-        state_.loader = train_loader_.get_state();
-        state_.loss_scale = loss_scale_;
-        state_.clean_steps = clean_steps_;
-        state_.tok_vocab = model_.config().vocab_size;
-        state_.sched_total = total_steps_ > 0 ? total_steps_ : sched_.total();
-        state_.sched_warmup = sched_.warmup();
-        state_.sched_peak = sched_.peak();
-        state_.sched_min_ratio = cfg_.min_lr_ratio;
-        state_.sched_decay_frac = cfg_.sched_decay_frac;
-        state_.sched_kind = (cfg_.scheduler == "wsd") ? 1 : 0;
-        {
-            int ws = 1;
-#ifdef GAI_CUDA
-            if (dist_ && dist_->world_size() > 1) ws = dist_->world_size();
-#endif
-            state_.ddp_world = ws;
-        }
-        if (!snapshot_cache_ || snapshot_step_ != state_.step) {
-            if (use_muon_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
-                Checkpoint::capture(model_, *opt_muon_, state_));
-            else if (use_lion_) snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
-                Checkpoint::capture(model_, *opt_lion_, state_));
-            else snapshot_cache_ = std::make_shared<CheckpointSnapshot>(
-                Checkpoint::capture(model_, *opt_adam_, state_));
-            snapshot_step_ = state_.step;
-        }
-    } catch (...) {
-        resume_prefetch();
-        throw;
-    }
-    resume_prefetch();
-
     const std::string path = (fs::path(cfg_.checkpoint_dir) / name).string();
     std::shared_ptr<CheckpointSnapshot> snapshot = snapshot_cache_;
-    save_async([path, snapshot]() {
-        Timer t;
-        Checkpoint::save(*snapshot, path);
-        log_info(strfmt("[ckpt] saved %s (%s)", path.c_str(),
-                        human_duration(t.seconds()).c_str()));
-    });
+    save_async(path, snapshot);
 #ifdef GAI_CUDA
     if (dist_ && dist_->world_size() > 1) dist_->barrier();
 #endif
@@ -1101,10 +1209,15 @@ void Trainer::run_pretrain() {
         // by grad_accum leaving a ~100x phantom step. True no-op instead:
         // skip the optimizer, keep scheduler advancing, never NaN.
         double gnorm = 0.0;
+        bool opt_applied = false;
         if (ntok_global > 0) {
             float grad_scale = 1.0f / (static_cast<float>(ntok_global) * dscale);
             gnorm = opt_step(lr, grad_scale);
-            model_.mark_weights_dirty();
+            // F-11: every optimizer returns a non-finite norm when it refuses
+            // the update (overflow). That is a rejected step, so nothing that
+            // is coupled to the step may move.
+            opt_applied = std::isfinite(gnorm);
+            if (opt_applied) model_.mark_weights_dirty();
         } else {
             static int warned_empty = 0;
             if (warned_empty++ < 3)
@@ -1115,6 +1228,10 @@ void Trainer::run_pretrain() {
             }
         }
         scaler_update(gnorm);
+        // Aux-free MoE: all-reduce slot counts (sum over micros+ranks) and apply
+        // the EMA bias update exactly once per optimizer step — and only when
+        // the optimizer actually applied its update (F-11).
+        sync_moe_bias(opt_applied);
 
         ++state_.step;
         // DeepSeek accounting: tokens_seen tracks GLOBAL supervised tokens
@@ -1135,7 +1252,12 @@ void Trainer::run_pretrain() {
         // ranks still reset MoE balance stats (they accumulate locally in
         // training forwards). Skipping evaluate() elsewhere is safe: each
         // rank owns an independent val_loader whose state isn't checkpointed.
+        //
+        // F-01 (P0): the save DECISION is rank-local but save() is collective.
+        // The decision is broadcast and all ranks enter save() together, so the
+        // NCCL collective order can never desync at a new-best step.
         if (have_val_ && cfg_.eval_every > 0 && state_.step % cfg_.eval_every == 0) {
+            bool is_best = false;
             if (main) {
                 double vl = evaluate(cfg_.eval_batches);
                 std::string bal = model_.moe_balance_report();
@@ -1143,18 +1265,26 @@ void Trainer::run_pretrain() {
                 model_.moe_balance_reset();
                 log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %.4f]",
                                 vl, std::exp(std::min(20.0, vl)), state_.best_val));
-                if (vl < state_.best_val) {
-                    state_.best_val = vl;
-                    save("best.ckpt");
-                }
+                is_best = (vl < state_.best_val);
+                if (is_best) state_.best_val = vl;
             } else {
                 model_.moe_balance_reset();
             }
+            sync_eval_best(main, is_best);
+            if (is_best) save("best.ckpt");
         }
 
         if (cfg_.save_every > 0 && state_.step % cfg_.save_every == 0) {
             save("last.ckpt");
         }
+        // F-07: a dead checkpoint disk must stop the run at a save boundary,
+        // not thousands of steps later.
+        check_ckpt_health();
+        // Release the retained snapshot once every save for this step is
+        // queued: a queued job owns its own shared_ptr, so the multi-GB CPU
+        // clone does not outlive the step (matches the SFT loop; without this
+        // pretrain held a full extra snapshot for the whole run).
+        if (main) snapshot_cache_.reset();
     }
 
     // Phase 1C: stop prefetch thread before final save.
@@ -1240,10 +1370,12 @@ void Trainer::run_sft() {
         // Same all-masked no-op rule as pretrain (see above): never divide
         // aux-only grads by grad_accum.
         double gnorm = 0.0;
+        bool opt_applied = false;
         if (ntok_global > 0) {
             float grad_scale = 1.0f / (static_cast<float>(ntok_global) * dscale);
             gnorm = opt_step(lr, grad_scale);
-            model_.mark_weights_dirty();
+            opt_applied = std::isfinite(gnorm);   // F-11 (see pretrain loop)
+            if (opt_applied) model_.mark_weights_dirty();
         } else {
             static int warned_empty_sft = 0;
             if (warned_empty_sft++ < 3)
@@ -1254,6 +1386,9 @@ void Trainer::run_sft() {
             }
         }
         scaler_update(gnorm);
+        // Aux-free MoE: same as pretrain — all-reduce slot counts, apply the
+        // EMA once, and only on a step the optimizer accepted.
+        sync_moe_bias(opt_applied);
 
         ++state_.step;
         state_.tokens_seen += ntok_global;
@@ -1266,7 +1401,9 @@ void Trainer::run_sft() {
         }
 
         // T4-P1-23: rank-0-only validation (see pretrain loop for rationale).
+        // F-01 (P0): broadcast the best-decision, then ALL ranks enter save().
         if (have_val_ && cfg_.eval_every > 0 && state_.step % cfg_.eval_every == 0) {
+            bool is_best = false;
             if (main) {
                 double vl = evaluate(cfg_.eval_batches);
                 std::string bal = model_.moe_balance_report();
@@ -1274,18 +1411,22 @@ void Trainer::run_sft() {
                 model_.moe_balance_reset();
                 log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %.4f]",
                                 vl, std::exp(std::min(20.0, vl)), state_.best_val));
-                if (vl < state_.best_val) {
-                    state_.best_val = vl;
-                    save("best.ckpt");
-                }
+                is_best = (vl < state_.best_val);
+                if (is_best) state_.best_val = vl;
             } else {
                 model_.moe_balance_reset();
             }
+            sync_eval_best(main, is_best);
+            if (is_best) save("best.ckpt");
         }
 
         if (cfg_.save_every > 0 && state_.step % cfg_.save_every == 0) {
             save("last.ckpt");
         }
+        check_ckpt_health();   // F-07
+
+        // Release snapshot memory after all saves for this step are queued.
+        if (main) snapshot_cache_.reset();
     }
 
     // Phase 1C: stop prefetch thread before final save.
@@ -1337,9 +1478,7 @@ void Trainer::init_distributed() {
     dist_ = std::make_unique<DistributedContext>();
     bool ok = dist_->init(dcfg);
     if (!ok) {
-        log_warn("[dist] Failed to initialize distributed context, falling back to single GPU");
-        dist_.reset();
-        return;
+        GAI_FAIL("[dist] Failed to initialize distributed context; WORLD_SIZE>1 requires successful NCCL init.");
     }
 
     // Set CUDA device for this rank
@@ -1413,7 +1552,7 @@ void Trainer::sync_gradients() {
         }
     }
 
-    dist_->barrier();
+
 #else
     (void)dist_; (void)model_; // suppress unused warning
 #endif
@@ -1459,30 +1598,150 @@ i64 Trainer::sync_ntok_sum(i64 local) {
         // Exact path is CUDA+NCCL (production).
         return local * (i64)dist_->world_size();
     }
-    if (!dist_ntok_.defined())
-        dist_ntok_ = Tensor::empty({1}, DType::F32, Device::CUDA);
-    float h = static_cast<float>(local);
-    device_copy(dist_ntok_.data_ptr(), Device::CUDA, &h, Device::CPU, sizeof(float));
-    dist_->all_reduce_sum(static_cast<float*>(dist_ntok_.data_ptr()), 1);
-    float out = 0.0f;
-    device_copy(&out, Device::CPU, dist_ntok_.data_ptr(), Device::CUDA, sizeof(float));
-    i64 res = static_cast<i64>(std::llround(out));
-    return res > 0 ? res : 0;
+    if (!dist_ntok_.defined() || dist_ntok_.dtype() != DType::I64)
+        dist_ntok_ = Tensor::empty({1}, DType::I64, Device::CUDA);
+    i64 h = local;
+    device_copy(dist_ntok_.data_ptr(), Device::CUDA, &h, Device::CPU, sizeof(i64));
+    dist_->all_reduce_sum_i64(static_cast<int64_t*>(dist_ntok_.data_ptr()), 1);
+    i64 out = 0;
+    device_copy(&out, Device::CPU, dist_ntok_.data_ptr(), Device::CUDA, sizeof(i64));
+    return out > 0 ? out : 0;
 #else
     (void)dist_;
     return local > 0 ? local : 0;
 #endif
 }
 
+void Trainer::sync_moe_bias(bool opt_step_applied) {
+    // All-reduce the aux-free expert slot-count accumulator across DDP ranks,
+    // then apply the EMA bias update exactly once per optimizer step.
+    // F-02: on CUDA the counts never left the device (moe_count_slots into the
+    // model's persistent [L*ne] counter), so the all-reduce runs on device and
+    // the ONLY host traffic of the whole step is one tiny [L*ne] read below.
+    // CPU-only / single-GPU: counts are already local-only; just apply.
+    // F-11: `opt_step_applied` is false when the optimizer refused the update
+    // (non-finite grad norm) — the bias is optimizer-step-coupled control
+    // state, so it must not move on a step whose weights did not.
+    // F-12: the per-layer denominator is derived inside the model from the
+    // same counts, so no external token count can desync the population.
+    Tensor& acc_dev = model_.moe_bias_acc_dev();
+    auto& acc = model_.moe_bias_acc_host();
+    if (acc.empty() && !acc_dev.defined()) {
+        // No MoE or aux_free disabled; nothing to do.
+        return;
+    }
+#ifdef GAI_CUDA
+    if (dist_ && dist_->world_size() > 1 && model_.device() == Device::CUDA && acc_dev.defined()) {
+        // DDP + CUDA: reduce the device counter in place, then read the
+        // summary back once. Small (e.g. 8 experts * 36 layers = 288 floats).
+        dist_->all_reduce_sum(acc_dev.f32(), static_cast<size_t>(acc_dev.numel()));
+        const size_t n = static_cast<size_t>(acc_dev.numel());
+        acc.assign(n, 0.0f);
+        device_copy(acc.data(), Device::CPU, acc_dev.data_ptr(), Device::CUDA,
+                    n * sizeof(float));
+    } else if (dist_ && dist_->world_size() > 1 && !acc.empty()) {
+        // CPU+NCCL is unsupported; fall back to the local host counts.
+        // (Production DDP is CUDA-only; this branch exists so the collective
+        // order stays identical if someone wires it up later.)
+    }
+    if (!dist_ || dist_->world_size() <= 1) {
+        if (acc_dev.defined() && acc.empty()) {
+            // Single GPU: no reduction needed, just read the device summary.
+            const size_t n = static_cast<size_t>(acc_dev.numel());
+            acc.assign(n, 0.0f);
+            device_copy(acc.data(), Device::CPU, acc_dev.data_ptr(), Device::CUDA,
+                        n * sizeof(float));
+        }
+    }
+#else
+    (void)acc_dev;
+#endif
+    model_.apply_moe_bias_step(acc.empty() ? nullptr : acc.data(), opt_step_applied);
+}
+
+void Trainer::broadcast_from_main(void* buf, size_t numel, int dtype_size) {
+#ifdef GAI_CUDA
+    if (dist_ && dist_->world_size() > 1)
+        dist_->broadcast(buf, numel, dtype_size, 0);
+#else
+    (void)buf; (void)numel; (void)dtype_size; // single process: nothing to do
+#endif
+}
+
+void Trainer::sync_eval_best(bool is_main, bool is_best) {
+    // F-01 (P0 DDP deadlock): validation runs on rank 0 only, but save() begins
+    // with a collective. If only rank 0 entered save("best.ckpt"), NCCL would
+    // see 4 collectives on rank 0 and 2 on the others at the first new best and
+    // the job would hang. So the decision is broadcast and EVERY rank then
+    // enters save() the same number of times, in the same order.
+    // Packed into one i64 pair -> exactly one collective:
+    //   [0] = is_best flag, [1] = bit pattern of best_val (kept exact).
+    i64 payload[2] = {is_best ? 1 : 0, 0};
+    if (is_main) {
+        double bv = state_.best_val;
+        std::memcpy(&payload[1], &bv, sizeof(double));
+    }
+    broadcast_from_main(payload, 2, static_cast<int>(sizeof(i64)));
+    is_best = payload[0] != 0;
+    if (is_main) {
+        double bv = 0.0;
+        std::memcpy(&bv, &payload[1], sizeof(double));
+        state_.best_val = bv;
+    }
+}
+
+void Trainer::check_ckpt_health() {
+    // F-07: a fatal background-write error used to stay invisible until the
+    // final drain, so a full disk could burn hours of T4 time. Checked at every
+    // log/save cadence (cheap atomic read) and turned into a hard stop.
+    bool failed = false;
+    std::string err;
+    {
+        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+        failed = ckpt_failed_;
+        err = ckpt_error_;
+    }
+    if (failed)
+        GAI_FAIL("background checkpoint write failed: " + err +
+                 " (stopping now instead of training into a dead disk)");
+}
+
 // ============================================================
 // Phase 1D — Background Checkpoint Writer
 // ============================================================
-// save_async() captures the current TrainState + loader/optimizer snapshot by
-// value inside a closure and enqueues it. If a previous write is still queued
-// (not yet started), it is replaced by the newer one (we always want the
-// freshest checkpoint). The writer thread blocks until it has work, executes
-// the closure, then sleeps again. wait_for_save() drains the queue before the
-// training run exits so no data is lost on Kaggle preemption.
+// A save enqueues an immutable CheckpointSnapshot; a dedicated thread
+// serializes it while the training loop keeps computing. The queue is bounded
+// by a host-RAM budget with real backpressure (the caller waits for the writer
+// to drain instead of crashing), and every checkpoint failure is surfaced at
+// the next step boundary by check_ckpt_health().
+
+// F-06: publish an already-committed checkpoint under a second name
+// (best.ckpt next to last.ckpt for the same step) without re-serializing
+// gigabytes. A hard link is instant and shares the immutable inode; a plain
+// copy is the fallback. Returns false so the caller can do a full write.
+static bool link_or_copy_committed(const std::string& src, const std::string& dst) {
+    std::error_code ec;
+    if (!fs::exists(src, ec) || ec) return false;
+    const std::string tmp = dst + ".lnk";
+    fs::remove(tmp, ec);
+    ec.clear();
+    fs::create_hard_link(src, tmp, ec);
+    if (ec) {
+        ec.clear();
+        fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
+    }
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    ec.clear();
+    fs::rename(tmp, dst, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
 
 void Trainer::start_ckpt_writer() {
     if (ckpt_writer_thread_.joinable()) return;
@@ -1491,21 +1750,53 @@ void Trainer::start_ckpt_writer() {
         ckpt_stop_ = false;
         ckpt_failed_ = false;
         ckpt_error_.clear();
+        ckpt_committed_.clear();
+        ckpt_active_.reset();
     }
     ckpt_writer_thread_ = std::thread([this]() {
         while (true) {
-            std::function<void()> fn;
+            QueuedSave qs;
             {
                 std::unique_lock<std::mutex> lk(ckpt_mutex_);
                 ckpt_cv_.wait(lk, [this] { return !pending_saves_.empty() || ckpt_stop_; });
                 if (pending_saves_.empty() && ckpt_stop_) break;
-                fn = std::move(pending_saves_.front());
-                pending_saves_.pop_front();
+                qs = std::move(pending_saves_.front());
+                pending_saves_.erase(pending_saves_.begin());
                 ckpt_busy_ = true;
+                ckpt_active_ = qs.snapshot;
             }
-            if (fn) {
+            if (qs.snapshot) {
                 try {
-                    fn();
+                    Timer t;
+                    // F-06: if this exact step is already on disk under another
+                    // name, reuse that file instead of serializing again.
+                    std::string reuse;
+                    {
+                        std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                        auto it = ckpt_committed_.find(qs.step);
+                        if (it != ckpt_committed_.end() && it->second != qs.path)
+                            reuse = it->second;
+                    }
+                    if (!reuse.empty() && link_or_copy_committed(reuse, qs.path)) {
+                        log_info(strfmt("[ckpt] published %s from %s (same step %lld, no re-serialize)",
+                                        qs.path.c_str(), reuse.c_str(), static_cast<long long>(qs.step)));
+                        {
+                            std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                            ckpt_committed_[qs.step] = qs.path;
+                        }
+                    } else {
+                        Checkpoint::save(*qs.snapshot, qs.path);
+                        {
+                            std::lock_guard<std::mutex> lk(ckpt_mutex_);
+                            ckpt_committed_[qs.step] = qs.path;
+                            // Bounded history: only the newest few steps can be
+                            // reused, and the map must not grow with the run.
+                            while (ckpt_committed_.size() > 8) ckpt_committed_.erase(ckpt_committed_.begin());
+                        }
+                        log_info(strfmt("[ckpt] saved %s (%s)", qs.path.c_str(),
+                                        human_duration(t.seconds()).c_str()));
+                    }
+                    qs.snapshot.reset();
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(ckpt_mutex_);
                     ckpt_failed_ = true;
@@ -1521,6 +1812,7 @@ void Trainer::start_ckpt_writer() {
             {
                 std::lock_guard<std::mutex> lk(ckpt_mutex_);
                 ckpt_busy_ = false;
+                ckpt_active_.reset();
             }
             ckpt_cv_.notify_all();
         }
@@ -1536,12 +1828,65 @@ void Trainer::stop_ckpt_writer() {
     if (ckpt_writer_thread_.joinable()) ckpt_writer_thread_.join();
 }
 
-void Trainer::save_async(std::function<void()> fn) {
-    GAI_CHECK(ckpt_writer_thread_.joinable(), "checkpoint writer is not running");
-    {
-        std::lock_guard<std::mutex> lk(ckpt_mutex_);
-        pending_saves_.push_back(std::move(fn));
+// F-05: host-RAM budget must cover every live reference to a snapshot —
+// the one being written right now, everything still queued, and the trainer's
+// retained snapshot_cache_ — otherwise the real peak exceeds the budget.
+static size_t unique_snapshot_bytes(const std::vector<std::shared_ptr<CheckpointSnapshot>>& refs) {
+    size_t total = 0;
+    for (const auto& s : refs) {
+        if (!s) continue;
+        bool dup = false;
+        for (const auto& prev : refs) {
+            if (prev == s) { dup = true; break; }
+        }
+        if (!dup) total += s->bytes();
     }
+    return total;
+}
+
+void Trainer::save_async(const std::string& path, std::shared_ptr<CheckpointSnapshot> snapshot) {
+    GAI_CHECK(ckpt_writer_thread_.joinable(), "checkpoint writer is not running");
+    GAI_CHECK(snapshot != nullptr, "save_async: null checkpoint snapshot");
+    const i64 step = snapshot_step_;
+    const size_t single = snapshot->bytes();
+
+    std::unique_lock<std::mutex> lk(ckpt_mutex_);
+    // Explicit backpressure: a full queue means the disk cannot keep up. Wait
+    // for the writer to drain instead of aborting the run — but never wait on
+    // a writer that already failed or stopped.
+    for (int spins = 0; ; ++spins) {
+        // Supersede any queued write for the same destination: the newer
+        // snapshot always wins.
+        auto it = std::remove_if(pending_saves_.begin(), pending_saves_.end(),
+                                 [&](const QueuedSave& p) { return p.path == path; });
+        pending_saves_.erase(it, pending_saves_.end());
+
+        std::vector<std::shared_ptr<CheckpointSnapshot>> refs;
+        refs.reserve(pending_saves_.size() + 3);
+        refs.push_back(snapshot);
+        if (ckpt_active_) refs.push_back(ckpt_active_);
+        if (snapshot_cache_) refs.push_back(snapshot_cache_);
+        for (const auto& qs : pending_saves_) refs.push_back(qs.snapshot);
+        const size_t live = unique_snapshot_bytes(refs);
+
+        if (live <= kCkptRamBudgetBytes || ckpt_failed_ || ckpt_stop_) {
+            if (live > kCkptRamBudgetBytes) {
+                GAI_FAIL("checkpoint backlog exceeds the host-RAM budget and the writer "
+                         "cannot drain (see ckpt_error_)");
+            }
+            break;
+        }
+        if (spins == 0)
+            log_warn(strfmt("[ckpt] host-RAM budget reached (%.0f MB live): applying backpressure",
+                            static_cast<double>(live) / (1024.0 * 1024.0)));
+        ckpt_cv_.wait_for(lk, std::chrono::milliseconds(50));
+    }
+
+    pending_saves_.push_back({path, step, std::move(snapshot)});
+    log_info(strfmt("[ckpt] queued %s (snapshot %.0f MB, step %lld)", path.c_str(),
+                    static_cast<double>(single) / (1024.0 * 1024.0),
+                    static_cast<long long>(step)));
+    lk.unlock();
     ckpt_cv_.notify_one();
 }
 

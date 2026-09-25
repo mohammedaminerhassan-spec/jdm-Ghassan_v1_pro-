@@ -105,6 +105,13 @@ struct MuonConfig {
     float weight_decay = 0.1f;
     float grad_clip    = 1.0f;   // 0 disables
     int   ns_steps     = 5;      // Newton-Schulz iterations (1..10)
+    // F-04 (T4-aware Muon): only matrices with min(rows, cols) >= min_ns_dim
+    // run Newton-Schulz. Smaller decay matrices (routers, small projections)
+    // fall back to the cheap Lion-style branch of step(). 0 = historical
+    // behavior (NS on every decay matrix). A T4 recipe that enables Muon
+    // should set this (e.g. 256) so the ~300 small-matrix orthogonalizations
+    // per step — each 5 NS iterations of GEMMs — do not dominate step time.
+    int   min_ns_dim   = 0;
 };
 
 enum class OptimizerSnapshotKind : u8 { None = 0, AdamW = 1, Lion = 2, Muon = 3 };
@@ -117,6 +124,13 @@ struct OptimizerStateSnapshot {
     MuonConfig muon{};
     std::vector<Tensor> first;
     std::vector<Tensor> second;
+
+    size_t bytes() const {
+        size_t b = 0;
+        for (const auto& t : first) if (t.defined()) b += t.nbytes();
+        for (const auto& t : second) if (t.defined()) b += t.nbytes();
+        return b;
+    }
 };
 
 // Muon (orthogonalized momentum, cf. Moonshot Kimi K2): 2D matmul weights
@@ -151,6 +165,17 @@ public:
     void orthogonalize(const float* G, float* O, int rows, int cols);
 
 private:
+    // F-04: single source of truth for "does this parameter get NS". Used by
+    // the constructor (scratch sizing) AND step() (routing), so the two can
+    // never disagree about which matrices are orthogonalized.
+    bool uses_ns(const Parameter* p) const {
+        if (!p || p->frozen) return false;
+        if (p->shape.size() != 2 || !p->decay) return false;
+        if (cfg_.min_ns_dim <= 0) return true;
+        const i64 r = p->shape[0], c = p->shape[1];
+        return (r < c ? r : c) >= static_cast<i64>(cfg_.min_ns_dim);
+    }
+
     Model&     model_;
     MuonConfig cfg_;
     std::vector<Tensor> m_;   // momentum for every non-frozen param

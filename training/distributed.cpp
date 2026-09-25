@@ -1,4 +1,5 @@
 #include "training/distributed.h"
+#include "core/ops.h"   // ops::perf_note_sync (telemetry for blocking collectives)
 
 #include <chrono>
 #include <cstdlib>
@@ -135,6 +136,18 @@ void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
     all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
 }
 
+void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+    NCCL_CHECK(ncclAllReduce(buffer, buffer, numel, ncclInt64, ncclSum, comm_, stream_));
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
+#else
+    (void)buffer; (void)numel;
+#endif
+}
+
 void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_size) {
     if (world_size_ <= 1) return;
 
@@ -147,6 +160,7 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
 
     NCCL_CHECK(ncclAllReduce(buffer, buffer, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
 #else
     (void)buffer; (void)numel; (void)dtype_size;
 #endif
@@ -164,6 +178,7 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
 
     NCCL_CHECK(ncclBroadcast(buffer, buffer, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
 #else
     (void)buffer; (void)numel; (void)dtype_size; (void)root;
 #endif
@@ -177,6 +192,7 @@ void DistributedContext::barrier() {
     if (!barrier_dev_ || !comm_) return;
     NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
 #endif
 }
 

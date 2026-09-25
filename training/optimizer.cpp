@@ -14,6 +14,16 @@
 
 namespace gai {
 
+namespace {
+// Acceptance criterion 9: times an optimizer step() on every exit path,
+// including the non-finite-norm early return. Declared once per step(), so a
+// future early-return cannot silently drop the telemetry.
+struct OptStepTimer {
+    Timer t;
+    ~OptStepTimer() { ops::perf_note_opt_step(t.elapsed_us()); }
+};
+} // namespace
+
 static Tensor snapshot_tensor(const Tensor& src) {
     if (!src.defined()) return {};
     return src.device() == Device::CPU ? src.clone() : src.to(Device::CPU);
@@ -39,6 +49,7 @@ AdamW::AdamW(Model& model, AdamWConfig cfg) : model_(model), cfg_(cfg) {
 }
 
 double AdamW::step(float lr, float grad_scale) {
+    OptStepTimer opt_step_timer;
     ++t_;
     Device dev = model_.device();
     auto& params = model_.parameters();
@@ -234,6 +245,11 @@ constexpr float kNSa = 1.5f, kNSb = -0.5f;
 void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     Device dev = model_.device();
     const i64 rc = static_cast<i64>(rows) * cols;
+    Timer ns_t;
+    int iters_done = 0;
+    // F-04 telemetry reports even the degenerate early return, so "NS cost 0"
+    // is distinguishable from "NS never ran".
+    auto note = [&]() { ops::perf_note_muon_ns(iters_done, ns_t.elapsed_us()); };
     // Layout [O|T|A]: O is caller-owned output (step() passes the scratch O
     // region, tests pass their own vector); T/A are scratch-internal. O never
     // aliases T/A by construction.
@@ -244,7 +260,7 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     ops::copy(dev, O, G, rc);
     // Normalize: NS converges from X0 = G / ||G||_F (scale-invariant update).
     const double frob = std::sqrt(ops::global_sq_norm(dev, O, rc));
-    if (!std::isfinite(frob) || frob < 1e-12) return; // degenerate: keep copy
+    if (!std::isfinite(frob) || frob < 1e-12) { note(); return; } // degenerate: keep copy
     ops::scale_inplace(dev, O, static_cast<float>(1.0 / frob), rc);
 
     for (int it = 0; it < cfg_.ns_steps; ++it) {
@@ -255,7 +271,9 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
         ops::scale_inplace(dev, O, kNSa, rc);
         ops::scale_inplace(dev, T, kNSb, rc);
         ops::add_inplace(dev, O, T, rc);
+        ++iters_done;
     }
+    note();
 }
 
 Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
@@ -270,6 +288,7 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
     m_.reserve(model_.parameters().size());
     v_.reserve(model_.parameters().size());
     i64 max_rc = 0, max_cc = 0;
+    i64 ns_matrices = 0;
     for (Parameter* p : model_.parameters()) {
         // P2-3: frozen params carry no moments (placeholders keep indices).
         if (p->frozen) {
@@ -284,11 +303,12 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
         // would block the official Linux/Kaggle build for no runtime reason.
         const std::vector<i64> shape = p->shape;
         m_.push_back(Tensor::zeros(shape, DType::F32, model_.device()));
-        const bool is_mat = shape.size() == 2 && p->decay;
-        const bool is_vec = !is_mat && shape.size() == 1;
+        const bool is_ns = uses_ns(p);
+        const bool is_vec = !is_ns && shape.size() == 1;
         if (is_vec) v_.push_back(Tensor::zeros(shape, DType::F32, model_.device()));
         else v_.emplace_back();
-        if (is_mat) {
+        if (is_ns) {
+            ++ns_matrices;
             const i64 r = p->shape[0], c = p->shape[1];
             max_rc = std::max(max_rc, r * c);
             max_cc = std::max(max_cc, c * c);
@@ -302,9 +322,16 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
     amax_cc_ = max_cc;
     const i64 need = max_rc * 2 + max_cc;
     if (need > 0) scratch_ = Tensor::zeros({need}, DType::F32, model_.device());
+    if (ns_matrices > 0)
+        log_info(strfmt("[opt ] muon: Newton-Schulz on %lld matrices x %d iters (min_ns_dim=%d)",
+                        static_cast<long long>(ns_matrices), cfg_.ns_steps, cfg_.min_ns_dim));
+    else
+        log_info("[opt ] muon: no matrix eligible for Newton-Schulz (min_ns_dim gate); "
+                 "all params take the cheap branches");
 }
 
 double Muon::step(float lr, float grad_scale) {
+    OptStepTimer opt_step_timer;
     ++t_;
     Device dev = model_.device();
     auto& params = model_.parameters();
@@ -348,7 +375,12 @@ double Muon::step(float lr, float grad_scale) {
         Parameter* p = params[i];
         if (!p->g.defined()) continue;
         if (p->frozen) continue;
-        const bool is_mat = p->shape.size() == 2 && p->decay;
+        // F-04: the NS gate lives in uses_ns() (shared with the ctor), so a
+        // matrix excluded here also has no scratch sized for it — and a matrix
+        // below min_ns_dim takes the cheap Lion branch instead of 5 NS GEMM
+        // passes. Shape routing is what keeps this compatible with the
+        // embedding (2D, decay=false) and norm (1D) branches below.
+        const bool is_mat = uses_ns(p);
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
         if (is_mat) {
             // Momentum combine into O staging: O = (1-b1)*g, m = b1*m, m += O.
@@ -512,6 +544,7 @@ Lion::Lion(Model& model, LionConfig cfg) : model_(model), cfg_(cfg) {
 }
 
 double Lion::step(float lr, float grad_scale) {
+    OptStepTimer opt_step_timer;
     ++t_;
     Device dev = model_.device();
     auto& params = model_.parameters();
