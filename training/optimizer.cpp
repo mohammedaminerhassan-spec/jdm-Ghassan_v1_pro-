@@ -29,6 +29,50 @@ static Tensor snapshot_tensor(const Tensor& src) {
     return src.device() == Device::CPU ? src.clone() : src.to(Device::CPU);
 }
 
+// Moment tables are index-aligned with model_.parameters() BY CONSTRUCTION
+// (one entry per parameter, an undefined placeholder for frozen ones). Any
+// drift — a freeze flag flipped after the optimizer was built, parameters
+// added later, a restore that resized the table — makes the update kernel
+// write `p->numel()` floats into a null or smaller buffer. On CUDA that is an
+// "illegal memory access" that names neither the parameter nor the cause; on
+// CPU it silently corrupts neighbouring memory. Verify on the host, serially,
+// BEFORE launching a single kernel.
+static void validate_moment_table(const char* kind,
+                                  const std::vector<Parameter*>& params,
+                                  const std::vector<Tensor>& m,
+                                  const std::vector<Tensor>& v) {
+    GAI_CHECK(m.size() == params.size(),
+              std::string(kind) + ": moment table has " + std::to_string(m.size()) +
+              " entries for " + std::to_string(params.size()) + " parameters");
+    if (!v.empty()) {
+        GAI_CHECK(v.size() == params.size(),
+                  std::string(kind) + ": second moment table has " + std::to_string(v.size()) +
+                  " entries for " + std::to_string(params.size()) + " parameters");
+    }
+    for (size_t i = 0; i < params.size(); ++i) {
+        Parameter* p = params[i];
+        if (!p->g.defined() || p->frozen) continue;
+        const std::string where = std::string(kind) + " param '" + p->name + "' (index " +
+                                  std::to_string(i) + "): ";
+        GAI_CHECK(m[i].defined(), where + "optimizer moment is missing (index misalignment)");
+        GAI_CHECK(m[i].numel() == p->numel(),
+                  where + "moment numel " + std::to_string(m[i].numel()) +
+                  " != param numel " + std::to_string(p->numel()));
+        GAI_CHECK(m[i].device() == p->w.device(),
+                  where + "moment on " + device_name(m[i].device()) +
+                  " but weights on " + device_name(p->w.device()));
+        if (!v.empty()) {
+            GAI_CHECK(v[i].defined(), where + "second moment is missing (index misalignment)");
+            GAI_CHECK(v[i].numel() == p->numel(),
+                      where + "second moment numel " + std::to_string(v[i].numel()) +
+                      " != param numel " + std::to_string(p->numel()));
+            GAI_CHECK(v[i].device() == p->w.device(),
+                      where + "second moment on " + device_name(v[i].device()) +
+                      " but weights on " + device_name(p->w.device()));
+        }
+    }
+}
+
 AdamW::AdamW(Model& model, AdamWConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "AdamW requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
@@ -53,6 +97,7 @@ double AdamW::step(float lr, float grad_scale) {
     ++t_;
     Device dev = model_.device();
     auto& params = model_.parameters();
+    validate_moment_table("adamw", params, m_, v_);
 
     // ---- global grad norm (fused: 1 sync, was ~200). DeepSeek-style.
     std::vector<std::pair<const float*, i64>> parts;
@@ -84,20 +129,24 @@ double AdamW::step(float lr, float grad_scale) {
     const float bc1 = 1.0f - std::pow(cfg_.beta1, static_cast<float>(t_));
     const float bc2 = 1.0f - std::pow(cfg_.beta2, static_cast<float>(t_));
 
-    // PERF (audit #7): one kernel per parameter serializes ~200 launches.
-    // Full bucketing needs a layout migration; the safe win available now is
-    // threading the per-parameter updates — iterations are independent
-    // (disjoint w/g/m/v tensors), so a parallel-for is exact. Muon keeps its
-    // serial loop (shared NS scratch Ostage).
-    // PRO-HARDEN (MSVC C3016): OpenMP loop var must be signed on Windows.
-#ifdef GAI_OPENMP
-#pragma omp parallel for schedule(dynamic, 1) if(params.size() > (size_t)8)
-#endif
+    // PERF: the per-parameter updates are independent (disjoint w/g/m/v), so
+    // they used to be threaded with OpenMP. That bought nothing (the kernels
+    // are async, so the host pipeline is already saturated) and it was a
+    // correctness hazard: a device error inside a parallel region is UB and
+    // escaped as std::terminate, hiding the real message. Serial host loop.
     for (long long i = 0; i < static_cast<long long>(params.size()); ++i) {
         Parameter* p = params[static_cast<size_t>(i)];
         if (!p->g.defined()) continue;
         if (p->frozen) continue;   // frozen params receive no update at all
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
+        // Last breadcrumb before the kernel: on an illegal access this line is
+        // the one that names the guilty parameter.
+        log_debug(strfmt("[opt] adamw '%s' numel=%lld w=%p g=%p m=%p v=%p",
+                         p->name.c_str(), static_cast<long long>(p->numel()),
+                         static_cast<const void*>(p->w.f32()),
+                         static_cast<const void*>(p->g.f32()),
+                         static_cast<const void*>(m_[static_cast<size_t>(i)].f32()),
+                         static_cast<const void*>(v_[static_cast<size_t>(i)].f32())));
         ops::adamw_step(dev, p->w.f32(), p->g.f32(), m_[static_cast<size_t>(i)].f32(), v_[static_cast<size_t>(i)].f32(),
                         p->numel(), lr, cfg_.beta1, cfg_.beta2, cfg_.eps, wd,
                         bc1, bc2, effective_scale);
@@ -575,11 +624,9 @@ double Lion::step(float lr, float grad_scale) {
         return gnorm;
     }
 
-    // PERF: same threading as AdamW above (independent per-parameter updates).
-    // PRO-HARDEN (MSVC C3016): OpenMP loop var must be signed on Windows.
-#ifdef GAI_OPENMP
-#pragma omp parallel for schedule(dynamic, 1) if(params.size() > (size_t)8)
-#endif
+    // PERF: same reasoning as AdamW — serial host loop, no OpenMP region (see
+    // the note there: a device error inside a parallel region is UB).
+    validate_moment_table("lion", params, m_, {});
     for (long long i = 0; i < static_cast<long long>(params.size()); ++i) {
         Parameter* p = params[static_cast<size_t>(i)];
         if (!p->g.defined()) continue;
