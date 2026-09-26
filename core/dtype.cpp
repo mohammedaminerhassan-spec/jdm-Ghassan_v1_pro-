@@ -13,6 +13,7 @@ const char* dtype_name(DType t) {
         case DType::Q4_0: return "q4_0";
         case DType::Q4_1: return "q4_1";
         case DType::U16:  return "u16";
+        case DType::I64:  return "i64";
     }
     return "?";
 }
@@ -27,6 +28,7 @@ DType dtype_from_name(const std::string& s) {
     if (s == "q4_0" || s == "q4")    return DType::Q4_0;
     if (s == "q4_1")                 return DType::Q4_1;
     if (s == "u16")                  return DType::U16;
+    if (s == "i64")                  return DType::I64;
     GAI_FAIL("unknown dtype: " + s);
 }
 
@@ -51,6 +53,7 @@ size_t dtype_block_bytes(DType t) {
         case DType::BF16: return 2;
         case DType::U16:  return 2;
         case DType::I8:   return 1;
+        case DType::I64:  return 8;
         case DType::Q8_0: return sizeof(BlockQ8_0);
         case DType::Q4_0: return sizeof(BlockQ4_0);
         case DType::Q4_1: return sizeof(BlockQ4_1);

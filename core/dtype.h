@@ -16,6 +16,10 @@ enum class DType : u32 {
     Q4_0 = 6,   // block of 32 int4 (symmetric) + 1 fp16 scale
     Q4_1 = 7,   // block of 32 int4 + fp16 scale + fp16 min
     U16  = 8,
+    // I64: exact 64-bit integer counters (DDP supervised-token all-reduce via
+    // NCCL ncclInt64). Never a compute dtype — only device-side staging for
+    // collectives, so no kernel needs an I64 path.
+    I64  = 9,
 };
 
 // ---- quantization block layout (packed, no padding assumptions violated) ----
