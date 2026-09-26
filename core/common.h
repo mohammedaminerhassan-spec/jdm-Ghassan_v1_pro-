@@ -69,6 +69,13 @@ std::string human_bytes(u64 n);
 std::string human_count(u64 n);
 std::string human_duration(double seconds);
 
+// Stable 64-bit content fingerprint (FNV-1a) of a file, 0 if unreadable.
+// Used to pin the TOKENIZER identity inside checkpoints: a resume with a
+// different .gtok (same vocab_size, different merges) would silently train
+// on different token ids and corrupt every embedding row.
+u64 fingerprint_file(const std::string& path);
+std::string fingerprint_hex(u64 fp);
+
 int  num_threads();
 void set_num_threads(int n);
 

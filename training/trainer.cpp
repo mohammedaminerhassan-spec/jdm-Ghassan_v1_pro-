@@ -108,6 +108,10 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.save_every     = c.get_int("training.save_every", t.save_every);
     t.checkpoint_dir = c.get_str("training.checkpoint_dir", t.checkpoint_dir);
     t.resume         = c.get_str("training.resume", t.resume);
+    // Tokenizer identity pin (v11). Overridable in yaml so a recipe can carry
+    // the exact fingerprint its checkpoints were trained with.
+    t.tok_fingerprint = static_cast<u64>(c.get_int("training.tok_fingerprint",
+                                                   static_cast<i64>(t.tok_fingerprint)));
     t.seed           = static_cast<u64>(c.get_int("training.seed", static_cast<i64>(t.seed)));
     // Kaggle output quota: allow YAML pin (CLI --output-budget-mb overrides).
     // 20GB /kaggle/working cap -> keep total <=17GB (17408MB).
@@ -249,6 +253,7 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
              "training.beta2", "training.eps", "training.grad_clip",
               "training.ns_steps", "training.muon_min_ns_dim",
              "training.muon_vec_ratio", "training.output_budget_mb",
+             "training.tok_fingerprint",
 
              "training.precision", "training.gemm_fp16", "training.fp16_weight_cache",
              "training.loss_scale_init",
@@ -876,6 +881,25 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 }
                 if (!math_same)
                     log_warn("[ckpt] resuming WITH recipe drift (--allow-recipe-drift): numerics differ from save time");
+                // TOKENIZER IDENTITY (v11). The vocab SIZE is not identity: a
+                // re-trained BPE can have 32000 entries with different merges,
+                // i.e. different token ids. Resuming then feeds the model a
+                // different vocabulary and silently corrupts every embedding
+                // row. Fail closed, exactly like the math-drift gate above.
+                if (peek_st.tok_fingerprint != 0 && cfg_.tok_fingerprint != 0 &&
+                    peek_st.tok_fingerprint != cfg_.tok_fingerprint) {
+                    GAI_FAIL(strfmt(
+                        "tokenizer mismatch: checkpoint was trained with .gtok fingerprint %s "
+                        "but the current tokenizer is %s. Same vocab_size does NOT mean same "
+                        "merges -> different token ids -> corrupted embeddings. Ship the ORIGINAL "
+                        "tokenizer file (artifacts/tokenizer/english32k.gtok) with the checkpoint, "
+                        "or start a fresh run (--resume none).",
+                        fingerprint_hex(peek_st.tok_fingerprint).c_str(),
+                        fingerprint_hex(cfg_.tok_fingerprint).c_str()));
+                }
+                if (peek_st.tok_fingerprint == 0)
+                    log_warn("[ckpt] checkpoint predates tokenizer fingerprints (v10 or older): "
+                             "cannot verify the tokenizer identity on this resume");
                 // F-08: exact resume also refuses a reshaped schedule. Warn-only
                 // in migrate mode, because extending a run is a normal move.
                 if (peek_st.sched_total > 0) {
@@ -1183,6 +1207,7 @@ void Trainer::save(const std::string& name) {
             state_.loss_scale = loss_scale_;
             state_.clean_steps = clean_steps_;
             state_.tok_vocab = model_.config().vocab_size;
+            state_.tok_fingerprint = cfg_.tok_fingerprint;
             state_.sched_total = total_steps_ > 0 ? total_steps_ : sched_.total();
             state_.sched_warmup = sched_.warmup();
             state_.sched_peak = sched_.peak();

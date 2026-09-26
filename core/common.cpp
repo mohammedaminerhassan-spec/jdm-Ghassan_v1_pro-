@@ -1,6 +1,8 @@
 #include "core/common.h"
 
 #include <cstdarg>
+#include <cstdio>
+#include <fstream>
 #include <vector>
 #include <iostream>
 #include <thread>
@@ -80,13 +82,39 @@ std::string human_duration(double s) {
     return strfmt("%dd%02dh", int(s) / 86400, (int(s) % 86400) / 3600);
 }
 
+// FNV-1a 64. Stable across platforms/compilers (unlike std::hash), so a
+// checkpoint written on Kaggle Linux validates on any other host.
+u64 fingerprint_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return 0;
+    u64 h = 1469598103934665603ULL;                 // FNV offset basis
+    std::vector<char> buf(1 << 16);
+    while (f) {
+        f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        std::streamsize got = f.gcount();
+        for (std::streamsize i = 0; i < got; ++i) {
+            h ^= static_cast<unsigned char>(buf[static_cast<size_t>(i)]);
+            h *= 1099511628211ULL;                    // FNV prime
+        }
+        if (got < static_cast<std::streamsize>(buf.size())) break;
+    }
+    // 0 is reserved for "unknown", so never hand it back.
+    return h ? h : 1ULL;
+}
+
+std::string fingerprint_hex(u64 fp) {
+    if (fp == 0) return "unknown";
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(fp));
+    return std::string(buf);
+}
+
 int num_threads() {
     if (g_threads > 0) return g_threads;
     unsigned hc = std::thread::hardware_concurrency();
     g_threads = hc > 0 ? static_cast<int>(hc) : 1;
     return g_threads;
 }
-
 void set_num_threads(int n) {
     g_threads = n > 0 ? n : 1;
 #ifdef GAI_OPENMP

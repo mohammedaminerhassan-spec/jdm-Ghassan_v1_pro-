@@ -95,6 +95,11 @@ struct TrainerConfig {
     i64   save_every  = 1000;
     std::string checkpoint_dir = "artifacts/checkpoints/200m";
     std::string resume = "auto";
+    // Content fingerprint (FNV-1a) of the .gtok actually used, persisted in
+    // the checkpoint (v11) and re-checked on resume. 0 = unknown -> the check
+    // is skipped (never blocks). Set by the CLI from tokenizer.path; can be
+    // pinned in yaml as training.tok_fingerprint.
+    u64   tok_fingerprint = 0;
     u64   seed = 42;
     std::string device = "auto";
     // sft-specific

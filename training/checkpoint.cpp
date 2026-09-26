@@ -25,7 +25,12 @@ static constexpr u32 CKPT_MAGIC   = 0x54504B47u;   // "GKPT"
 //     past lr_at(N). Loader accepts v3..v8; v<8 gets sched_total=0 (unknown).
 // v9 (Pro): persists moe_aux_free + rope_yarn_low/high + sliding_window +
 //     rope_type. Loader accepts v3..v9; v<=8 files get Pro defaults (off).
-static constexpr u32 CKPT_VERSION = 10u;
+// v11 (multi-session safety): TrainState carries the tokenizer CONTENT
+//     fingerprint (tok_fingerprint). Resuming a checkpoint with a DIFFERENT
+//     .gtok is refused: same vocab_size + different merges = different token
+//     ids = silently corrupted embeddings/softmax. Loader accepts v3..v11;
+//     v<=10 files get fingerprint 0 (unknown -> warn, training continues).
+static constexpr u32 CKPT_VERSION = 11u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -34,11 +39,24 @@ static bool checkpoint_version_supported(u32 version) {
     return version >= 3u && version <= CKPT_VERSION;
 }
 
+// v11 tokenizer fingerprint reader (shared by the three load paths).
+// NOTE: defined after rd<> below.
+static bool rd_tok_fp_v11(std::istream& f, TrainState& state, u32 version);
+
 template <typename T> static void wr(std::ostream& o, const T& v) {
     o.write(reinterpret_cast<const char*>(&v), sizeof(T));
 }
 template <typename T> static bool rd(std::istream& i, T& v) {
     return static_cast<bool>(i.read(reinterpret_cast<char*>(&v), sizeof(T)));
+}
+
+static bool rd_tok_fp_v11(std::istream& f, TrainState& state, u32 version) {
+    if (version >= 11u) {
+        if (!rd(f, state.tok_fingerprint)) return false;
+    } else {
+        state.tok_fingerprint = 0;   // pre-v11: unknown, not a mismatch
+    }
+    return true;
 }
 
 // Field-wise config IO: stable across compilers (no struct padding).
@@ -403,6 +421,7 @@ void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& pat
         wr(f, state.clean_steps);
         wr(f, state.tok_vocab);
         wr_sched_v8(f, state);
+        wr(f, state.tok_fingerprint);
 
         u64 bias_layers = snapshot.moe_bias.size();
         wr(f, bias_layers);
@@ -504,6 +523,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
+    if (!rd_tok_fp_v11(f, state, version)) return false;
     // tokenizer identity: resuming with a different vocab silently corrupts
     // every embedding row. tok_vocab==0 means "unknown" (never for v3 files).
     if (!read_moe_bias(f, model, version >= 10u)) return false;
@@ -635,6 +655,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
+    if (!rd_tok_fp_v11(f, state, version)) return false;
     if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
@@ -762,6 +783,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
+    if (!rd_tok_fp_v11(f, state, version)) return false;
     if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",

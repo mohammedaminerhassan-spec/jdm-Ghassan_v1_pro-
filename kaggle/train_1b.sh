@@ -30,8 +30,8 @@ CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_en_pro.yaml}"
 # the clone/build before this script even starts. 540 min was the old default
 # and it planned a budget the session could not honour, so the run was killed
 # mid-stage. Keep a real margin below the limit.
-SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-700}"   # 12h = 720 min
-DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))     # 640 min: -60 for setup/teardown
+SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-540}"   # 9h ceiling (Kaggle caps at 12h)
+DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))     # 480 min = 8h of training in ONE session
 TIME_BUDGET_MIN="${TIME_BUDGET_MIN:-$DEFAULT_BUDGET}"
 [[ "${TIME_BUDGET_MIN}" -gt "$(( SESSION_LIMIT_MIN - 20 ))" ]] && {
     echo "[ERROR] --time-budget-min ${TIME_BUDGET_MIN} exceeds the ${SESSION_LIMIT_MIN} min session limit."

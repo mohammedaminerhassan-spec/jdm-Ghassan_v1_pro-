@@ -23,8 +23,13 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="full"
-SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-700}"   # 12h = 720, keep margin
-DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))
+# SINGLE-SESSION BUDGET. Kaggle caps a GPU session at 12h, and the goal is to
+# finish PT + SFT + export INSIDE ONE session, so the plan is built on 8h
+# (480 min) and refuses anything above the session limit. Raise deliberately:
+#   SESSION_LIMIT_MIN=700 TIME_BUDGET_MIN=620 bash kaggle/train_2xt4.sh
+# The budget covers training only: setup/data/preflight/pilot run before it.
+SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-540}"   # 9h: hard ceiling incl. overhead
+DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))     # 480 min = 8h of training
 TIME_BUDGET_MIN="${TIME_BUDGET_MIN:-$DEFAULT_BUDGET}"
 [[ "${TIME_BUDGET_MIN}" -gt "$(( SESSION_LIMIT_MIN - 20 ))" ]] && {
     echo "[ERROR] --time-budget-min ${TIME_BUDGET_MIN} exceeds session limit ${SESSION_LIMIT_MIN}."
@@ -285,6 +290,27 @@ PT_WARM=$(( PT_STEPS / 10 ));  [[ "${PT_WARM}" -gt 800 ]] && PT_WARM=800
 SFT_WARM=$(( SFT_STEPS / 10 )); [[ "${SFT_WARM}" -gt 200 ]] && SFT_WARM=200
 EVAL_CAD=$(( TOTAL_STEPS / 10 )); [[ "${EVAL_CAD}" -lt 50 ]] && EVAL_CAD=50
 echo "[plan] budget=${TIME_BUDGET_MIN}min remain~=${REMAIN_SEC}s total=${TOTAL_STEPS} (PT=${PT_STEPS} SFT=${SFT_STEPS}) ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens"
+
+# How much of the corpus does that plan actually cover? The decision "is one
+# 8h session enough" depends on it: more than ~2 epochs means we are fitting
+# the data, not learning from it. Parsed from `data_pipeline inspect` ("  total:
+# N tokens"); best-effort only (never fails the run).
+DATASET_TOKENS=0
+if [[ -f "${PT_DIR}" ]]; then
+    DATASET_TOKENS=$("${PIPE_BIN}" inspect --shards "${PT_DIR}" 2>/dev/null \
+        | awk '/^  total: /{gsub(/[^0-9.]/,"",$2); t+=$2} END{printf "%d", t+0}' || echo 0)
+fi
+if [[ "${DATASET_TOKENS}" -gt 0 ]]; then
+    PT_TOKENS=$(( PT_STEPS * FULL_TPS ))
+    EPOCHS=$(awk "BEGIN {printf \"%.2f\", ${PT_TOKENS}/${DATASET_TOKENS}}")
+    echo "[data] corpus ~${DATASET_TOKENS} tokens; PT plan ${PT_TOKENS} tokens = ${EPOCHS} epoch(s)"
+    if awk "BEGIN {exit !(${EPOCHS} > 4.0)}"; then
+        echo "[plan] NOTE: >4 epochs over this corpus. More steps will overfit it;"
+        echo "       raise --pt-fraction (less SFT) or accept a domain-specialised model."
+    fi
+else
+    echo "[data] corpus token count unavailable (inspect failed) — epoch coverage unknown"
+fi
 
 launch_ddp() {
     local cfg="$1" ckpt="$2" data="$3" steps="$4" warm="$5" extra=("${@:6}")

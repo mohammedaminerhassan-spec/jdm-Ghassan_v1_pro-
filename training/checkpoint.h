@@ -17,6 +17,11 @@ struct TrainState {
     double loss_scale  = 65536.0;  // dynamic loss-scaler value
     int    clean_steps = 0;        // scaler clean-step counter
     int    tok_vocab   = 0;        // tokenizer vocab at save time (0 = unknown)
+    // v11: tokenizer CONTENT fingerprint (FNV-1a of the .gtok bytes). The vocab
+    // SIZE is not identity: a re-trained BPE with the same 32000 merges
+    // different ids, so a multi-session resume would silently train on
+    // different tokens. 0 = unknown (pre-v11 file) -> warn, never block.
+    u64    tok_fingerprint = 0;
     // v8 additions: scheduler snapshot so resume with a different
     // max_steps/epochs/warmup/lr cannot silently reshape PAST lr_at(N).
     i64    sched_total = 0;

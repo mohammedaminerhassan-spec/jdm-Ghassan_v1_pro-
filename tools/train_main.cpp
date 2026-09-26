@@ -110,6 +110,26 @@ if (args.has("resume-mode")) {
     tcfg.resume_mode = rm;
 }
         if (args.has("output-budget-mb")) tcfg.output_budget_mb = args.num_strict("output-budget-mb");
+        // ---- tokenizer identity (v11): fingerprint the .gtok we will train
+        // with, so a later resume can refuse a different BPE with the same
+        // vocab_size. CLI --tokenizer wins over tokenizer.path (same rule the
+        // export uses). An explicit training.tok_fingerprint in the yaml wins
+        // over both (lets a recipe pin the fingerprint it was validated with).
+        {
+            const std::string tok_cli = args.str("tokenizer", "");
+            const std::string tok_yaml = cfg.get_str("tokenizer.path", "");
+            const std::string tok_path = !tok_cli.empty() ? tok_cli : tok_yaml;
+            const u64 fp = tok_path.empty() ? 0 : fingerprint_file(tok_path);
+            if (tcfg.tok_fingerprint == 0) {
+                tcfg.tok_fingerprint = fp;
+                if (fp != 0)
+                    log_info(strfmt("[tok ] fingerprint %s (%s) pinned for resume verification",
+                                    fingerprint_hex(fp).c_str(), tok_path.c_str()));
+                else if (!tok_path.empty())
+                    log_warn(strfmt("[tok ] cannot read %s: resume will not verify tokenizer identity",
+                                    tok_path.c_str()));
+            }
+        }
         if (args.has("batch-size"))      tcfg.batch_size = strict_args ? args.num_int_strict("batch-size") : args.num_int("batch-size");
         if (args.has("seq-len"))         tcfg.seq_len = strict_args ? args.num_int_strict("seq-len") : args.num_int("seq-len");
         if (args.has("grad-accum"))      tcfg.grad_accum = strict_args ? args.num_int_strict("grad-accum") : args.num_int("grad-accum");
