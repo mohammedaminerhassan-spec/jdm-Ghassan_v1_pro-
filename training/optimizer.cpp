@@ -433,23 +433,23 @@ double Muon::step(float lr, float grad_scale) {
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
         if (is_mat) {
             // Momentum combine into O staging: O = (1-b1)*g, m = b1*m, m += O.
-            // ARCHITECTURE (DeepSeek/Moonshot rule): Newton-Schulz normalizes
-            // away ANY pre-orthogonalization scale, so grad_scale (1/ntok/dscale)
-            // is intentionally NOT applied here — matrix updates are
-            // batch-size invariant by construction. BUT clip_scale MUST survive:
-            // scaling before NS would be erased, so it scales the orthogonal
-            // update AFTER NS (lr_eff = lr * clip_scale).
+            // ARCHITECTURE CONTRACT: Grad scale + clip scale (effective_scale) is applied
+            // to incoming gradient `p->g` before momentum accumulation:
+            //   m = beta1 * m + (1 - beta1) * (effective_scale * g)
+            // This ensures the momentum direction ratio between historical m and new g
+            // is strictly invariant to gradient accumulation and token batch size.
+            // Newton-Schulz then orthogonalizes m to unit scale, and the parameter update
+            // is applied as w -= lr * O (plus decoupled weight decay).
             GAI_CHECK(Ostage != nullptr, "muon: missing scratch for matrix update");
             ops::copy(dev, Ostage, p->g.f32(), p->numel());
-            ops::scale_inplace(dev, Ostage, 1.0f - cfg_.beta1, p->numel());
+            ops::scale_inplace(dev, Ostage, effective_scale * (1.0f - cfg_.beta1), p->numel());
             ops::scale_inplace(dev, m_[i].f32(), cfg_.beta1, p->numel());
             ops::add_inplace(dev, m_[i].f32(), Ostage, p->numel());
             const int rows = static_cast<int>(p->shape[0]);
             const int cols = static_cast<int>(p->shape[1]);
             orthogonalize(m_[i].f32(), Ostage, rows, cols);
-            // Decoupled update: w -= (lr*clip_scale)*O, then decoupled decay.
-            const float lr_eff = lr * clip_scale;
-            ops::scale_inplace(dev, Ostage, -lr_eff, p->numel());
+            // Decoupled update: w -= lr * O, then decoupled decay.
+            ops::scale_inplace(dev, Ostage, -lr, p->numel());
             ops::add_inplace(dev, p->w.f32(), Ostage, p->numel());
             if (wd != 0.0f) ops::scale_inplace(dev, p->w.f32(), 1.0f - lr * wd, p->numel());
         } else if (p->shape.size() == 1) {

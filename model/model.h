@@ -53,14 +53,12 @@ struct ModelConfig {
                                       // يعني توازنا عبر jitter+shared فقط)
     float rope_yarn_low     = 1.0f;   // YaRN ramp: الأبعاد < low تبقى خطية
     float rope_yarn_high    = 32.0f;  // الأبعاد > high تُستكمل NTK كاملة
-    int   sliding_window    = 0;      // 0=off (full causal). >0 نافذة انزلاقية
-                                      // (Mistral/SWA؛ kernel block-mask TODO —
-                                      // الحقل محفوظ ومصدّر لـGGUF + مرفوض في
-                                      // llama_compat حتى يكتمل الـkernel)
-    int   rope_type         = 0;      // 0=interleaved (legacy هذا المشروع),
-                                      // 1=neox half-rotate (HF/Llama/Qwen/DS
-                                      // التوافق؛ للـcheckpoints الجديدة فقط —
-                                      // kernels الحالية interleaved)
+    int   sliding_window    = 0;      // 0=off (full causal). >0 sliding window
+                                      // attention (Mistral/SWA; routed via
+                                      // extended attention API)
+    int   rope_type         = 0;      // 0=interleaved (legacy Ghassan v1),
+                                      // 1=neox half-rotate (HF/Llama/Qwen/DS;
+                                      // routed via extended RoPE API)
 
     int head_dim() const { return hidden_size / num_heads; }
     int kv_dim()   const { return num_kv_heads * head_dim(); }
