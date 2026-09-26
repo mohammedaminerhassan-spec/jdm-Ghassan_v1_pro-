@@ -134,6 +134,12 @@ if (args.has("resume-mode")) {
         if (args.has("vocab"))           mcfg.vocab_size = strict_args ? args.num_int_strict("vocab") : args.num_int("vocab");
         if (args.has("layers"))          mcfg.num_layers = strict_args ? args.num_int_strict("layers") : args.num_int("layers");
         if (args.has("hidden"))          mcfg.hidden_size = strict_args ? args.num_int_strict("hidden") : args.num_int("hidden");
+        // Tiny-smoke overrides (verify_fixes.sh --ddp shrinks the model; the
+        // head counts must shrink with hidden_size or validate() correctly
+        // refuses hidden % heads != 0 — that refusal is what caught the smoke
+        // script passing --hidden 128 against num_heads=12 on Kaggle).
+        if (args.has("heads"))           mcfg.num_heads = strict_args ? args.num_int_strict("heads") : args.num_int("heads");
+        if (args.has("kv-heads"))        mcfg.num_kv_heads = strict_args ? args.num_int_strict("kv-heads") : args.num_int("kv-heads");
         mcfg.validate();
         // Echo resolved overrides so pilot math never plans from truncated ints.
         if (strict_args || args.flag("verbose", false))

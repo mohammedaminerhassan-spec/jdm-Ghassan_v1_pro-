@@ -87,7 +87,7 @@ if [[ "${DO_DDP}" == "1" ]]; then
   for RANK in 0 1; do
     RANK="${RANK}" LOCAL_RANK="${RANK}" timeout 600 "${BIN}/gai_train" \
       --config configs/en_pro.yaml --device cuda \
-      --vocab 32000 --layers 2 --hidden 128 \
+      --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
       --batch-size 1 --seq-len 32 --grad-accum 1 --max-steps 3 \
       --eval-every 1 --eval-batches 1 --save-every 1 --log-every 1 \
       --data "${SMOKE_DIR}/shards" --checkpoint-dir "${SMOKE_DIR}/ckpt" \
