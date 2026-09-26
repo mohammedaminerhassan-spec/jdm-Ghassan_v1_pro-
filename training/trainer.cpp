@@ -855,6 +855,7 @@ void Trainer::scaler_update(double gnorm) {
         // overflow: the AdamW step was already skipped internally; shrink fast.
         loss_scale_ = std::max(1.0, loss_scale_ * 0.5);
         clean_steps_ = 0;
+        ++scaler_overflows_;
         log_warn(strfmt("[scaler] overflow at step %lld, scale -> %.0f",
                         static_cast<long long>(state_.step), loss_scale_));
     } else if (++clean_steps_ >= cfg_.loss_scale_window) {
@@ -866,6 +867,22 @@ void Trainer::scaler_update(double gnorm) {
                             cfg_.loss_scale_window, loss_scale_));
         }
     }
+}
+
+void Trainer::log_scaler_summary() const {
+    if (cfg_.loss_scale_init <= 0.0 || !ops::gemm_fp16_enabled()) return;
+    if (state_.step <= 0) return;
+    const double ratio = static_cast<double>(skipped_steps_) / static_cast<double>(state_.step);
+    log_info(strfmt("[scaler] %lld/%lld optimizer steps skipped (%.2f%%), %lld overflow(s), final scale %.0f",
+                    static_cast<long long>(skipped_steps_),
+                    static_cast<long long>(state_.step), ratio * 100.0,
+                    static_cast<long long>(scaler_overflows_), loss_scale_));
+    if (ratio > 0.02)
+        log_warn(strfmt("[scaler] %.2f%% of steps were skipped for non-finite grads: "
+                        "fp16 gradients are unstable at loss_scale_init=%.0f. Lower "
+                        "training.loss_scale_init (or disable gemm_fp16) — the run is "
+                        "burning GPU time on rejected steps.",
+                        ratio * 100.0, cfg_.loss_scale_init));
 }
 
 double Trainer::forward_backward_micro(const Batch& batch, float dscale, i64* out_ntok) {
@@ -1234,6 +1251,7 @@ void Trainer::run_pretrain() {
             // is coupled to the step may move.
             opt_applied = std::isfinite(gnorm);
             if (opt_applied) model_.mark_weights_dirty();
+            else ++skipped_steps_;
         } else {
             static int warned_empty = 0;
             if (warned_empty++ < 3)
@@ -1324,6 +1342,7 @@ void Trainer::run_pretrain() {
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
                     human_duration(wall_.seconds()).c_str()));
+    log_scaler_summary();
 }
 
 void Trainer::run_sft() {
@@ -1399,6 +1418,7 @@ void Trainer::run_sft() {
             gnorm = opt_step(lr, grad_scale);
             opt_applied = std::isfinite(gnorm);   // F-11 (see pretrain loop)
             if (opt_applied) model_.mark_weights_dirty();
+            else ++skipped_steps_;
         } else {
             static int warned_empty_sft = 0;
             if (warned_empty_sft++ < 3)
@@ -1464,6 +1484,7 @@ void Trainer::run_sft() {
                     static_cast<long long>(state_.step),
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
                     human_duration(wall_.seconds()).c_str()));
+    log_scaler_summary();
 }
 
 // ---- distributed training ----

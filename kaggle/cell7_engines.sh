@@ -60,11 +60,31 @@ if [[ -d "${EN_LAKE}" ]]; then
         echo "  ---- corpus_stats on ${dom} (${n} lines) ----"
         "${BIN}/corpus_stats" --input "${WORK}/corpus_${dom}.txt" --tokenizer "${TOK}" \
             --dedup --pii --quality 2>&1 | tail -30
-        echo "  ---- data_pipeline retrieve (RAG index smoke) ----"
-        "${BIN}/data_pipeline" retrieve --index "${WORK}/corpus_${dom}.txt" \
-            --query "how do I stay consistent with my training routine?" --top 2 2>&1 | tail -12 \
-            || bad "retrieve on ${dom}"
     done
+    echo "  ---- data_pipeline retrieve (RAG needs QA objects, not raw text) ----"
+    "${BIN}/data_pipeline" synth --lang en --n 200 --seed 99 \
+        --out "${WORK}/rag_train.json" > /dev/null 2>&1 || bad "synth for RAG index"
+    "${BIN}/data_pipeline" retrieve --index "${WORK}/rag_train.json" \
+        --query "how do I stay consistent with my training routine?" --top 2 2>&1 | tail -14 \
+        || bad "retrieve on the QA index"
+    echo "  ---- shipped synth configs are REAL (they are data_pipeline configs) ----"
+    for cfg in synth_large synth_billion; do
+        if "${BIN}/data_pipeline" synth --config "configs/${cfg}.yaml" --n 5 \
+             --out "${WORK}/${cfg}.jsonl" > "${WORK}/${cfg}.log" 2>&1; then
+            printf "  [ok] %-14s %s\n" "${cfg}" "$(grep -m1 '\[synth\] config' "${WORK}/${cfg}.log" | sed 's/.*config //')"
+        else
+            printf "  [FAIL] %-14s\n" "${cfg}"; tail -5 "${WORK}/${cfg}.log" | sed 's/^/         /'
+            FAILURES=$((FAILURES + 1))
+        fi
+    done
+    echo "  ---- an unknown key in a synth config must fail, not be ignored ----"
+    sed 's/^  seed: .*/  seed: 1234\n  p_bogus_typo: 0.5/' configs/synth_large.yaml > "${WORK}/synth_typo.yaml"
+    if "${BIN}/data_pipeline" synth --config "${WORK}/synth_typo.yaml" --n 2 \
+         --out "${WORK}/typo.jsonl" > "${WORK}/typo.log" 2>&1; then
+        bad "unknown synth config key was silently accepted"
+    else
+        ok "unknown key rejected (typo cannot pass unnoticed)"
+    fi
 else
     echo "  [skip] lake not attached: ${EN_LAKE}"
 fi
@@ -86,27 +106,38 @@ else
 fi
 grep -q "pretrain done" "${WORK}/ckpt_on.log" && ok "segmented training completed" || bad "segmented training did not finish"
 
-step "[4/8] segmented backward == full-arena backward (gradient agreement)"
-# Same seed/data, only the checkpointing flag differs. Losses must match to fp32
-# round-off: a different result means the flagship trains something else.
-"${BIN}/gai_train" --config configs/en_pro.yaml --device cuda \
-  --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
-  --batch-size 1 --seq-len 256 --grad-accum 1 --max-steps 3 --warmup 0 \
-  --eval-every 9 --eval-batches 1 --save-every 9 --log-every 1 \
-  --data "${SHARDS}" --checkpoint-dir "${WORK}/ckpt_plain" \
-  --tokenizer "${TOK}" --resume none --seed 21 \
-  > "${WORK}/ckpt_off.log" 2>&1 || { bad "non-checkpointing run crashed"; tail -20 "${WORK}/ckpt_off.log"; }
-L_ON=$(grep -oE "step +1 \| loss [0-9.]+" "${WORK}/ckpt_on.log"  | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
-L_OFF=$(grep -oE "step +1 \| loss [0-9.]+" "${WORK}/ckpt_off.log" | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
-echo "  ckpt ON  step1 loss = ${L_ON}"
-echo "  ckpt OFF step1 loss = ${L_OFF}"
-if [[ -n "${L_ON}" && -n "${L_OFF}" ]]; then
-    awk -v a="${L_ON}" -v b="${L_OFF}" 'BEGIN{ d=a-b; if (d<0) d=-d; r=d/(b==0?1:b);
-        if (r < 1e-4) printf "  [ok] losses agree (rel diff %.2e)\n", r; else printf "  [FAIL] losses differ (rel %.2e)\n", r; exit 1 }' \
-        || bad "segmented vs full-arena loss mismatch"
-else
-    bad "could not read step-1 loss from both runs"
-fi
+step "[4/8] segmented backward == full-arena backward (identical data, fp32 exact)"
+# The ONLY difference allowed is the backward strategy: same batch_size (so the
+# sampler draws the SAME windows with the same seed), same everything else, and
+# --ckpt-segments 2 vs 1. Run in pure fp32 (--gemm-fp16 0) so any difference is
+# a real numerical bug, not fp16 accumulation order. Then repeat with fp16 and
+# allow the shape-dependent accumulation slack.
+run_ckpt() {  # $1=segments  $2=gemm_fp16  $3=out log
+    "${BIN}/gai_train" --config configs/en_pro.yaml --device cuda \
+      --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
+      --batch-size 2 --seq-len 256 --grad-accum 1 --max-steps 2 --warmup 0 \
+      --ckpt-segments "$1" --gemm-fp16 "$2" \
+      --eval-every 9 --eval-batches 1 --save-every 9 --log-every 1 \
+      --data "${SHARDS}" --checkpoint-dir "${WORK}/ckpt_a$1_$2" \
+      --tokenizer "${TOK}" --resume none --seed 21 > "$3" 2>&1
+}
+compare() {  # $1=label  $2=logA  $3=logB  $4=max rel diff
+    local a b
+    a=$(grep -oE "step +1 \| loss [0-9.]+" "$2" | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
+    b=$(grep -oE "step +1 \| loss [0-9.]+" "$3" | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
+    echo "  $1: segments=2 -> ${a}   segments=1 -> ${b}"
+    if [[ -z "$a" || -z "$b" ]]; then bad "$1: could not read step-1 loss"; return; fi
+    awk -v a="$a" -v b="$b" -v tol="$4" -v lbl="$1" 'BEGIN{ d=a-b; if (d<0) d=-d; r=d/b;
+        if (r <= tol) printf "  [ok] %s agrees (rel %.2e <= %.0e)\n", lbl, r, tol;
+        else { printf "  [FAIL] %s MISMATCH (rel %.2e > %.0e)\n", lbl, r, tol; exit 1 } }' \
+        || bad "$1 gradient mismatch"
+}
+run_ckpt 2 0 "${WORK}/seg2_fp32.log" || bad "segments=2 fp32 run"
+run_ckpt 1 0 "${WORK}/seg1_fp32.log" || bad "segments=1 fp32 run"
+compare "fp32 " "${WORK}/seg2_fp32.log" "${WORK}/seg1_fp32.log" 1e-5
+run_ckpt 2 1 "${WORK}/seg2_fp16.log" || bad "segments=2 fp16 run"
+run_ckpt 1 1 "${WORK}/seg1_fp16.log" || bad "segments=1 fp16 run"
+compare "fp16 " "${WORK}/seg2_fp16.log" "${WORK}/seg1_fp16.log" 5e-3
 
 step "[5/8] quantization accuracy on real held-out data"
 "${BIN}/gai_train" --config configs/en_pro.yaml --device cuda \
@@ -139,7 +170,7 @@ awk -v fp="${PPL_fp16}" -v q8="${PPL_q8k}" -v q4="${PPL_q40}" 'BEGIN{
 }' || bad "quantization accuracy gate"
 
 step "[6/8] every shipped config parses under --strict-config"
-for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 sft_en_4xt4 smoke synth_billion synth_large; do
+for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 sft_en_4xt4 smoke; do
     if "${BIN}/gai_train" --config "configs/${cfg}.yaml" --dry-run --device cuda --strict-config \
          > "/tmp/cell7_cfg_${cfg}.log" 2>&1; then
         printf "  [ok] %-16s %s\n" "${cfg}" "$(grep TOTAL "/tmp/cell7_cfg_${cfg}.log" | head -1)"
@@ -149,6 +180,7 @@ for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 sft_e
         FAILURES=$((FAILURES + 1))
     fi
 done
+echo "  (synth_*.yaml are data_pipeline configs, verified in [2/8])"
 
 step "[7/8] CUDA resume round-trip (train -> stop -> resume -> finish)"
 "${BIN}/gai_train" --config configs/en_pro.yaml --device cuda \

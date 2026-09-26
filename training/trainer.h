@@ -225,8 +225,15 @@ private:
     // dynamic loss scaler state (FP16 training safety net)
     double loss_scale_ = 65536.0;
     int    clean_steps_ = 0;
+    // Overflow accounting: a couple of skipped steps while the scaler finds its
+    // level is normal, a persistent stream of them means fp16 gradients are
+    // unstable and the run is quietly wasting GPU hours. Counted, reported at
+    // the end of every stage, and warned about past a threshold.
+    i64    scaler_overflows_ = 0;
+    i64    skipped_steps_ = 0;
     float  scaler_for_step();                 // current scale (1.0 when disabled)
     void   scaler_update(double gnorm);       // shrink on overflow, grow when clean
+    void   log_scaler_summary() const;
 
     // ---- distributed training ----
     std::unique_ptr<DistributedContext> dist_;
