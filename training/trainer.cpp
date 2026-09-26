@@ -1261,6 +1261,13 @@ void Trainer::run_pretrain() {
         if (main && cfg_.log_every > 0 && state_.step % cfg_.log_every == 0) {
             log_step(loss, lr, gnorm, dt, ntok_global);
         }
+        // Non-main ranks are otherwise silent, so a DDP crash leaves no trace of
+        // how far they got. Debug-level breadcrumb on every rank.
+        if (!main) log_debug(strfmt("[step] rank %d/%d step %lld loss %.4f ntok %lld",
+                                    dist_ ? dist_->global_rank() : 0,
+                                    dist_ ? dist_->world_size() : 1,
+                                    static_cast<long long>(state_.step), loss,
+                                    static_cast<long long>(ntok_global)));
 
         // T4-P1-23: validation forwards run on rank 0 ONLY. Every rank was
         // executing identical eval passes while only rank 0 logged the

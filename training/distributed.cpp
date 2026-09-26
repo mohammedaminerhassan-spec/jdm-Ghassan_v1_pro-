@@ -161,8 +161,11 @@ void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
+    const size_t nbytes = numel * sizeof(int64_t);
     bool back = false;
-    void* dev = collective_staging(buffer, numel * sizeof(int64_t), &back);
+    void* dev = collective_staging(buffer, nbytes, &back);
+    log_debug(strfmt("[dist] all_reduce_i64 numel=%zu bytes=%zu staged=%d rank=%d",
+                     numel, nbytes, back ? 1 : 0, global_rank_));
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, ncclInt64, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, numel * sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -185,6 +188,11 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
+    // Collective ledger: an illegal memory access is reported at the NEXT
+    // stream sync, not at the kernel that caused it, so without this the crash
+    // is unattributable on a rank that prints nothing.
+    log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
+                     numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
@@ -210,6 +218,8 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
+    log_debug(strfmt("[dist] broadcast numel=%zu dtype=%d bytes=%zu staged=%d root=%d rank=%d",
+                     numel, dtype_size, nbytes, back ? 1 : 0, root, global_rank_));
     NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));

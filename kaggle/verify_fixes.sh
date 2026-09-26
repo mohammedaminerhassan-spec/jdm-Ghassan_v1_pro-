@@ -95,11 +95,18 @@ if [[ "${DO_DDP}" == "1" ]]; then
     --out "${SMOKE_DIR}/shards" --seq-len 32 --val-ratio 0.2 > /tmp/verify_shard.log 2>&1 \
     || fail "tiny shard build (see /tmp/verify_shard.log)"
   export WORLD_SIZE=2 MASTER_ADDR=127.0.0.1 MASTER_PORT=29511
+  # Crash attribution: an illegal memory access surfaces at the NEXT stream
+  # sync, not at the kernel that caused it. Blocking launches make the fault
+  # fire at the offending launch, and --verbose enables the collective ledger
+  # plus per-rank step breadcrumbs (a non-main rank prints nothing otherwise,
+  # so a DDP crash is otherwise unattributable). The model is tiny, so
+  # blocking launches cost nothing.
+  export CUDA_LAUNCH_BLOCKING=1
   rm -f /tmp/gai_nccl_29511.id
   SMOKE_OK=1
   for RANK in 0 1; do
     RANK="${RANK}" LOCAL_RANK="${RANK}" timeout 600 "${BIN}/gai_train" \
-      --config configs/en_pro.yaml --device cuda \
+      --config configs/en_pro.yaml --device cuda --verbose \
       --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
       --batch-size 1 --seq-len 32 --grad-accum 1 --max-steps 3 --warmup 0 \
       --eval-every 1 --eval-batches 1 --save-every 1 --log-every 1 \
