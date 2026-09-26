@@ -740,6 +740,47 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             log_warn("[disk] could not stat free space for " + cfg_.checkpoint_dir +
                      " — cannot pre-flight the checkpoint budget");
         }
+
+        // ---- output-quota projection (NOT the same limit as free space) ----
+        // Kaggle caps what /kaggle/working SAVES at ~20 GB while the filesystem
+        // itself has ~57 GB. Everything the run produces lands in that quota:
+        // the clone, the build tree, the shards, the checkpoints and the GGUF.
+        // Counting checkpoint NAMES twice (best.ckpt + last.ckpt are one
+        // inode when the writer published them from the same step) invents a
+        // phantom copy, so the projection counts real inodes.
+        if (cfg_.output_budget_mb > 0) {
+            const size_t budget = static_cast<size_t>(cfg_.output_budget_mb) * (1024u * 1024u);
+            // The quota root is the working tree that contains the checkpoints.
+            fs::path root = fs::absolute(fs::path(cfg_.checkpoint_dir));
+            for (int i = 0; i < 4 && root.has_parent_path() &&
+                            root.filename().string() != "working"; ++i)
+                root = root.parent_path();
+            if (root.filename().string() != "working") root = fs::absolute(".");
+            size_t unique_files = 0;
+            const size_t used = tree_size_bytes(root.string(), &unique_files);
+            size_t ckpt_files = 0;
+            const size_t ckpt_now = tree_size_bytes(cfg_.checkpoint_dir, &ckpt_files);
+            // One snapshot (published under 1-2 names) + the .tmp being written.
+            const size_t transient = per_snapshot * 2;
+            // Rough export size for the final GGUF: 4-bit ~= 0.8 bytes/param.
+            const size_t gguf = static_cast<size_t>(params) + per_snapshot / 8;
+            const size_t projected = used + transient + gguf;
+            log_info(strfmt("[quota] %s budget | %s already in %s (%zu files, incl. %s of checkpoints)",
+                            human_bytes(budget).c_str(), human_bytes(used).c_str(),
+                            root.string().c_str(), unique_files,
+                            human_bytes(ckpt_now).c_str()));
+            log_info(strfmt("[quota] projected peak = %s (current %s + save transient %s + gguf %s)",
+                            human_bytes(projected).c_str(), human_bytes(used).c_str(),
+                            human_bytes(transient).c_str(), human_bytes(gguf).c_str()));
+            if (projected > budget) {
+                GAI_FAIL(strfmt("output quota guard: this run projects %s of saved output but "
+                                "the budget is %s (over by %s). The quota bites at "
+                                "Save Version, long after training. Free space under %s, "
+                                "or lower --output-budget-mb knowingly, or shrink the model.",
+                                human_bytes(projected).c_str(), human_bytes(budget).c_str(),
+                                human_bytes(projected - budget).c_str(), root.string().c_str()));
+            }
+        }
     }
 
     // ---- resume

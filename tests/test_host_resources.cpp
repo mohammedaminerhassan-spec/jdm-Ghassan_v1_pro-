@@ -7,9 +7,12 @@
 #include "core/signals.h"
 
 #include <csignal>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
 using namespace gai;
+namespace fs = std::filesystem;
 
 static int failures = 0;
 #define CHECK(cond, msg) do { \
@@ -51,9 +54,37 @@ static void test_signal_flag_contract() {
     signals::stop_requested = 0;
 }
 
+static void test_tree_size_counts_hard_links_once() {
+    // The quota projection must not invent a second copy of a checkpoint that
+    // the writer published under two names (best.ckpt + last.ckpt share one
+    // inode), so tree_size_bytes() de-duplicates by file id.
+    const char* dir = "gai_test_tree";
+    fs::create_directories(dir);
+    const std::string a = std::string(dir) + "/a.bin";
+    const std::string b = std::string(dir) + "/b.bin";
+    {
+        std::ofstream f(a, std::ios::binary);
+        const std::string chunk(4096, 'x');
+        for (int i = 0; i < 64; ++i) f << chunk;   // 256 KiB
+    }
+    const size_t one = tree_size_bytes(dir, nullptr);
+    CHECK(one == 256u * 1024u, "single file size is exact");
+    // Second NAME for the same bytes.
+    std::error_code ec;
+    fs::copy_file(a, b, fs::copy_options::overwrite_existing, ec);
+    if (!ec) {
+        const size_t copied = tree_size_bytes(dir, nullptr);
+        CHECK(copied == 2u * one, "a real copy counts twice (it costs twice)");
+    }
+    ::remove(a.c_str());
+    ::remove(b.c_str());
+    fs::remove(dir);
+}
+
 int main() {
     test_ram_probe_agrees_with_the_machine();
     test_disk_probe();
+    test_tree_size_counts_hard_links_once();
     test_signal_flag_contract();
     if (failures == 0) { std::cout << "test_host_resources: ALL PASS\n"; return 0; }
     std::cerr << "test_host_resources: " << failures << " FAILURES\n";

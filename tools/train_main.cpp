@@ -51,6 +51,9 @@ static void usage() {
     "  --strict-config        unknown/dead config keys fail instead of warning\n"
     "  --dry-run              arithmetic-only memory/schedule estimate (allocates nothing)\n"
     "  --max-vram-mb <n>      pre-flight gate: fail if the predicted peak exceeds n MiB\n"
+    "  --output-budget-mb <n> pre-flight gate: fail if the run would exceed n MiB of\n"
+    "                         SAVED output (/kaggle/working on Kaggle: repo+build+shards+\n"
+    "                         checkpoints+gguf). 0 = off.\n"
     "                         or leaves <10% headroom (use with --dry-run)\n"
   "  --allow-recipe-drift   resume despite rope/eps/ctx recipe drift (research only)\n"
     "  --resume-mode exact|migrate   # exact: fail closed on any recipe/state drift\n"
@@ -106,6 +109,7 @@ if (args.has("resume-mode")) {
         GAI_FAIL("--resume-mode must be 'exact' or 'migrate' (got '" + rm + "')");
     tcfg.resume_mode = rm;
 }
+        if (args.has("output-budget-mb")) tcfg.output_budget_mb = args.num_strict("output-budget-mb");
         if (args.has("batch-size"))      tcfg.batch_size = strict_args ? args.num_int_strict("batch-size") : args.num_int("batch-size");
         if (args.has("seq-len"))         tcfg.seq_len = strict_args ? args.num_int_strict("seq-len") : args.num_int("seq-len");
         if (args.has("grad-accum"))      tcfg.grad_accum = strict_args ? args.num_int_strict("grad-accum") : args.num_int("grad-accum");

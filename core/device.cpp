@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <new>
 #include <string>
+#include <set>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,10 +21,44 @@
 #endif
 
 namespace gai {
+namespace fs = std::filesystem;
 
 bool is_gpu(Device d) { return d == Device::CUDA; }
 
 // ---------------------------------------------------------------- host
+namespace {
+// One 64-bit file id, so hard links can be counted once.
+struct FileId {
+    unsigned long long hi = 0;
+    unsigned long long lo = 0;
+    bool operator<(const FileId& o) const {
+        return hi != o.hi ? hi < o.hi : lo < o.lo;
+    }
+};
+FileId file_id_of(const std::string& path) {
+    FileId id;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return id;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileInformationByHandle(h, &info)) {
+        id.hi = static_cast<unsigned long long>(info.dwVolumeSerialNumber);
+        id.lo = (static_cast<unsigned long long>(info.nFileIndexHigh) << 32) |
+                static_cast<unsigned long long>(info.nFileIndexLow);
+    }
+    CloseHandle(h);
+#else
+    struct stat st {};
+    if (::stat(path.c_str(), &st) == 0) {
+        id.hi = static_cast<unsigned long long>(st.st_dev);
+        id.lo = static_cast<unsigned long long>(st.st_ino);
+    }
+#endif
+    return id;
+}
+} // namespace
+
 size_t physical_ram_bytes() {
 #ifdef _WIN32
     MEMORYSTATUSEX st{};
@@ -35,6 +71,34 @@ size_t physical_ram_bytes() {
     if (pages <= 0 || page <= 0) return 0;
     return static_cast<size_t>(pages) * static_cast<size_t>(page);
 #endif
+}
+
+size_t tree_size_bytes(const std::string& path, size_t* unique_files) {
+    std::error_code ec;
+    if (!fs::exists(path, ec)) {
+        if (unique_files) *unique_files = 0;
+        return 0;
+    }
+    if (!fs::is_directory(path, ec)) {
+        if (unique_files) *unique_files = 1;
+        return static_cast<size_t>(fs::file_size(path, ec));
+    }
+    size_t total = 0;
+    size_t count = 0;
+    std::set<FileId> seen;
+    for (fs::recursive_directory_iterator it(path, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        const FileId id = file_id_of(it->path().string());
+        if (id.hi || id.lo) {
+            if (!seen.insert(id).second) continue;   // hard link: already counted
+        }
+        total += static_cast<size_t>(it->file_size(ec));
+        ++count;
+    }
+    if (unique_files) *unique_files = count;
+    return total;
 }
 
 size_t free_disk_bytes(const std::string& path) {

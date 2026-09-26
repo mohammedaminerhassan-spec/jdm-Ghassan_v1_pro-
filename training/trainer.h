@@ -107,6 +107,13 @@ struct TrainerConfig {
     // Loss weights (aux/z/jitter) stay warn-only: retuning them on resume is
     // legitimate. true: explicit opt-out for research (--allow-recipe-drift).
     bool  allow_recipe_drift   = false;
+    // Output-quota gate (0 = off). Kaggle SAVES everything under /kaggle/working
+    // and caps that at ~20 GB, which is NOT the same limit as free disk space
+    // (~57 GB): a run can fit on the filesystem and still blow the saved-output
+    // quota with repo + build + shards + checkpoints + GGUF — and the failure
+    // only appears at "Save Version", long after the training. Project it up
+    // front instead (--output-budget-mb).
+    i64   output_budget_mb    = 0;
     // F-08 resume contract.
     //   "migrate" (default): keep the historical forgiving behavior — a math
     //                      drift warns, a missing parameter keeps its fresh

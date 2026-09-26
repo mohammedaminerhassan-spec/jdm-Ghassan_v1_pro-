@@ -60,6 +60,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
+# Kaggle SAVES everything under /kaggle/working and caps THAT at ~20 GB, which
+# is a different limit from free disk space (~57 GB). Everything the run
+# produces counts: clone + build tree + shards + checkpoints + GGUF. The gate
+# projects it before the first step instead of failing at Save Version.
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-19456}"   # 19.5 GiB, the panel's real number
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
 # PRO-HARDEN: fallback الصامت إلى 16k كان يضيع run كاملا ثم يفشل عند البوابة.
@@ -216,7 +221,8 @@ P_START=$(date +%s)
 # step >= PILOT_STEPS would make the pilot do ~zero work in ~zero seconds,
 # and the absurd tok/s would corrupt the whole session budget below.
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
-    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none
+    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none \
+    --output-budget-mb "${OUTPUT_BUDGET_MB}"
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START )); [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
 P_TPS=$(( $(yget batch_size "${CONFIG_PT}") * $(yget seq_len "${CONFIG_PT}") * $(yget grad_accum "${CONFIG_PT}") * PILOT_STEPS / P_ELAPSED ))
@@ -257,23 +263,28 @@ T0=$(date +%s)
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
     --data "${PT_DIR}" --max-steps "${PT_STEPS}" --warmup "${PT_WARM}" \
     --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-    --checkpoint-dir "${CKPT_PT}" --resume auto
+    --checkpoint-dir "${CKPT_PT}" --resume auto \
+    --output-budget-mb "${OUTPUT_BUDGET_MB}"
 echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 
 echo ""
 echo "[stage-B] SFT Pro (${SFT_STEPS} steps)..."
 T0=$(date +%s)
+# SFT resumes the PRETRAIN checkpoint (frozen embeddings), so its own quota
+# projection must see the pretrain checkpoints already on disk.
 if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
         --resume auto \
+        --output-budget-mb "${OUTPUT_BUDGET_MB}" \
         --export "${GGUF_OUT}" --export-profile "${EXPORT_PROFILE}"
 else
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-        --resume auto
+        --resume auto \
+        --output-budget-mb "${OUTPUT_BUDGET_MB}"
 fi
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 

@@ -37,6 +37,11 @@ Device            best_device();          // T4-ONLY: CUDA > CPU
 // size, so the transient peak is ~2x one checkpoint.
 size_t physical_ram_bytes();
 size_t free_disk_bytes(const std::string& path);
+// Recursive size of a directory tree. Hard links are counted ONCE (by file
+// id): the checkpoint writer publishes best.ckpt and last.ckpt as two names
+// for ONE inode, and a quota projection that counts names twice invents a
+// phantom second copy. unique_files (optional) receives the inode count.
+size_t tree_size_bytes(const std::string& path, size_t* unique_files = nullptr);
 
 void* device_alloc(size_t nbytes, Device dev, DType dt = DType::F32);
 void  device_free(void* ptr, Device dev);

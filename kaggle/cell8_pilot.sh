@@ -40,17 +40,18 @@ P_START=$(date +%s)
 "${BIN}/gai_train" --config "${CFG}" --device cuda --tokenizer "${TOK}" \
     --data "${SHARDS}" --max-steps 20 --warmup 5 \
     --eval-every 20 --eval-batches 2 --save-every 20 --log-every 1 \
-    --checkpoint-dir /tmp/cell8_pilot --resume none 2>&1 | tee /tmp/cell8_pilot.log \
-    | grep -E "^\[info \] (step|  >> val)|host RAM|\[disk\]|pretrain done|\[scaler\]|ckpt\] (saved|published)|OOM|guard"
+    --checkpoint-dir /tmp/cell8_pilot --resume none \
+    --output-budget-mb 19456 2>&1 | tee /tmp/cell8_pilot.log \
+    | grep -E "^\[info \] (step|  >> val)|host RAM|\[disk\]|\[quota\]|pretrain done|\[scaler\]|ckpt\] (saved|published)|OOM|guard"
 P_END=$(date +%s)
 ELAPSED=$(( P_END - P_START )); [[ "${ELAPSED}" -le 0 ]] && ELAPSED=1
 
 echo ""
 echo "----- [4/5] the new resource guards, as this machine reports them -----"
-grep -E "host RAM|\[disk\]" /tmp/cell8_pilot.log | sed 's/^/  /' || true
-grep -E "OOM guard|disk guard|host RAM guard|host RAM cannot" /tmp/cell8_pilot.log \
+grep -E "host RAM|\[disk\]|\[quota\]" /tmp/cell8_pilot.log | sed 's/^/  /' || true
+grep -E "OOM guard|disk guard|host RAM guard|host RAM cannot|output quota guard" /tmp/cell8_pilot.log \
     && { echo "  [FAIL] a resource guard fired on the flagship recipe"; exit 1; } \
-    || echo "  [ok] no resource guard fired (RAM/disk/VRAM all fit)"
+    || echo "  [ok] no resource guard fired (VRAM/RAM/disk/quota all fit)"
 
 echo ""
 echo "----- [5/5] measured throughput -> honest plans -----"
