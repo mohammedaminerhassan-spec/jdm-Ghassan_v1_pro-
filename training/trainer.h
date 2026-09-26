@@ -243,10 +243,13 @@ private:
     // the NCCL collective order stays identical across ranks; they are no-ops
     // for single-process runs.
     void broadcast_from_main(void* buf, size_t numel, int dtype_size);
-    // F-01: the rank-0-only validation decision is broadcast so that all ranks
-    // agree on whether this step produced a new best checkpoint — and therefore
-    // all enter save() (which contains collectives) the same number of times.
-    void sync_eval_best(bool is_main, bool is_best);
+    // F-01: agree on the rank-0-only "new best?" decision so every rank enters
+    // save() (which contains collectives) the same number of times. RETURNS the
+    // agreed decision and callers MUST use the return value: the argument is
+    // rank-local (only the main rank evaluates), so keeping a local copy makes
+    // rank 0 save while the others skip it, desyncing the collective order —
+    // which NCCL surfaces as an illegal memory access mid-run.
+    bool sync_eval_best(bool is_main, bool is_best);
     // F-07: surface a fatal background-checkpoint failure at the next safe
     // training boundary instead of letting thousands of steps burn GPU hours
     // on an unusable disk.

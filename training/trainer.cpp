@@ -1293,7 +1293,7 @@ void Trainer::run_pretrain() {
             } else {
                 model_.moe_balance_reset();
             }
-            sync_eval_best(main, is_best);
+            is_best = sync_eval_best(main, is_best);
             if (is_best) save("best.ckpt");
         }
 
@@ -1439,7 +1439,7 @@ void Trainer::run_sft() {
             } else {
                 model_.moe_balance_reset();
             }
-            sync_eval_best(main, is_best);
+            is_best = sync_eval_best(main, is_best);
             if (is_best) save("best.ckpt");
         }
 
@@ -1691,7 +1691,7 @@ void Trainer::broadcast_from_main(void* buf, size_t numel, int dtype_size) {
 #endif
 }
 
-void Trainer::sync_eval_best(bool is_main, bool is_best) {
+bool Trainer::sync_eval_best(bool is_main, bool is_best) {
     // F-01 (P0 DDP deadlock): validation runs on rank 0 only, but save() begins
     // with a collective. If only rank 0 entered save("best.ckpt"), NCCL would
     // see 4 collectives on rank 0 and 2 on the others at the first new best and
@@ -1705,12 +1705,16 @@ void Trainer::sync_eval_best(bool is_main, bool is_best) {
         std::memcpy(&payload[1], &bv, sizeof(double));
     }
     broadcast_from_main(payload, 2, static_cast<int>(sizeof(i64)));
-    is_best = payload[0] != 0;
+    const bool agreed_is_best = payload[0] != 0;
     if (is_main) {
         double bv = 0.0;
         std::memcpy(&bv, &payload[1], sizeof(double));
         state_.best_val = bv;
     }
+    // The decision MUST travel back to the caller: a non-main rank's own
+    // `is_best` is still false here, and `if (is_best) save(...)` around it
+    // would let rank 0 enter the collective while the others skip it.
+    return agreed_is_best;
 }
 
 void Trainer::check_ckpt_health() {
