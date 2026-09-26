@@ -184,7 +184,7 @@ cleanup_pilot() { for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true;
 trap 'cleanup_pilot; persist_output' INT TERM
 for i in 0 1; do
     RANK=$i LOCAL_RANK=$i "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
-        --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none \
+        --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
         --checkpoint-dir "${CKPT_PT}" --output-budget-mb "${OUTPUT_BUDGET_MB}" \
         > "/tmp/pilot_2xt4_rank${i}.log" 2>&1 &
     PIDS[$i]=$!

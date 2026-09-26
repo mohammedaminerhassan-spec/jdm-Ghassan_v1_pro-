@@ -24,6 +24,7 @@ public:
         std::string master_addr = "localhost";
         int master_port = 29500;
         std::string backend = "nccl";
+        bool grad_compression = false; // compress grads to fp16 for all-reduce (2x less NCCL traffic)
     };
 
     DistributedContext() = default;
@@ -83,6 +84,8 @@ private:
     void* barrier_dev_ = nullptr;   // device-side word for barrier()
     void* coll_dev_ = nullptr;      // staging scratch for host-side collectives
     size_t coll_dev_bytes_ = 0;
+    void* f16_stage_ = nullptr;     // fp16 gradient compression staging
+    size_t f16_stage_bytes_ = 0;
     std::string id_file_;           // rendezvous file published by rank 0
 #endif
 };

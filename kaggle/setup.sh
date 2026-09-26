@@ -242,8 +242,8 @@ fi
 if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
     echo ""
     echo "[gate] CUDA parity gate (MoE kernel validation)..."
-    if [[ -x "${BUILD_DIR}/bin/test_cuda" ]]; then
-        if "${BUILD_DIR}/bin/test_cuda"; then
+    if [[ -x "${BUILD_DIR}/bin/test_moe_cuda_parity" ]]; then
+        if "${BUILD_DIR}/bin/test_moe_cuda_parity"; then
             echo "[gate] CUDA parity: PASSED"
         else
             echo "[ERROR] CUDA parity gate FAILED — GPU kernels are broken."
@@ -251,7 +251,7 @@ if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
             exit 1
         fi
     else
-        echo "[gate] CUDA parity: SKIPPED (test_cuda not built)"
+        echo "[gate] CUDA parity: SKIPPED (test_moe_cuda_parity not built)"
     fi
 fi
 

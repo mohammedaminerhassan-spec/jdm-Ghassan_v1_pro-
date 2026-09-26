@@ -56,10 +56,10 @@ for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 en_2x
   grep -q "TOTAL" /tmp/verify_dry_${cfg}.log || fail "dry-run ${cfg} printed no TOTAL"
   pass "dry-run ${cfg}: $(grep 'TOTAL' /tmp/verify_dry_${cfg}.log | head -1)"
 done
-"${BIN}/gai_train" --config configs/t4_1b.yaml --dry-run --device cuda \
-  --max-vram-mb 15360 > /tmp/verify_gate.log 2>&1 || fail "VRAM gate (t4_1b must fit 15 GiB)"
+"${BIN}/gai_train" --config configs/en_pro.yaml --dry-run --device cuda \
+  --max-vram-mb 15360 > /tmp/verify_gate.log 2>&1 || fail "VRAM gate (en_pro must fit 15 GiB)"
 pass "flagship fits 16 GB T4 with headroom"
-if "${BIN}/gai_train" --config configs/t4_1b.yaml --dry-run --device cuda \
+if "${BIN}/gai_train" --config configs/en_pro.yaml --dry-run --device cuda \
     --max-vram-mb 8192 > /tmp/verify_gate_neg.log 2>&1; then
   fail "VRAM gate did NOT reject an 8 GiB budget (gate is broken)"
 fi

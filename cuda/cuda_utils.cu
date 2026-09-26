@@ -130,6 +130,18 @@ size_t free_bytes_live() {
     return free_b;
 }
 
+void check_free_vram(size_t need, const char* what) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return; // probe failed; cudaMalloc will catch it
+    if (need > free_b) {
+        GAI_FAIL(strfmt("CUDA OOM: %s needs %s but only %s free of %s total",
+                        what ? what : "allocation",
+                        human_bytes(need).c_str(),
+                        human_bytes(free_b).c_str(),
+                        human_bytes(total_b).c_str()));
+    }
+}
+
 void* cublas_handle() {
     if (!g_cublas) {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");

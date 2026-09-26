@@ -221,7 +221,7 @@ P_START=$(date +%s)
 # step >= PILOT_STEPS would make the pilot do ~zero work in ~zero seconds,
 # and the absurd tok/s would corrupt the whole session budget below.
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
-    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none \
+    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
     --output-budget-mb "${OUTPUT_BUDGET_MB}"
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START )); [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1

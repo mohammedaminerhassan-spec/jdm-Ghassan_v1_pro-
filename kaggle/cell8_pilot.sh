@@ -23,7 +23,7 @@ echo "=============================================================="
 
 echo ""
 echo "----- [1/5] commit under test -----"
-git log --oneline -1
+git log --oneline -1 2>/dev/null || echo "  (no git repo — Kaggle package)"
 echo "  gpu       : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | tr '\n' ' ')"
 echo "  ram       : $(free -g | awk '/^Mem:/{print $2" GB total, "$7" GB available"}')"
 echo "  disk      : $(df -h . | awk 'NR==2{print $4" free of "$2" ("$5" used)"}')"

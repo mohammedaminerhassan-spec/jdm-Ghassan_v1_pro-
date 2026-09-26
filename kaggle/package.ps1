@@ -17,7 +17,16 @@ Write-Host "Creating Kaggle package: $OutFile ..." -ForegroundColor Cyan
 # Files and directories to exclude
 $ExcludePatterns = @(
     "build",
-    "artifacts",
+    "artifacts/shards*",
+    "artifacts/checkpoints",
+    "artifacts/*.gguf",
+    "artifacts/synth",
+    "artifacts/corpus",
+    "dataset/english_parquet",
+    "dataset/qa_darija",
+    "dataset/parquet",
+    "dataset/dataset-main",
+    "dataset/model_speak",
     ".git",
     ".vscode",
     "*.obj",

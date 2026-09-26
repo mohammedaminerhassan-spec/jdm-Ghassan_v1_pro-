@@ -47,6 +47,7 @@ static void* workspace(size_t bytes) {
     size_t want = round_ws(bytes);
     if (want <= g_ws_bytes) return g_ws;
     if (g_ws) CU_CHECK(cudaFree(g_ws));
+    check_free_vram(want, "GEMM workspace");
     CU_CHECK(cudaMalloc(&g_ws, want));
     g_ws_bytes = want;
     return g_ws;
@@ -65,6 +66,7 @@ void free_workspace() {
     if (g_ws) cudaFree(g_ws);
     g_ws = nullptr;
     g_ws_bytes = 0;
+    if (g_sce_acc) { cudaFree(g_sce_acc); g_sce_acc = nullptr; }
     free_sampling_workspace();
     moe_free_workspace();
 }

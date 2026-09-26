@@ -122,6 +122,11 @@ void DistributedContext::finalize() {
         coll_dev_ = nullptr;
         coll_dev_bytes_ = 0;
     }
+    if (f16_stage_) {
+        cudaFree(f16_stage_);
+        f16_stage_ = nullptr;
+        f16_stage_bytes_ = 0;
+    }
     if (stream_) {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
@@ -153,6 +158,18 @@ void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_
 }
 #endif // GAI_NCCL
 
+#ifdef GAI_NCCL
+// f32 <-> f16 conversion kernels for gradient compression
+__global__ void k_f32_to_f16(const float* src, uint16_t* dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half_rn(src[i]);
+}
+__global__ void k_f16_to_f32(const uint16_t* src, float* dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(reinterpret_cast<const __half&>(src[i]));
+}
+#endif
+
 void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
     all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
 }
@@ -179,6 +196,34 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
+    // Gradient compression: convert f32 -> f16, all-reduce, convert back.
+    // Reduces NCCL traffic by 2x. Lossy but acceptable for gradients.
+    if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
+        size_t nbytes_f32 = numel * sizeof(float);
+        size_t nbytes_f16 = numel * sizeof(uint16_t);
+        bool back = false;
+        void* dev_f32 = collective_staging(buffer, nbytes_f32, &back);
+
+        if (!f16_stage_ || f16_stage_bytes_ < nbytes_f16) {
+            if (f16_stage_) cudaFree(f16_stage_);
+            cudaMalloc(&f16_stage_, nbytes_f16);
+            f16_stage_bytes_ = nbytes_f16;
+        }
+
+        int threads = 256;
+        int blocks = (int)((numel + threads - 1) / threads);
+        k_f32_to_f16<<<blocks, threads>>>(static_cast<float*>(dev_f32),
+                                          static_cast<uint16_t*>(f16_stage_), numel);
+        NCCL_CHECK(ncclAllReduce(f16_stage_, f16_stage_, numel, ncclFloat16, ncclSum, comm_, stream_));
+        CU_RT_CHECK(cudaStreamSynchronize(stream_));
+        k_f16_to_f32<<<blocks, threads>>>(static_cast<uint16_t*>(f16_stage_),
+                                          static_cast<float*>(dev_f32), numel);
+        CU_RT_CHECK(cudaStreamSynchronize(stream_));
+        if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev_f32, nbytes_f32, cudaMemcpyDeviceToHost));
+        ops::perf_note_sync();
+        return;
+    }
+
     ncclDataType_t nccl_dtype = ncclFloat32;
     if (dtype_size == 2) nccl_dtype = ncclFloat16;
     else if (dtype_size == 4) nccl_dtype = ncclFloat32;
@@ -188,9 +233,6 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
-    // Collective ledger: an illegal memory access is reported at the NEXT
-    // stream sync, not at the kernel that caused it, so without this the crash
-    // is unattributable on a rank that prints nothing.
     log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));

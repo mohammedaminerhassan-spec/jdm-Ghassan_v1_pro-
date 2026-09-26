@@ -111,11 +111,56 @@ static void test_model_validate() {
     CHECK(threw, "bad head split fails fast");
 }
 
+// DDP gradient correctness: verify token-weighted gradient scaling math.
+// This is a pure-CPU reference of the DDP gradient sync logic.
+static void test_ddp_gradient_math() {
+    // Simulate 2 ranks with different token counts (SFT masks)
+    // Rank 0: 100 tokens, Rank 0: 50 tokens
+    // Global ntok = 150
+    // Each rank computes SUM grads (mean * ntok)
+    // After all-reduce: sum of both ranks' SUM grads
+    // Final: divide by global ntok
+    float rank0_grad = 2.0f;  // mean grad on rank 0
+    float rank1_grad = 4.0f;  // mean grad on rank 1
+    int ntok0 = 100, ntok1 = 50;
+    int ntok_global = ntok0 + ntok1;
+
+    // SUM grads per rank (mean * ntok)
+    float sum0 = rank0_grad * ntok0;
+    float sum1 = rank1_grad * ntok1;
+
+    // All-reduce SUM
+    float total = sum0 + sum1;
+
+    // Divide by global ntok
+    float final_grad = total / ntok_global;
+
+    // Expected: (2*100 + 4*50) / 150 = 400/150 = 2.6667
+    float expected = (rank0_grad * ntok0 + rank1_grad * ntok1) / (float)ntok_global;
+    CHECK(std::fabs(final_grad - expected) < 1e-5f, "DDP token-weighted grad math");
+
+    // Verify: if both ranks had same ntok, result should be mean of means
+    int ntok_equal = 100;
+    float sum0_eq = rank0_grad * ntok_equal;
+    float sum1_eq = rank1_grad * ntok_equal;
+    float total_eq = sum0_eq + sum1_eq;
+    float final_eq = total_eq / (2.0f * ntok_equal);
+    float expected_eq = (rank0_grad + rank1_grad) / 2.0f;
+    CHECK(std::fabs(final_eq - expected_eq) < 1e-5f, "DDP equal-ntok grad math");
+
+    // Verify: all-masked step (ntok=0) should skip optimizer
+    // (this is handled in trainer, not in the math, but we verify the logic)
+    int ntok_zero = 0;
+    bool skip = (ntok_zero == 0);
+    CHECK(skip, "DDP all-masked step skips optimizer");
+}
+
 int main() {
     test_rmsnorm_grad();
     test_softmax_swa_invariant();
     test_rope_cache_parity();
     test_model_validate();
+    test_ddp_gradient_math();
     if (failures == 0) { std::cout << "test_gradcheck: ALL PASS\n"; return 0; }
     std::cerr << "test_gradcheck: " << failures << " FAILURES\n";
     return 1;

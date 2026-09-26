@@ -158,6 +158,7 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     // Phase 1A: sequence packing (default off — safe for existing shards).
     t.pack_sequences = c.get_bool("training.pack_sequences", false);
     t.ddp = c.get_bool("training.ddp", false);
+    t.ddp_grad_compression = c.get_bool("training.ddp_grad_compression", false);
 
     // P2-5: data.train_glob/val_glob ("<dir>/<prefix>*.gbin") used to be
     // silently DEAD while training "worked by accident" off training.data_dir.
@@ -249,9 +250,9 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
             "training.pretrained_checkpoint", "training.allow_no_pretrained",
              "training.allow_recipe_drift", "training.resume_mode",
 
-            "training.freeze_embeddings", "training.activation_checkpointing",
-             "training.ckpt_segments", "training.ce_chunks", "training.pack_sequences",
-             "training.ddp",
+             "training.freeze_embeddings", "training.activation_checkpointing",
+              "training.ckpt_segments", "training.ce_chunks", "training.pack_sequences",
+              "training.ddp", "training.ddp_grad_compression",
             "data.data_dir",
             "data.train_glob", "data.val_glob", "data.train_prefix", "data.val_prefix",
         };
@@ -519,6 +520,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     }
 #endif
     BatchSpec spec{cfg_.batch_size, cfg_.seq_len, cfg_.pack_sequences};
+    train_loader_.set_vocab_size(model_.config().vocab_size);
     bool opened = false;
     if (!cfg_.mix.empty()) {
         // Prefer domain-weighted sampling when train_<domain>_*.gbin exists.
@@ -1202,7 +1204,15 @@ void Trainer::save(const std::string& name) {
 
     const std::string path = (fs::path(cfg_.checkpoint_dir) / name).string();
     std::shared_ptr<CheckpointSnapshot> snapshot = snapshot_cache_;
-    save_async(path, snapshot);
+    try {
+        save_async(path, snapshot);
+    } catch (...) {
+        resume_prefetch();
+#ifdef GAI_CUDA
+        if (dist_ && dist_->world_size() > 1) dist_->barrier();
+#endif
+        throw;
+    }
 #ifdef GAI_CUDA
     if (dist_ && dist_->world_size() > 1) dist_->barrier();
 #endif
@@ -1685,6 +1695,7 @@ void Trainer::init_distributed() {
     }
 
     DistributedContext::Config dcfg = distributed_config_from_env(num_gpus);
+    dcfg.grad_compression = cfg_.ddp_grad_compression;
     if (dcfg.world_size <= 1) {
         if (cfg_.ddp) GAI_FAIL("training.ddp=true but world_size==1 (launch 2+ ranks or set ddp=false)");
         return;
@@ -1818,8 +1829,7 @@ bool Trainer::is_main_rank() const {
 
 i64 Trainer::sync_ntok_sum(i64 local) {
     // Exact global supervised-token count for token-weighted DDP (P0-05).
-    // NCCL sums floats; ntok/step (<1M) is exactly representable in fp32.
-    // Persistent 1-float buffer: no per-step alloc. Single tiny sync.
+    // NCCL sums int64 exactly; persistent 1-i64 buffer, no per-step alloc.
 #ifdef GAI_CUDA
     if (!dist_ || dist_->world_size() <= 1) return local;
     if (model_.device() != Device::CUDA) {

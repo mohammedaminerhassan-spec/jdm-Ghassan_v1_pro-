@@ -230,11 +230,12 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
     else mask_out.clear();
     if (len == 0) return true;
 
-    // PRO-HARDEN: مسار RAM كان يقرأ tokens_[start+len] بلا فحص فينهار heap
-    // على offsets فاسدة؛ مسار streaming كان يرجع false فقط. نوحد الفشل السريع.
     const u64 total = n_tokens();
-    GAI_CHECK(start <= total && len <= total - start,
-              strfmt("Shard::read_window OOB (start=%llu len=%llu ntok=%llu)",
+    GAI_CHECK(start <= total,
+              strfmt("Shard::read_window OOB: start=%llu > ntok=%llu",
+                     (unsigned long long)start, (unsigned long long)total));
+    GAI_CHECK(len <= total - start,
+              strfmt("Shard::read_window OOB: start=%llu + len=%llu > ntok=%llu",
                      (unsigned long long)start, (unsigned long long)len,
                      (unsigned long long)total));
     if (!streaming_) {
@@ -447,6 +448,10 @@ std::string DataLoader::mix_report() const {
     return s;
 }
 
+static inline bool token_valid(i32 tok, int vocab_size) {
+    return vocab_size <= 0 || (tok >= 0 && tok < vocab_size);
+}
+
 bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
     const int T = spec_.seq_len;
     u64 best_start = 0, best_end = 0, best_avail = 0;
@@ -479,13 +484,25 @@ bool DataLoader::fill_from_shard(const Shard& sh, Batch& out, int b) {
     for (int i = 0; i < filled; ++i) {
         size_t o = static_cast<size_t>(b) * T + static_cast<size_t>(i);
         u64 ti = best_start + static_cast<u64>(i);
-        out.ids[o] = static_cast<i32>(toks[static_cast<size_t>(i)]);
+        i32 tok = static_cast<i32>(toks[static_cast<size_t>(i)]);
+        if (!token_valid(tok, vocab_size_))
+            GAI_FAIL(strfmt("dataloader: token id %d out of range [0,%d) at shard %s pos %llu "
+                            "(corrupt shard or vocab mismatch)",
+                            tok, vocab_size_, sh.path().c_str(),
+                            (unsigned long long)ti));
+        out.ids[o] = tok;
         out.segment_ids[o] = 0;
         bool has_next = (static_cast<size_t>(i) + 1 < toks.size()) && (ti + 1 < best_end);
         if (has_next) {
             u8 m = masks.empty() ? 1 : masks[static_cast<size_t>(i) + 1];
             if (m) {
-                out.targets[o] = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
+                i32 next_tok = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
+                if (!token_valid(next_tok, vocab_size_))
+                    GAI_FAIL(strfmt("dataloader: token id %d out of range [0,%d) at shard %s pos %llu "
+                                    "(corrupt shard or vocab mismatch)",
+                                    next_tok, vocab_size_, sh.path().c_str(),
+                                    (unsigned long long)(ti + 1)));
+                out.targets[o] = next_tok;
                 ++out.tokens_supervised;
             }
         }
@@ -515,14 +532,26 @@ bool DataLoader::fill_packed_row(const Shard& sh, Batch& out, int b) {
         int filled = static_cast<int>(std::min<u64>(toks.size(), static_cast<u64>(T - pos)));
         for (int i = 0; i < filled; ++i) {
             size_t o = row_off + static_cast<size_t>(pos + i);
-            out.ids[o] = static_cast<i32>(toks[static_cast<size_t>(i)]);
+            i32 tok = static_cast<i32>(toks[static_cast<size_t>(i)]);
+            if (!token_valid(tok, vocab_size_))
+                GAI_FAIL(strfmt("dataloader: token id %d out of range [0,%d) at shard %s pos %llu "
+                                "(corrupt shard or vocab mismatch)",
+                                tok, vocab_size_, sh.path().c_str(),
+                                (unsigned long long)(doc_start + i)));
+            out.ids[o] = tok;
             out.segment_ids[o] = segment;
             bool has_next = static_cast<size_t>(i + 1) < toks.size() &&
                             static_cast<u64>(i + 1) < doc_len;
             if (has_next) {
                 u8 m = masks.empty() ? 1 : masks[static_cast<size_t>(i) + 1];
                 if (m) {
-                    out.targets[o] = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
+                    i32 next_tok = static_cast<i32>(toks[static_cast<size_t>(i) + 1]);
+                    if (!token_valid(next_tok, vocab_size_))
+                        GAI_FAIL(strfmt("dataloader: token id %d out of range [0,%d) at shard %s pos %llu "
+                                        "(corrupt shard or vocab mismatch)",
+                                        next_tok, vocab_size_, sh.path().c_str(),
+                                        (unsigned long long)(doc_start + i + 1)));
+                    out.targets[o] = next_tok;
                     ++out.tokens_supervised;
                 }
             }

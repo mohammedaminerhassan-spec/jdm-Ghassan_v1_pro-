@@ -85,7 +85,8 @@ struct TrainerConfig {
     // are wasted. Recovers 20-40% throughput vs the one-doc-per-row baseline.
     bool  pack_sequences = false;
     // distributed training
-    bool  ddp = false;         // enable multi-GPU DDP (auto-detected if >1 GPU)
+    bool  ddp = false;
+    bool  ddp_grad_compression = false;
     // io / cadence
     i64   log_every   = 10;
     i64   eval_every  = 500;

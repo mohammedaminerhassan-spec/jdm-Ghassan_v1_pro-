@@ -166,6 +166,11 @@ public:
     State get_state() const;
     void  set_state(const State& s);
 
+    // Set vocab size for token range validation (0 = no validation).
+    // When set, fill_from_shard/fill_packed_row check every token and
+    // GAI_FAIL on out-of-range (prevents silent OOB embedding reads).
+    void set_vocab_size(int vocab_size) { vocab_size_ = vocab_size; }
+
 private:
     std::vector<Shard> shards_;       // legacy uniform path (and val loader)
     std::vector<DomainGroup> groups_; // mix path (train loader only)
@@ -177,6 +182,7 @@ private:
     i64  committed_batches_ = 0;
     State committed_state_{};
     bool pack_sequences_ = false;
+    int  vocab_size_ = 0;   // 0 = no token range validation
 
     State capture_current_state() const;
 

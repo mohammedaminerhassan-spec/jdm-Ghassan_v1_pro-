@@ -23,9 +23,13 @@ void  memset_zero(void* ptr, size_t nbytes);
 bool  is_device_memory(const void* ptr);
 void  copy(void* dst, bool dst_is_device, const void* src, bool src_is_device, size_t nbytes);
 void  synchronize();
-// FIX P2-1: live free-VRAM query (device.cpp OOM guard used stale startup
-// free_mem and false-passed after GBs of weights). Returns 0 if unavailable.
-size_t free_bytes_live();
+    // FIX P2-1: live free-VRAM query (device.cpp OOM guard used stale startup
+    // free_mem and false-passed after GBs of weights). Returns 0 if unavailable.
+    size_t free_bytes_live();
+    // Check that at least `need` bytes of VRAM are free; GAI_FAIL with a clear
+    // message if not. Call before large workspace allocations for better
+    // diagnostics than a raw cudaMalloc failure.
+    void check_free_vram(size_t need, const char* what);
 
 // cuBLAS handle, created lazily on first use.
 void* cublas_handle();
