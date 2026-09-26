@@ -18,6 +18,9 @@ void probe(DeviceInfo& info);
 void* malloc_device(size_t nbytes);
 void  free_device(void* ptr);
 void  memset_zero(void* ptr, size_t nbytes);
+// True only if ptr is live device memory on the current device. Lives here (in
+// the .cu) so core/device.cpp never needs the CUDA runtime headers.
+bool  is_device_memory(const void* ptr);
 void  copy(void* dst, bool dst_is_device, const void* src, bool src_is_device, size_t nbytes);
 void  synchronize();
 // FIX P2-1: live free-VRAM query (device.cpp OOM guard used stale startup

@@ -25,14 +25,24 @@ DO_DDP=0
 
 pass() { echo "  [ok] $1"; }
 fail() { echo "  [FAIL] $1"; exit 1; }
+# A build/test failure that only says "see /tmp/x.log" costs a whole round trip
+# and, worse, leaves the PREVIOUS binary in build/bin to run and produce a
+# misleading second failure. Always surface the tail inline.
+fail_log() {
+  echo "  [FAIL] $1"
+  echo "  ----- last 25 lines of $2 -----"
+  tail -25 "$2" 2>/dev/null || echo "  (log missing: $2)"
+  echo "  ---------------------------------"
+  exit 1
+}
 
 echo "=== [1/5] build + CPU tests ==="
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON > /tmp/verify_cmake.log 2>&1 \
-  || fail "cmake configure (see /tmp/verify_cmake.log)"
+  || fail_log "cmake configure" /tmp/verify_cmake.log
 cmake --build build -j2 > /tmp/verify_build.log 2>&1 \
-  || fail "CUDA build -Werror (see /tmp/verify_build.log)"
+  || fail_log "CUDA build -Werror" /tmp/verify_build.log
 ctest --test-dir build --output-on-failure > /tmp/verify_ctest.log 2>&1 \
-  || fail "ctest (see /tmp/verify_ctest.log)"
+  || fail_log "ctest" /tmp/verify_ctest.log
 pass "build clean, all CPU tests green"
 
 echo "=== [2/5] GPU parity (F-02/F-03/F-10) ==="

@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <new>
 
 #ifdef GAI_CUDA
@@ -142,10 +143,7 @@ void device_memset_zero(void* ptr, size_t nbytes, Device dev) {
         // A memset on memory that is not device-resident returns the useless
         // "invalid argument". Verify the pointer first so the failure names the
         // real cause (host pointer, or already-freed device memory).
-        cudaPointerAttributes attr{};
-        if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess ||
-            attr.type != cudaMemoryTypeDevice) {
-            cudaGetLastError();
+        if (!cuda::is_device_memory(ptr)) {
             GAI_FAIL("device_memset_zero: pointer is not device memory (ptr=" +
                      std::to_string(reinterpret_cast<uintptr_t>(ptr)) +
                      ", nbytes=" + std::to_string(nbytes) +

@@ -103,6 +103,15 @@ void memset_zero(void* ptr, size_t nbytes) {
     CUDA_CHECK(cudaMemset(ptr, 0, nbytes));
 }
 
+bool is_device_memory(const void* ptr) {
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, const_cast<void*>(ptr)) != cudaSuccess) {
+        cudaGetLastError();  // clear the sticky-free query error
+        return false;
+    }
+    return attr.type == cudaMemoryTypeDevice;
+}
+
 void copy(void* dst, bool dst_dev, const void* src, bool src_dev, size_t nbytes) {
     cudaMemcpyKind kind = cudaMemcpyHostToHost;
     if (dst_dev && src_dev)        kind = cudaMemcpyDeviceToDevice;
