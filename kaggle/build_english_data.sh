@@ -30,18 +30,19 @@ SHARD_SEQ_LEN=1024
 
 EN_DIR="${1:-${EN_PARQUET_DIR:-}}"
 if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
-    for d in /kaggle/input/*/; do
-        [[ -d "$d" ]] || continue
-        # maxdepth 4: the all-in-one zip lays out
-        #   <ds>/ghassan-en-pro/english_parquet/*.parquet
-        if [[ -n "$(find "$d" -maxdepth 4 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
-            EN_DIR="$(dirname "$(find "$d" -maxdepth 4 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)")"
-            break
+    # maxdepth 8: same deep-nesting contract as setup.sh find_english_lake
+    # (dataset uploads like .../Users/<name>/Desktop/english_parquet).
+    local hit=""
+    hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
+    if [[ -n "${hit}" ]]; then
+        EN_DIR="$(dirname "${hit}")"
+    else
+        local any=""
+        any="$(find /kaggle/input -maxdepth 8 -name '*.parquet' 2>/dev/null | head -n 1)"
+        if [[ -n "${any}" ]]; then
+            EN_DIR="$(dirname "${any}")"
         fi
-        if [[ -n "$(find "$d" -maxdepth 4 -name '*.parquet' 2>/dev/null | head -n 1)" ]]; then
-            EN_DIR="$d"
-        fi
-    done
+    fi
 fi
 # Local fallbacks (in order):
 #   1. dataset/english_parquet (vendored in THIS checkout, 522k chat + 478k inst)

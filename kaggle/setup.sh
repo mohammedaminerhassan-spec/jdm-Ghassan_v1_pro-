@@ -254,16 +254,16 @@ find_english_lake() {
         fi
     done
     if [[ -d "/kaggle/input" ]]; then
-        local d=""
-        for d in /kaggle/input/*/; do
-            [[ -d "$d" ]] || continue
-            local hit=""
-            hit="$(find "$d" -maxdepth 4 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
-            if [[ -n "${hit}" ]]; then
-                echo "$(dirname "${hit}")"
-                return 0
-            fi
-        done
+        # maxdepth 8: Kaggle dataset uploads can nest deeply, e.g.
+        #   /kaggle/input/datasets/<user>/<slug>/Users/<name>/Desktop/english_parquet/*.parquet
+        # (depth 8). The old maxdepth-4 loop missed that layout and failed the
+        # whole setup with "No English lake found" on a healthy machine.
+        local hit=""
+        hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
+        if [[ -n "${hit}" ]]; then
+            echo "$(dirname "${hit}")"
+            return 0
+        fi
     fi
     return 1
 }
