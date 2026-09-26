@@ -65,16 +65,26 @@ bool DistributedContext::init(const Config& cfg) {
         // so ranks 1..3 could read the OLD id before rank 0 rewrites it ->
         // ncclCommInitRank mismatch / hang. Unlink first so followers only
         // ever see a fresh, complete ID (train_4xt4.sh also removes it).
+        // ATOMIC PUBLISH: write to a tmp name + fsync + rename, so followers
+        // can never observe a half-written ID even if the size check races.
         {
             std::error_code ec;
             std::filesystem::remove(id_file, ec);
         }
         NCCL_CHECK(ncclGetUniqueId(&nccl_id));
-        std::ofstream f(id_file, std::ios::binary | std::ios::trunc);
-        if (!f.good()) GAI_FAIL("NCCL: cannot publish ID file " + id_file);
-        f.write(reinterpret_cast<const char*>(&nccl_id), sizeof(nccl_id));
-        f.close();
-        if (!f.good()) GAI_FAIL("NCCL: failed writing ID file " + id_file);
+        const std::string tmp_file = id_file + ".tmp";
+        {
+            std::ofstream f(tmp_file, std::ios::binary | std::ios::trunc);
+            if (!f.good()) GAI_FAIL("NCCL: cannot publish ID file " + tmp_file);
+            f.write(reinterpret_cast<const char*>(&nccl_id), sizeof(nccl_id));
+            f.flush();
+            if (!f.good()) GAI_FAIL("NCCL: failed writing ID file " + tmp_file);
+        }
+        {
+            std::error_code ec;
+            std::filesystem::rename(tmp_file, id_file, ec);
+            if (ec) GAI_FAIL("NCCL: atomic publish failed for " + id_file + ": " + ec.message());
+        }
     } else {
         // Bounded wait: fail loudly instead of hanging forever if rank 0 dies.
         bool seen = false;
@@ -221,19 +231,15 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
 #ifdef GAI_NCCL
     // OVERFLOW GUARD: grad compression casts f32->f16 while grads are still
     // scaled by loss_scale (e.g. 8192x). Scaled grads overflow fp16 -> inf ->
-    // skipped-step storm. FAIL FAST instead of warning-and-continuing: a
-    // warning scrolls past and the run then trains on garbage for hours.
-    // All shipped recipes keep ddp_grad_compression=false (exact fp32 path
-    // below), so this only fires when someone opts into compression.
+    // skipped-step storm. HARD FAIL, no environment override: an env-var
+    // escape hatch is one exported line away from silently training on
+    // garbage for hours, and no shipped recipe uses compression (exact fp32
+    // path below). Compression, if ever wanted, needs unscale-first plumbing
+    // in the Trainer with numerical validation — not a runtime flag.
     if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
-        const char* ls = std::getenv("GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING");
-        if (!ls || std::string(ls) != "1") {
-            GAI_FAIL("ddp_grad_compression=true with loss scaling active: scaled "
-                     "grads overflow fp16 and corrupt training. Either set "
-                     "training.ddp_grad_compression=false (exact fp32 all-reduce, "
-                     "recommended), or set training.loss_scale_init<=1 AND export "
-                     "GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING=1 knowingly.");
-        }
+        GAI_FAIL("ddp_grad_compression=true is unsupported with loss scaling: scaled "
+                 "grads overflow fp16 and corrupt training. Set "
+                 "training.ddp_grad_compression=false (exact fp32 all-reduce).");
         size_t nbytes_f32 = numel * sizeof(float);
         size_t nbytes_f16 = numel * sizeof(uint16_t);
         bool back = false;

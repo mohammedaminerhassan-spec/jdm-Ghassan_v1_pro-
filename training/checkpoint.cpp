@@ -59,6 +59,39 @@ static bool rd_tok_fp_v11(std::istream& f, TrainState& state, u32 version) {
     return true;
 }
 
+// Shared TrainState prefix reader: step through tok_fingerprint, in exact
+// file order. Used by all three load() paths AND peek(). A single definition
+// means peek() can never drift behind load() again (the v11 fingerprint was
+// verified by load but invisible to peek, which silently disabled the resume
+// identity gate and spammed a false "predates fingerprints" warning).
+// (Loader/sched readers are defined below; forward-declared here.)
+static bool rd_loader_v5(std::istream& i, DataLoader::State& s);
+static bool rd_loader_legacy(std::istream& i, DataLoader::State& s);
+static bool rd_sched_v8(std::istream& f, TrainState& state);
+static bool rd_state_prefix(std::istream& f, TrainState& state, u32 version) {
+    if (!rd(f, state.step)) return false;
+    if (!rd(f, state.tokens_seen)) return false;
+    if (!rd(f, state.best_val)) return false;
+    if (!rd(f, state.last_loss)) return false;
+    if (!rd(f, state.seed)) return false;
+    if (version >= 5u) {
+        if (!rd_loader_v5(f, state.loader)) return false;
+    } else {
+        if (!rd_loader_legacy(f, state.loader)) return false;
+    }
+    if (!rd(f, state.loss_scale)) return false;
+    if (!rd(f, state.clean_steps)) return false;
+    if (!rd(f, state.tok_vocab)) return false;
+    if (version >= 8u) {
+        if (!rd_sched_v8(f, state)) return false;
+    } else {
+        state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
+        state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
+    }
+    if (!rd_tok_fp_v11(f, state, version)) return false;
+    return true;
+}
+
 // Field-wise config IO: stable across compilers (no struct padding).
 static void wr_config(std::ostream& o, const ModelConfig& c) {
     wr(o, c.vocab_size); wr(o, c.hidden_size); wr(o, c.num_layers);
@@ -504,26 +537,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         return false;
     }
 
-    if (!rd(f, state.step)) return false;
-    if (!rd(f, state.tokens_seen)) return false;
-    if (!rd(f, state.best_val)) return false;
-    if (!rd(f, state.last_loss)) return false;
-    if (!rd(f, state.seed)) return false;
-    if (version >= 5u) {
-        if (!rd_loader_v5(f, state.loader)) return false;
-    } else {
-        if (!rd_loader_legacy(f, state.loader)) return false;
-    }
-    if (!rd(f, state.loss_scale)) return false;
-    if (!rd(f, state.clean_steps)) return false;
-    if (!rd(f, state.tok_vocab)) return false;
-    if (version >= 8u) {
-        if (!rd_sched_v8(f, state)) return false;
-    } else {
-        state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
-        state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
-    }
-    if (!rd_tok_fp_v11(f, state, version)) return false;
+    if (!rd_state_prefix(f, state, version)) return false;
     // tokenizer identity: resuming with a different vocab silently corrupts
     // every embedding row. tok_vocab==0 means "unknown" (never for v3 files).
     if (!read_moe_bias(f, model, version >= 10u)) return false;
@@ -636,26 +650,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         return false;
     }
 
-    if (!rd(f, state.step)) return false;
-    if (!rd(f, state.tokens_seen)) return false;
-    if (!rd(f, state.best_val)) return false;
-    if (!rd(f, state.last_loss)) return false;
-    if (!rd(f, state.seed)) return false;
-    if (version >= 5u) {
-        if (!rd_loader_v5(f, state.loader)) return false;
-    } else {
-        if (!rd_loader_legacy(f, state.loader)) return false;
-    }
-    if (!rd(f, state.loss_scale)) return false;
-    if (!rd(f, state.clean_steps)) return false;
-    if (!rd(f, state.tok_vocab)) return false;
-    if (version >= 8u) {
-        if (!rd_sched_v8(f, state)) return false;
-    } else {
-        state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
-        state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
-    }
-    if (!rd_tok_fp_v11(f, state, version)) return false;
+    if (!rd_state_prefix(f, state, version)) return false;
     if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
@@ -764,26 +759,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         return false;
     }
 
-    if (!rd(f, state.step)) return false;
-    if (!rd(f, state.tokens_seen)) return false;
-    if (!rd(f, state.best_val)) return false;
-    if (!rd(f, state.last_loss)) return false;
-    if (!rd(f, state.seed)) return false;
-    if (version >= 5u) {
-        if (!rd_loader_v5(f, state.loader)) return false;
-    } else {
-        if (!rd_loader_legacy(f, state.loader)) return false;
-    }
-    if (!rd(f, state.loss_scale)) return false;
-    if (!rd(f, state.clean_steps)) return false;
-    if (!rd(f, state.tok_vocab)) return false;
-    if (version >= 8u) {
-        if (!rd_sched_v8(f, state)) return false;
-    } else {
-        state.sched_total = 0; state.sched_warmup = 0; state.sched_peak = 0.0f; state.ddp_world = 1;
-        state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
-    }
-    if (!rd_tok_fp_v11(f, state, version)) return false;
+    if (!rd_state_prefix(f, state, version)) return false;
     if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
@@ -877,11 +853,9 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     } else {
         if (!rd(f, cfg)) return false;
     }
-    if (!rd(f, state.step)) return false;
-    if (!rd(f, state.tokens_seen)) return false;
-    if (!rd(f, state.best_val)) return false;
-    if (!rd(f, state.last_loss)) return false;
-    if (!rd(f, state.seed)) return false;
+    // Full state prefix (same reader as load): peek must see everything the
+    // resume gates check (sched snapshot, tok_vocab, tok_fingerprint).
+    if (!rd_state_prefix(f, state, version)) return false;
     return true;
 }
 

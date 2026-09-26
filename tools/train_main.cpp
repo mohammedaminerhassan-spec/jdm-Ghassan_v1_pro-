@@ -115,10 +115,18 @@ if (args.has("resume-mode")) {
         // vocab_size. CLI --tokenizer wins over tokenizer.path (same rule the
         // export uses). An explicit training.tok_fingerprint in the yaml wins
         // over both (lets a recipe pin the fingerprint it was validated with).
+        // Path resolution mirrors the loader below (yaml-relative paths resolve
+        // against the CONFIG FILE's directory first): fingerprinting the raw
+        // relative path while CWD differs would hash nothing (fp=0) even though
+        // the load succeeds, permanently disabling resume verification.
         {
             const std::string tok_cli = args.str("tokenizer", "");
             const std::string tok_yaml = cfg.get_str("tokenizer.path", "");
-            const std::string tok_path = !tok_cli.empty() ? tok_cli : tok_yaml;
+            std::string tok_path = !tok_cli.empty() ? tok_cli : tok_yaml;
+            if (!tok_path.empty() && !fs::path(tok_path).is_absolute()) {
+                fs::path cand = fs::path(cfg_path).parent_path() / tok_path;
+                if (fs::exists(cand)) tok_path = cand.string();
+            }
             const u64 fp = tok_path.empty() ? 0 : fingerprint_file(tok_path);
             if (tcfg.tok_fingerprint == 0) {
                 tcfg.tok_fingerprint = fp;

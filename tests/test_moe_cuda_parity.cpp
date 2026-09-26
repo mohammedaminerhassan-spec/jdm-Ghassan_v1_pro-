@@ -164,6 +164,80 @@ static void test_sce_acc_parity() {
           "F-10: CUDA accumulate loss matches CPU");
     near_vec(dlogits_cpu, to_host(dd), 1e-5, "F-10: CUDA dlogits match CPU");
 }
+
+// Full MoE backward parity (P1-5): the most complex path (router GEMM grad,
+// per-expert weight grads, dx scatter, shared-expert recompute) must match
+// the serial CPU reference, or long training silently diverges.
+static void test_moe_backward_parity() {
+    Rng rng;
+    rng.seed_with(2025);
+    const int N = 9, d = 16, E = 12, ne = 4, K = 2;
+    const i64 NK = (i64)N * K;
+    auto rnd = [&](size_t n, float s) {
+        std::vector<float> v(n);
+        for (float& x : v) x = (rng.uniform() * 2.0f - 1.0f) * s;
+        return v;
+    };
+    const std::vector<float> x = rnd((size_t)N * d, 1.0f);
+    const std::vector<float> router = rnd((size_t)ne * d, 0.5f);
+    const std::vector<float> gates = rnd((size_t)ne * E * d, 0.3f);
+    const std::vector<float> ups = rnd((size_t)ne * E * d, 0.3f);
+    const std::vector<float> downs = rnd((size_t)ne * d * E, 0.3f);
+    const std::vector<float> dout = rnd((size_t)N * d, 0.5f);
+
+    // Forward on CPU for the shared caches (probs/idx/w/s_*).
+    std::vector<float> out_cpu((size_t)N * d, 0.0f);
+    std::vector<float> probs((size_t)N * ne), w((size_t)NK);
+    std::vector<i32> idx((size_t)NK);
+    std::vector<float> sg((size_t)NK * E), su((size_t)NK * E), sa((size_t)NK * E);
+    cpu::moe_forward(x.data(), router.data(), gates.data(), ups.data(), downs.data(),
+                     nullptr, nullptr, nullptr, out_cpu.data(),
+                     probs.data(), idx.data(), w.data(),
+                     sg.data(), su.data(), sa.data(), N, d, E, ne, K);
+
+    // CPU backward reference.
+    std::vector<float> dx_cpu((size_t)N * d, 0.0f);
+    std::vector<float> dr_cpu((size_t)ne * d, 0.0f);
+    std::vector<float> dg_cpu((size_t)ne * E * d, 0.0f);
+    std::vector<float> du_cpu((size_t)ne * E * d, 0.0f);
+    std::vector<float> dd_cpu((size_t)ne * d * E, 0.0f);
+    std::vector<float> s_dact_cpu((size_t)NK * E, 0.0f);
+    cpu::moe_backward(x.data(), router.data(), gates.data(), ups.data(), downs.data(),
+                      nullptr, nullptr, nullptr,
+                      probs.data(), idx.data(), w.data(),
+                      sg.data(), su.data(), sa.data(),
+                      nullptr, 0.0f, dout.data(), dx_cpu.data(),
+                      dr_cpu.data(), dg_cpu.data(), du_cpu.data(), dd_cpu.data(),
+                      nullptr, nullptr, nullptr, s_dact_cpu.data(),
+                      N, d, E, ne, K);
+
+    // CUDA backward on the same inputs.
+    Tensor dx_ = to_cuda(x), dr_ = to_cuda(router), dg_ = to_cuda(gates),
+           du_ = to_cuda(ups), dd_ = to_cuda(downs);
+    Tensor dprobs = to_cuda(probs), didx = to_cuda_i32(idx), dw = to_cuda(w);
+    Tensor dsg = to_cuda(sg), dsu = to_cuda(su), dsa = to_cuda(sa);
+    Tensor ddout = to_cuda(dout);
+    Tensor gdx = Tensor::zeros({(i64)N * d}, DType::F32, Device::CUDA);
+    Tensor gdr = Tensor::zeros({(i64)ne * d}, DType::F32, Device::CUDA);
+    Tensor gdg = Tensor::zeros({(i64)ne * E * d}, DType::F32, Device::CUDA);
+    Tensor gdu = Tensor::zeros({(i64)ne * E * d}, DType::F32, Device::CUDA);
+    Tensor gdd = Tensor::zeros({(i64)ne * d * E}, DType::F32, Device::CUDA);
+    Tensor gsd = Tensor::zeros({NK * E}, DType::F32, Device::CUDA);
+    cuda_ops::moe_backward(dx_.f32(), dr_.f32(), dg_.f32(), du_.f32(), dd_.f32(),
+                           nullptr, nullptr, nullptr,
+                           dprobs.f32(), didx.i32p(), dw.f32(),
+                           dsg.f32(), dsu.f32(), dsa.f32(),
+                           nullptr, 0.0f, ddout.f32(), gdx.f32(),
+                           gdr.f32(), gdg.f32(), gdu.f32(), gdd.f32(),
+                           nullptr, nullptr, nullptr, gsd.f32(),
+                           N, d, E, ne, K);
+    device_synchronize(Device::CUDA);
+    near_vec(dx_cpu, to_host(gdx), 1e-4, "moe bwd dx vs CPU");
+    near_vec(dr_cpu, to_host(gdr), 1e-4, "moe bwd router grad vs CPU");
+    near_vec(dg_cpu, to_host(gdg), 1e-4, "moe bwd gate grad vs CPU");
+    near_vec(du_cpu, to_host(gdu), 1e-4, "moe bwd up grad vs CPU");
+    near_vec(dd_cpu, to_host(gdd), 1e-4, "moe bwd down grad vs CPU");
+}
 #endif // GAI_CUDA
 
 int main() {
@@ -173,6 +247,7 @@ int main() {
         return 0;
     }
     test_moe_forward_parity();
+    test_moe_backward_parity();
     test_count_slots_parity();
     test_sce_acc_parity();
 #else

@@ -124,6 +124,18 @@ if(GAI_HAVE_CUDA)
     target_link_libraries(gai_cuda PUBLIC CUDA::cudart CUDA::cublas)
     target_link_libraries(gai_core PUBLIC gai_cuda)
     target_compile_definitions(gai_core PUBLIC GAI_CUDA=1)
+    # Zero-warning policy for device code (mirrors gai_apply_cxx_flags, which
+    # nvcc rejects). Narrow and safe: cross-execution-space calls (a __host__
+    # function called from a kernel) are always a bug here — kernels must only
+    # call __device__ helpers. No -Xcompiler host flags: those differ per host
+    # compiler and belong to gai_apply_cxx_flags, not nvcc.
+    # Escape hatch if a future toolkit chokes on the flag value:
+    #   cmake -DGAI_CUDA_WERROR=OFF ...
+    option(GAI_CUDA_WERROR "Fail the CUDA build on device-code warnings" ON)
+    if(GAI_CUDA_WERROR)
+        target_compile_options(gai_cuda PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--Werror=cross-execution-space-call>)
+    endif()
 endif()
 
 # ---------------------------------------------------------------- NCCL (multi-GPU)

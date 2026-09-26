@@ -327,6 +327,16 @@ static MuonConfig make_muon(const TrainerConfig& c) {
     return m;
 }
 
+// Single source of truth for the scheduler peak: lion runs at 0.1x, muon
+// takes lr directly, adamw takes lr. Used when BUILDING the scheduler AND
+// when CHECKING a checkpoint (exact resume must compare like with like:
+// comparing a saved Lion peak against raw learning_rate always mismatches).
+static float effective_peak_lr(const TrainerConfig& c) {
+    const bool muon = (c.optimizer == "muon");
+    const bool lion = !muon && (c.optimizer == "lion");
+    return muon ? make_muon(c).lr : lion ? make_lion(c).lr : c.learning_rate;
+}
+
 Trainer::Trainer(Model& model, TrainerConfig cfg)
     : model_(model), cfg_(std::move(cfg)) {
     // Strong-model contract: fail fast on illogical shapes (never mid-run).
@@ -885,6 +895,25 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 }
                 if (!math_same)
                     log_warn("[ckpt] resuming WITH recipe drift (--allow-recipe-drift): numerics differ from save time");
+                // ARCHITECTURE IDENTITY (one definition, not three). The
+                // math_same gate above covers the silent-numerics fields;
+                // same_architecture_as additionally covers shapes, MoE
+                // routing (ne/k/E/shared), sliding_window, aux-free flag and
+                // the loss weights (aux/z/jitter). In EXACT mode the full
+                // identity must hold (bit-exact continuation); in migrate
+                // mode a drift only warns, because retuning loss weights on
+                // resume is legitimate.
+                {
+                    std::string why;
+                    const bool arch_same = ckpt_cfg.same_architecture_as(cur, &why);
+                    if (!arch_same && exact) {
+                        GAI_FAIL("exact resume refused: checkpoint architecture differs: " + why +
+                                 ". Restore the original recipe, or use resume_mode: migrate "
+                                 "to accept a controlled reset");
+                    }
+                    if (!arch_same)
+                        log_warn("[ckpt] resuming WITH architecture drift (migrate): " + why);
+                }
                 // TOKENIZER IDENTITY (v11). The vocab SIZE is not identity: a
                 // re-trained BPE can have 32000 entries with different merges,
                 // i.e. different token ids. Resuming then feeds the model a
@@ -901,15 +930,28 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                         fingerprint_hex(peek_st.tok_fingerprint).c_str(),
                         fingerprint_hex(cfg_.tok_fingerprint).c_str()));
                 }
-                if (peek_st.tok_fingerprint == 0)
+                // Unknown fingerprint (pre-v11 file, or unreadable tokenizer):
+                // warn in migrate, FAIL in exact (exact means verifiable).
+                if (peek_st.tok_fingerprint == 0 && cfg_.tok_fingerprint != 0) {
+                    if (exact) {
+                        GAI_FAIL("exact resume refused: checkpoint predates tokenizer "
+                                 "fingerprints (v10 or older), so the tokenizer identity "
+                                 "cannot be verified. Use resume_mode: migrate to accept it, "
+                                 "or start a fresh run (--resume none).");
+                    }
                     log_warn("[ckpt] checkpoint predates tokenizer fingerprints (v10 or older): "
                              "cannot verify the tokenizer identity on this resume");
+                }
                 // F-08: exact resume also refuses a reshaped schedule. Warn-only
                 // in migrate mode, because extending a run is a normal move.
+                // The peak is the EFFECTIVE peak (lion 0.1x): comparing a saved
+                // Lion peak against raw learning_rate mismatched every time and
+                // refused valid Lion checkpoints.
                 if (peek_st.sched_total > 0) {
+                    const float want_peak = effective_peak_lr(cfg_);
                     const bool sched_same =
                         peek_st.sched_kind == ((cfg_.scheduler == "wsd") ? 1 : 0) &&
-                        std::fabs(peek_st.sched_peak - cfg_.learning_rate) <=
+                        std::fabs(peek_st.sched_peak - want_peak) <=
                             1e-6f * std::fabs(peek_st.sched_peak) + 1e-30f;
                     if (!sched_same) {
                         const std::string why =
@@ -1158,6 +1200,14 @@ void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok)
     double tps = dt > 0 ? static_cast<double>(ntok) / dt : 0.0;
     i64 remaining = total_steps_ - state_.step;
     double eta = remaining > 0 ? remaining * dt : 0.0;
+    // SFT visibility (P1-7): ntok is GLOBAL SUPERVISED tokens (masks applied),
+    // while the schedule counts dense tokens. Log the supervised fraction so
+    // "3 epochs" is never misread as 3 supervised epochs on masked data.
+    double sup_frac = 0.0;
+    {
+        const i64 dense = cfg_.tokens_per_step_global(dist_ ? dist_->world_size() : 1);
+        if (dense > 0) sup_frac = static_cast<double>(ntok) / static_cast<double>(dense);
+    }
     // PERF telemetry (audit P2-2): launch/transfer totals since run start.
     // Deltas between log lines / grad_accum = per-step launch cost - the
     // number to drive down alongside tok/s (Nsight on T4 for hotspots).
@@ -1172,11 +1222,11 @@ void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok)
         if (ckpt_active_) ckpt_bytes += ckpt_active_->bytes();
     }
     log_info(strfmt("step %6lld | loss %7.4f | ema %7.4f | ppl %8.2f | lr %.3e | gnorm %6.3f "
-                    "| %7.0f tok/s | %s | eta %s | ckptq %zu (%s) | perf [%s]",
+                    "| %7.0f tok/s | %s | eta %s | sup %4.1f%% | ckptq %zu (%s) | perf [%s]",
                     static_cast<long long>(state_.step), loss, ema_loss_,
                     std::exp(std::min(20.0, ema_loss_)), lr, gnorm, tps,
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
-                    human_duration(eta).c_str(), ckpt_depth,
+                    human_duration(eta).c_str(), sup_frac * 100.0, ckpt_depth,
                     human_bytes(ckpt_bytes).c_str(),
                     ops::perf_report().c_str()));
 }
@@ -1349,9 +1399,7 @@ void Trainer::run() {
     // scheduler is built HERE from the true total (never from a default).
     // lion uses its own effective LR (0.1x), muon its direct LR; the
     // scheduler shapes whichever peak identically.
-    float sched_peak = use_muon_ ? make_muon(cfg_).lr
-                     : use_lion_ ? make_lion(cfg_).lr
-                                 : cfg_.learning_rate;
+    float sched_peak = effective_peak_lr(cfg_);
     sched_ = LrScheduler(sched_peak, cfg_.warmup_steps,
                          total_steps_, cfg_.min_lr_ratio,
                          cfg_.scheduler, cfg_.sched_decay_frac);

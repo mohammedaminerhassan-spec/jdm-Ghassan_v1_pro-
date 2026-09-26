@@ -23,6 +23,11 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# GLOBAL WALL CLOCK. Every budget below derives from time REMAINING in the
+# Kaggle session, not from when a phase happens to start: setup + data +
+# preflight + pilot all burn the same 12h limit as training.
+SESSION_START=$(date +%s)
+session_elapsed() { echo $(( $(date +%s) - SESSION_START )); }
 MODE="full"
 # SINGLE-SESSION BUDGET. Kaggle caps a GPU session at 12h, and the goal is to
 # finish PT + SFT + export INSIDE ONE session, so the plan is built on 8h
@@ -106,13 +111,24 @@ echo "  gguf      : ${GGUF_OUT}  (rank 0 only)"
 echo "  out budget: ${OUTPUT_BUDGET_MB} MB"
 
 persist_output() {
-    if [[ -d "/kaggle/working" ]]; then
-        mkdir -p /kaggle/working/output 2>/dev/null || true
-        cp -r "${CKPT_PT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -r "${CKPT_SFT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
-        echo "[persist] snapshot copied to /kaggle/working/output"
-    fi
+    # /kaggle/working itself is what "Save Version" persists. Sources already
+    # inside it must NOT be copied into output/ — that stores every byte TWICE
+    # against the 20GB quota (a successful train could then fail at Save).
+    # Only sources from outside (rare; the repo lives under working on Kaggle)
+    # are copied.
+    [[ -d "/kaggle/working" ]] || return 0
+    local dest="/kaggle/working/output"
+    mkdir -p "${dest}" 2>/dev/null || true
+    local src
+    for src in "${CKPT_PT}" "${CKPT_SFT}" "${GGUF_OUT}"; do
+        case "${src}" in
+            /kaggle/working/*)
+                echo "[persist] already persisted by the platform, skip copy: ${src}" ;;
+            *)
+                echo "[persist] copying ${src} -> ${dest}/"
+                cp -r "${src}" "${dest}/" 2>/dev/null || true ;;
+        esac
+    done
 }
 trap persist_output EXIT INT TERM
 
@@ -292,6 +308,21 @@ FULL_TPS=${TOK_PER_STEP_GLOBAL}
 BUDGET_SEC=$(( TIME_BUDGET_MIN * 60 ))
 USED_SEC=$(($(date +%s) - P_START))
 REMAIN_SEC=$(( BUDGET_SEC - USED_SEC - EXPORT_MARGIN_SEC ))
+# Cap by the ACTUAL session remainder: TIME_BUDGET is training-only, but setup
+# + data + preflight + pilot already burned session wall-clock. Without this
+# cap a slow setup phase pushes PT+SFT past the 12h Kaggle kill.
+SESSION_CAP_SEC=$(( SESSION_LIMIT_MIN * 60 ))
+SESSION_USED_SEC=$(session_elapsed)
+SESSION_LEFT_SEC=$(( SESSION_CAP_SEC - SESSION_USED_SEC - EXPORT_MARGIN_SEC ))
+echo "[time] session used ~$(( SESSION_USED_SEC / 60 ))m, left ~$(( SESSION_LEFT_SEC / 60 ))m of ${SESSION_LIMIT_MIN}m cap"
+if [[ "${SESSION_LEFT_SEC}" -lt 1800 ]]; then
+    echo "[ERROR] <30min left in the session cap; refusing to start training that cannot finish."
+    exit 1
+fi
+if [[ "${REMAIN_SEC}" -gt "${SESSION_LEFT_SEC}" ]]; then
+    echo "[time] training budget capped by session remainder: ${REMAIN_SEC}s -> ${SESSION_LEFT_SEC}s"
+    REMAIN_SEC="${SESSION_LEFT_SEC}"
+fi
 [[ "${REMAIN_SEC}" -lt 600 ]] && { echo "[ERROR] <10min left. Aborting."; exit 1; }
 TOTAL_STEPS=$(awk "BEGIN {printf \"%d\", (${REMAIN_SEC} * ${P_TPS}) / ${FULL_TPS}}")
 [[ "${TOTAL_STEPS}" -lt 100 ]] && TOTAL_STEPS=100
