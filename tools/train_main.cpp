@@ -9,6 +9,8 @@
 #include <iostream>
 #include <filesystem>
 #include <cstdlib>
+#include <cstdio>
+#include <exception>
 #ifdef GAI_CUDA
 #include <cuda_runtime.h>
 #include "cuda/cuda_ops.h"
@@ -17,6 +19,22 @@
 
 namespace fs = std::filesystem;
 using namespace gai;
+
+// When an exception escapes a worker thread (or any noexcept frame) the
+// default handler reports only the type: "terminate called after throwing an
+// instance of 'gai::Error'" with no message, which makes the crash
+// unactionable. Re-throw inside the handler to recover the real text.
+static void gai_verbose_terminate() {
+    try {
+        if (auto p = std::current_exception()) std::rethrow_exception(p);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[fatal] uncaught exception: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[fatal] uncaught non-std exception\n");
+    }
+    std::fflush(stderr);
+    std::abort();
+}
 
 static void usage() {
     std::cout <<
@@ -44,6 +62,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    std::set_terminate(gai_verbose_terminate);
     enable_utf8_console();
     Args args(argc, argv);
     apply_common_flags(args);
@@ -309,7 +328,16 @@ print_device_report();
         model.enable_grad(true);
 
         Trainer trainer(model, tcfg);
-        trainer.run();
+        // Report the failure BEFORE unwinding: ~Trainer joins the prefetch and
+        // checkpoint-writer threads, and a throw from that cleanup (or any other
+        // destructor) would turn a plain error into std::terminate, hiding both
+        // the message and the call site. Log first, then let main() exit(1).
+        try {
+            trainer.run();
+        } catch (const std::exception& e) {
+            log_error(std::string("training aborted: ") + e.what());
+            return 1;
+        }
 
         // optional export after training — produces a self-contained .gguf file
         // (tokenizer embedded; no sidecar needed). --compat llama gives a

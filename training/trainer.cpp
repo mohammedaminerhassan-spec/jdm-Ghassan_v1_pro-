@@ -812,8 +812,24 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 }
 
 Trainer::~Trainer() {
-    stop_prefetch();
-    stop_ckpt_writer();
+    // A destructor is implicitly noexcept: a throw here calls std::terminate
+    // and destroys the original diagnostic (the caller is usually already
+    // unwinding from a real failure). Cleanup is best-effort, so swallow and
+    // report instead of propagating.
+    try {
+        stop_prefetch();
+    } catch (const std::exception& e) {
+        log_error(std::string("[cleanup] prefetch stop failed: ") + e.what());
+    } catch (...) {
+        log_error("[cleanup] prefetch stop failed with unknown exception");
+    }
+    try {
+        stop_ckpt_writer();
+    } catch (const std::exception& e) {
+        log_error(std::string("[cleanup] ckpt-writer stop failed: ") + e.what());
+    } catch (...) {
+        log_error("[cleanup] ckpt-writer stop failed with unknown exception");
+    }
 }
 
 float Trainer::scaler_for_step() {
