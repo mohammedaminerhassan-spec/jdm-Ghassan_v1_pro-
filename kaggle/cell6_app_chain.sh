@@ -22,6 +22,14 @@ rm -rf "${WORK}"; mkdir -p "${WORK}/ckpt"
 step() { echo ""; echo "##### $1 #####"; }
 ok()   { echo "  [ok] $1"; }
 
+step "[0/12] build from the pulled commit (never test a stale binary)"
+echo "  commit: $(git log --oneline -1)"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON \
+  > /tmp/cell6_cmake.log 2>&1 || { echo "  [FAIL] cmake configure"; tail -25 /tmp/cell6_cmake.log; exit 1; }
+cmake --build build -j2 > /tmp/cell6_build.log 2>&1 \
+  || { echo "  [FAIL] CUDA build -Werror"; tail -25 /tmp/cell6_build.log; exit 1; }
+ok "build clean ($(date +%H:%M:%S))"
+
 step "[1/12] train 6 steps on the real shards (CUDA)"
 "${BIN}/gai_train" --config configs/en_pro.yaml --device cuda \
   --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
