@@ -10,11 +10,15 @@
 # TRAIN (PT+SFT) -> CHECKPOINT -> OPTIONAL EXPORT -> FINAL SMOKE.
 #
 # Usage:
-#   bash kaggle/train_2xt4.sh                                   # full PT+SFT, ~640min budget
+#   bash kaggle/train_2xt4.sh                                   # full PT+SFT (1B default)
 #   bash kaggle/train_2xt4.sh --preflight                       # gates only, no training
 #   bash kaggle/train_2xt4.sh --pilot-only                       # 2-rank pilot, measures global tok/s
 #   bash kaggle/train_2xt4.sh --time-budget-min 500 --pt-fraction 60
-#   CONFIG_PT=configs/pro_v1.yaml CONFIG_SFT=configs/sft_pro_v1.yaml bash kaggle/train_2xt4.sh
+#   CONFIG_PT=configs/en_2xt4.yaml bash kaggle/train_2xt4.sh    # 480M family
+#
+# Everything downstream of the recipe (checkpoint dirs, GGUF name, VRAM gate,
+# output budget) is DERIVED from the config basename, so a recipe pair can
+# never be wired to the wrong checkpoint dir.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,20 +30,25 @@ TIME_BUDGET_MIN="${TIME_BUDGET_MIN:-$DEFAULT_BUDGET}"
     echo "[ERROR] --time-budget-min ${TIME_BUDGET_MIN} exceeds session limit ${SESSION_LIMIT_MIN}."
     exit 1
 }
-CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/en_2xt4.yaml}"
-CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_en_2xt4.yaml}"
+# DEFAULT RECIPE = the 1B family (pro_1b_2xt4: ~1.04B total / ~612M active).
+# Override CONFIG_PT (+ CONFIG_SFT) to run another family; the derived paths
+# below follow automatically.
+CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/pro_1b_2xt4.yaml}"
+CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_pro_1b_2xt4.yaml}"
+# Derive the recipe tag from the PT config basename (pro_1b_2xt4 / en_2xt4 / ...).
+RECIPE_TAG="$(basename "${CONFIG_PT}" .yaml)"
+RECIPE_TAG="${RECIPE_TAG#sft_}"   # sft_ prefix carries no extra information here
 PT_DIR="${PT_DIR:-${REPO_DIR}/artifacts/shards_en}"
-SFT_DIR="${SFT_DIR:-${REPO_DIR}/artifacts/shards_en}"
-CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4}"
-CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4_sft}"
-GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-2xt4_q4_0.gguf}"
+SFT_DIR="${SFT_DIR:-${PT_DIR}}"
+CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/${RECIPE_TAG}}"
+CKPT_SFT="${CKPT_SFT:-${CKPT_PT}_sft}"
+GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-${RECIPE_TAG}_q4_0.gguf}"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
-# Kaggle /kaggle/working cap is 20GB (build+data+train). 480M recipes keep
-# total <=17GB; 1B recipes project ~17.2GB worst case (2 snapshots + GGUF),
-# so they use 19GB — still under the panel cap. CLI/env always wins when set.
-OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"
-if [[ -z "${OUTPUT_BUDGET_MB}" ]]; then
-    case "${CONFIG_PT}" in *1b_2xt4*|*pro_v1*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
+# Kaggle /kaggle/working cap is 20GB (build+data+train). 480M recipes project
+# ~11.3GB; 1B recipes ~16.0GB (2 snapshots + GGUF), so they get 19GB. Both stay
+# under the panel cap. An explicit OUTPUT_BUDGET_MB always wins.
+if [[ -z "${OUTPUT_BUDGET_MB:-}" ]]; then
+    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
 fi
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
@@ -70,6 +79,13 @@ echo "============================================================"
 echo "  Ghassan v1 Pro — 2xT4 DDP Production [${MODE}]"
 echo "  DDP data-parallel: 2 replicas, NCCL sync, per-GPU <=16GB"
 echo "============================================================"
+echo "  recipe    : ${RECIPE_TAG}"
+echo "  PT        : ${CONFIG_PT}"
+echo "  SFT       : ${CONFIG_SFT}"
+echo "  ckpt PT   : ${CKPT_PT}"
+echo "  ckpt SFT  : ${CKPT_SFT}"
+echo "  gguf      : ${GGUF_OUT}  (rank 0 only)"
+echo "  out budget: ${OUTPUT_BUDGET_MB} MB"
 
 persist_output() {
     if [[ -d "/kaggle/working" ]]; then
@@ -124,6 +140,36 @@ run_preflight() {
     [[ -f "${CONFIG_PT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_PT}"; return 1; }
     [[ -f "${CONFIG_SFT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_SFT}"; return 1; }
     echo "[preflight] configs present"
+    # SFT->PT CHECKPOINT CHAIN GATE. The SFT yaml names the pretrain
+    # checkpoint it must load; if that path is not the directory stage A
+    # actually writes, stage B dies AFTER the whole pretrain. Fail here with
+    # the exact fix instead of burning the session.
+    SFT_PT_CKPT="$(yget pretrained_checkpoint "${CONFIG_SFT}" || true)"
+    if [[ -n "${SFT_PT_CKPT}" ]]; then
+        # The yaml carries a repo-relative path; CKPT_PT is absolute. Resolve
+        # to the same form before comparing, else a correct pair looks broken.
+        case "${SFT_PT_CKPT}" in
+            /*) SFT_PT_CKPT_ABS="${SFT_PT_CKPT}" ;;
+            *)  SFT_PT_CKPT_ABS="${REPO_DIR}/${SFT_PT_CKPT}" ;;
+        esac
+        EXPECT_PT_LCKPT="${CKPT_PT}/last.ckpt"
+        if [[ "${SFT_PT_CKPT_ABS}" != "${EXPECT_PT_LCKPT}" ]]; then
+            SFT_PT_DIR_ABS="$(dirname "${SFT_PT_CKPT_ABS}")"
+            DERIVED_PT_DIR="${REPO_DIR}/artifacts/checkpoints/${RECIPE_TAG}"
+            echo "[preflight FAIL] SFT pretrain checkpoint chain mismatch."
+            echo "              SFT yaml wants to load : ${SFT_PT_CKPT_ABS}"
+            echo "              stage A would write   : ${EXPECT_PT_LCKPT}"
+            echo "              stage B would then abort (fail-fast) after the whole pretrain."
+            echo "              fix (pick one):"
+            echo "                1) drop the CKPT_PT override  -> derived: ${DERIVED_PT_DIR}"
+            echo "                2) export CKPT_PT=${SFT_PT_DIR_ABS}"
+            echo "                3) set training.pretrained_checkpoint=${SFT_PT_CKPT} in ${CONFIG_SFT}"
+            return 1
+        fi
+        echo "[preflight] SFT->PT checkpoint chain OK (${EXPECT_PT_LCKPT})"
+    else
+        echo "[preflight WARN] ${CONFIG_SFT} has no training.pretrained_checkpoint"
+    fi
     # Arch parity: SFT function must equal pretrain function (canonical identity).
     if [[ -x "${TESTCFG_BIN}" ]]; then
         "${TESTCFG_BIN}" > /tmp/preflight_arch.log 2>&1 || { echo "[preflight FAIL] arch parity (see /tmp/preflight_arch.log)"; tail -20 /tmp/preflight_arch.log; return 1; }
@@ -177,7 +223,7 @@ EOF
     # 1B recipes peak honestly at ~14.4GB, so they use the full-16GB gate;
     # the 480M recipes keep the stricter 15GiB gate (their envelope is smaller).
     VRAM_MB=15360
-    case "${CONFIG_PT}" in *1b_2xt4*|*pro_v1*) VRAM_MB=16384;; esac
+    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) VRAM_MB=16384;; esac
     "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
     "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
     "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --max-vram-mb "${VRAM_MB}" --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] PT recipe exceeds per-GPU budget (${VRAM_MB}MiB)"; return 1; }
@@ -244,11 +290,21 @@ launch_ddp() {
     local cfg="$1" ckpt="$2" data="$3" steps="$4" warm="$5" extra=("${@:6}")
     local pids=()
     for i in 0 1; do
+        local rank_extra=()
+        # EXPORT ON RANK 0 ONLY. train_main.cpp exports unconditionally (no
+        # rank gate), so passing --export to both ranks made two processes
+        # write the SAME gguf path concurrently -> truncated/corrupt file.
+        # Safe: the export runs after trainer.run(), i.e. after every
+        # collective, so rank 1 simply finishes and exits.
+        if [[ "${EXPORT_GGUF}" -eq 1 && "${i}" -eq 0 ]]; then
+            rank_extra=(--export "${GGUF_OUT}" --export-profile "${EXPORT_PROFILE}")
+        fi
         RANK=$i LOCAL_RANK=$i "${BINARY}" --config "$cfg" --device cuda --tokenizer "${TOK}" \
             --data "$data" --max-steps "$steps" --warmup "$warm" \
             --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
             --checkpoint-dir "$ckpt" --resume auto \
-            --output-budget-mb "${OUTPUT_BUDGET_MB}" "${extra[@]}" &
+            --output-budget-mb "${OUTPUT_BUDGET_MB}" \
+            "${extra[@]}" "${rank_extra[@]}" &
         pids[$i]=$!
         echo "  rank $i pid ${pids[$i]}"
     done
@@ -268,11 +324,7 @@ echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 echo ""
 echo "[stage-B] SFT 2xT4 (${SFT_STEPS} steps)..."
 T0=$(date +%s)
-if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
-    launch_ddp "${CONFIG_SFT}" "${CKPT_SFT}" "${SFT_DIR}" "${SFT_STEPS}" "${SFT_WARM}" --export "${GGUF_OUT}" --export-profile "${EXPORT_PROFILE}"
-else
-    launch_ddp "${CONFIG_SFT}" "${CKPT_SFT}" "${SFT_DIR}" "${SFT_STEPS}" "${SFT_WARM}"
-fi
+launch_ddp "${CONFIG_SFT}" "${CKPT_SFT}" "${SFT_DIR}" "${SFT_STEPS}" "${SFT_WARM}"
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
