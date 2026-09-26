@@ -25,6 +25,7 @@ namespace cuda_ops {
 static inline int grid_for(i64 n, int block) {
     i64 g = (n + block - 1) / block;
     if (g < 1) g = 1;
+    if (g > 65535 * 64) g = 65535 * 64;
     return static_cast<int>(g);
 }
 

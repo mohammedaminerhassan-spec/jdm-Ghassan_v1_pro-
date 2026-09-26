@@ -2034,13 +2034,14 @@ void Trainer::stop_ckpt_writer() {
 // retained snapshot_cache_ — otherwise the real peak exceeds the budget.
 static size_t unique_snapshot_bytes(const std::vector<std::shared_ptr<CheckpointSnapshot>>& refs) {
     size_t total = 0;
+    std::vector<const CheckpointSnapshot*> seen;
     for (const auto& s : refs) {
         if (!s) continue;
-        bool dup = false;
-        for (const auto& prev : refs) {
-            if (prev == s) { dup = true; break; }
+        const CheckpointSnapshot* ptr = s.get();
+        if (std::find(seen.begin(), seen.end(), ptr) == seen.end()) {
+            seen.push_back(ptr);
+            total += s->bytes();
         }
-        if (!dup) total += s->bytes();
     }
     return total;
 }

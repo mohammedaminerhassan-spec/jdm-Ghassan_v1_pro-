@@ -352,6 +352,16 @@ void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& pat
         GAI_CHECK(!fs::is_directory(p, pre_ec), "checkpoint path is a directory: " + path);
     }
     std::string tmp = path + ".tmp";
+    struct TmpGuard {
+        std::string path;
+        bool keep = false;
+        ~TmpGuard() {
+            if (!keep && !path.empty()) {
+                std::error_code ec;
+                fs::remove(path, ec);
+            }
+        }
+    } guard{tmp, false};
     {
         std::ofstream f(tmp, std::ios::binary);
         GAI_CHECK(f.good(), "cannot write checkpoint: " + tmp);
@@ -405,6 +415,7 @@ void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& pat
         f.flush();
     }
     publish_file(path, tmp);
+    guard.keep = true;
 }
 
 static bool read_moe_bias(std::istream& f, Model& model, bool present) {
