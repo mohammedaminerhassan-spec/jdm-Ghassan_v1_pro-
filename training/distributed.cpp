@@ -14,6 +14,7 @@
 #ifdef GAI_NCCL
 #include <nccl.h>
 #include <cuda_runtime.h>
+#include "cuda/cuda_utils.h"
 
 #define NCCL_CHECK(x) do { ncclResult_t _r = (x); if (_r != ncclSuccess) \
     GAI_FAIL(std::string("NCCL ") + #x + ": " + ncclGetErrorString(_r)); } while (0)
@@ -116,6 +117,11 @@ void DistributedContext::finalize() {
         cudaFree(barrier_dev_);
         barrier_dev_ = nullptr;
     }
+    if (coll_dev_) {
+        cudaFree(coll_dev_);
+        coll_dev_ = nullptr;
+        coll_dev_bytes_ = 0;
+    }
     if (stream_) {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
@@ -132,6 +138,21 @@ void DistributedContext::finalize() {
     log_info("[dist] Finalized");
 }
 
+#ifdef GAI_NCCL
+void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_back) {
+    *copy_back = false;
+    if (cuda::is_device_memory(p)) return p;
+    if (!coll_dev_ || coll_dev_bytes_ < nbytes) {
+        if (coll_dev_) CU_RT_CHECK(cudaFree(coll_dev_));
+        coll_dev_bytes_ = nbytes < 256 ? 256 : nbytes;
+        CU_RT_CHECK(cudaMalloc(&coll_dev_, coll_dev_bytes_));
+    }
+    CU_RT_CHECK(cudaMemcpy(coll_dev_, p, nbytes, cudaMemcpyHostToDevice));
+    *copy_back = true;
+    return coll_dev_;
+}
+#endif // GAI_NCCL
+
 void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
     all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
 }
@@ -140,8 +161,11 @@ void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    NCCL_CHECK(ncclAllReduce(buffer, buffer, numel, ncclInt64, ncclSum, comm_, stream_));
+    bool back = false;
+    void* dev = collective_staging(buffer, numel * sizeof(int64_t), &back);
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, ncclInt64, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, numel * sizeof(int64_t), cudaMemcpyDeviceToHost));
     ops::perf_note_sync();
 #else
     (void)buffer; (void)numel;
@@ -158,8 +182,12 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     else if (dtype_size == 8) nccl_dtype = ncclFloat64;
     else if (dtype_size == 1) nccl_dtype = ncclInt8;
 
-    NCCL_CHECK(ncclAllReduce(buffer, buffer, numel, nccl_dtype, ncclSum, comm_, stream_));
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
     ops::perf_note_sync();
 #else
     (void)buffer; (void)numel; (void)dtype_size;
@@ -176,8 +204,15 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     else if (dtype_size == 8) nccl_dtype = ncclFloat64;
     else if (dtype_size == 1) nccl_dtype = ncclInt8;
 
-    NCCL_CHECK(ncclBroadcast(buffer, buffer, numel, nccl_dtype, root, comm_, stream_));
+    // Host buffers (e.g. the F-01 "is_best" i64 pair) MUST be staged on the
+    // device: ncclBroadcast on a host pointer aborts with an illegal memory
+    // access and kills every rank at the first new-best step.
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
     ops::perf_note_sync();
 #else
     (void)buffer; (void)numel; (void)dtype_size; (void)root;
