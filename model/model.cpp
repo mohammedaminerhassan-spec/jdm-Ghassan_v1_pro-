@@ -887,14 +887,13 @@ void Model::enable_grad(bool on) {
 }
 
 void Model::zero_grad() {
-    // PERF (audit #8): one memset per tensor, serial. Tensors are disjoint —
-    // clear them concurrently. (Full bucketing stays future work.)
-    // PRO-HARDEN (MSVC C3016): size_t مرفوض كمتغير OpenMP على Windows.
-#ifdef GAI_OPENMP
-#pragma omp parallel for schedule(dynamic, 4) if(params_.size() > (size_t)8)
-#endif
-    for (long long i = 0; i < static_cast<long long>(params_.size()); ++i)
-        if (params_[static_cast<size_t>(i)]->g.defined()) params_[static_cast<size_t>(i)]->g.zero_();
+    // Serial on purpose: a gai::Error thrown inside an OpenMP parallel region
+    // is undefined behaviour (it escapes the region and calls std::terminate,
+    // which is exactly how the first T4 DDP crash hid its own message). The
+    // memsets are async-free device calls, so serial costs microseconds while
+    // the per-tensor context and fail-fast behaviour are worth far more.
+    for (Parameter* p : params_)
+        if (p->g.defined()) p->g.zero_();
 }
 
 // ---------------------------------------------------------------- activations

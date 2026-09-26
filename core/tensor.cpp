@@ -116,7 +116,15 @@ void Tensor::zero_() {
     // External views are read-only by contract (mmap pages are PAGE_READONLY).
     // Faulting here would be a SIGSEGV; fail fast with file:line instead.
     GAI_CHECK(!is_external(), "zero_ on read-only external view (mmap weight?)");
-    device_memset_zero(data_ptr(), nbytes(), device_);
+    // Name the tensor in any device failure: a bare "cudaMemset: invalid
+    // argument" is unactionable (which of the 20+ buffers? which device?).
+    try {
+        device_memset_zero(data_ptr(), nbytes(), device_);
+    } catch (const std::exception& e) {
+        throw Error(std::string(e.what()) + " | tensor='" + (name_.empty() ? "<unnamed>" : name_) +
+                    "' shape=" + shape_str() + " dev=" + device_name(device_) +
+                    " bytes=" + std::to_string(nbytes()));
+    }
 }
 
 void Tensor::copy_from(const Tensor& src) {

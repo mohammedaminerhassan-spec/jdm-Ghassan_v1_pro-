@@ -139,6 +139,18 @@ void device_memset_zero(void* ptr, size_t nbytes, Device dev) {
     if (!ptr || nbytes == 0) return;
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
+        // A memset on memory that is not device-resident returns the useless
+        // "invalid argument". Verify the pointer first so the failure names the
+        // real cause (host pointer, or already-freed device memory).
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess ||
+            attr.type != cudaMemoryTypeDevice) {
+            cudaGetLastError();
+            GAI_FAIL("device_memset_zero: pointer is not device memory (ptr=" +
+                     std::to_string(reinterpret_cast<uintptr_t>(ptr)) +
+                     ", nbytes=" + std::to_string(nbytes) +
+                     ", storage registered as cpu)");
+        }
         cuda::memset_zero(ptr, nbytes);
 #else
         GAI_FAIL("device_memset_zero: CUDA pointer in a CPU-only build (noop hidden)");
