@@ -326,7 +326,17 @@ static void publish_file(const std::string& path, const std::string& tmp) {
         if (fs::exists(backup, restore_ec) && !restore_ec) fs::rename(backup, target, restore_ec);
         GAI_CHECK(false, "cannot finalise checkpoint: " + reason);
     }
-    if (ec) log_warn("checkpoint backup cleanup failed: " + ec.message());
+
+    // Successful publish has installed a complete new target. The backup is
+    // only a crash-recovery staging file during the rename window; retaining it
+    // after a successful save would permanently double checkpoint disk usage
+    // and can exhaust Kaggle's saved-output quota on long runs.
+    std::error_code cleanup_ec;
+    if (fs::exists(backup, cleanup_ec) && !cleanup_ec) {
+        fs::remove(backup, cleanup_ec);
+        if (cleanup_ec)
+            log_warn("checkpoint backup cleanup failed: " + cleanup_ec.message());
+    }
 }
 
 size_t unique_snapshot_bytes(const std::vector<std::shared_ptr<CheckpointSnapshot>>& refs) {
