@@ -5,6 +5,14 @@
 #include <cstring>
 #include <cstdint>
 #include <new>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/statvfs.h>
+#include <unistd.h>
+#endif
 
 #ifdef GAI_CUDA
 #include "cuda/cuda_utils.h"
@@ -13,6 +21,50 @@
 namespace gai {
 
 bool is_gpu(Device d) { return d == Device::CUDA; }
+
+// ---------------------------------------------------------------- host
+size_t physical_ram_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) return static_cast<size_t>(st.ullTotalPhys);
+    return 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page  = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page <= 0) return 0;
+    return static_cast<size_t>(pages) * static_cast<size_t>(page);
+#endif
+}
+
+size_t free_disk_bytes(const std::string& path) {
+    // Walk up to the nearest existing ancestor: the checkpoint dir is created
+    // on the FIRST save, so probing the configured path verbatim answers 0 on
+    // Windows and would silently skip the pre-flight exactly when a fresh run
+    // needs it. (Linux statvfs needs the same walk.)
+    std::string p = path;
+    for (int depth = 0; depth < 8; ++depth) {
+#ifdef _WIN32
+        const DWORD attr = GetFileAttributesA(p.c_str());
+        const bool exists = (attr != INVALID_FILE_ATTRIBUTES);
+        if (exists && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return 0;  // a file: no volume
+        if (exists) {
+            ULARGE_INTEGER avail{};
+            if (GetDiskFreeSpaceExA(p.c_str(), &avail, nullptr, nullptr))
+                return static_cast<size_t>(avail.QuadPart);
+            return 0;
+        }
+#else
+        struct statvfs vfs {};
+        if (::statvfs(p.c_str(), &vfs) == 0)
+            return static_cast<size_t>(vfs.f_bavail) * static_cast<size_t>(vfs.f_frsize);
+#endif
+        const size_t slash = p.find_last_of("/\\");
+        if (slash == std::string::npos) break;
+        p = (slash == 0) ? "/" : p.substr(0, slash);
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------- info
 // Portable backends: CPU (OpenMP, everywhere: Windows/Linux/macOS) +

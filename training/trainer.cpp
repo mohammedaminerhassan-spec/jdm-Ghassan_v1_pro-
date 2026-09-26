@@ -2,6 +2,7 @@
 #include "core/ops.h"
 #include "core/device.h"
 #include "core/common.h"
+#include "core/signals.h"
 #ifdef GAI_CUDA
 #include <cuda_runtime.h>
 #include "cuda/cuda_ops.h"
@@ -680,6 +681,67 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         }
     }
 
+    // ---- host RAM + disk pre-flight -------------------------------------
+    // The GPU guard above used to be the only memory check, which left the two
+    // ways a multi-hour Kaggle run actually dies un-guarded:
+    //   * host OOM  — the writer queues ~12 bytes/param of host snapshots;
+    //   * ENOSPC    — a save needs the previous file AND a same-size .tmp.
+    // Both are knowable BEFORE the first step, so fail here instead of at hour
+    // 6 with the run half done.
+    {
+        const u64 params = static_cast<u64>(model_.num_parameters());
+        // weights fp32 + grads fp32 + adamw m/v (lion: m only). Matches the
+        // measured 12.0002 bytes/param of a real checkpoint.
+        const size_t per_snapshot = static_cast<size_t>(params) * 8 + opt_state_bytes();
+
+        const size_t ram = physical_ram_bytes();
+        const size_t ram_budget = ckpt_ram_budget();
+        if (ram > 0) {
+            log_info(strfmt("[mem ] host RAM %s total, checkpoint queue budget %s (%.0f%%), one snapshot %s",
+                            human_bytes(ram).c_str(), human_bytes(ram_budget).c_str(),
+                            100.0 * static_cast<double>(ram_budget) / static_cast<double>(ram),
+                            human_bytes(per_snapshot).c_str()));
+            // The writer holds one snapshot and the trainer retains one, so the
+            // process needs ~2 of them plus the runtime's own footprint.
+            const size_t need = per_snapshot * 2 + (512ull << 20);
+            if (ram < need) {
+                GAI_FAIL(strfmt("host RAM guard: this run needs ~%s (two %s checkpoint "
+                                "snapshots + 512 MB) but the machine has only %s. "
+                                "Reduce the model, or free RAM; training here would be "
+                                "OOM-killed mid-save.",
+                                human_bytes(need).c_str(), human_bytes(per_snapshot).c_str(),
+                                human_bytes(ram).c_str()));
+            }
+        }
+
+        const size_t free_disk = free_disk_bytes(cfg_.checkpoint_dir);
+        if (free_disk > 0) {
+            // A save writes <name>.tmp and then renames it over <name> (rename
+            // does not copy, and a replaced file is staged as .bak on the same
+            // inode), so the transient peak is: every checkpoint already
+            // published + one more being written. Count what is really there.
+            size_t published = 0;
+            for (const char* n : {"best.ckpt", "last.ckpt"})
+                if (fs::exists(fs::path(cfg_.checkpoint_dir) / n)) ++published;
+            const size_t need_disk = per_snapshot * (published + 1) + per_snapshot / 4;
+            log_info(strfmt("[disk] %s free at %s (%zu checkpoint(s) published); "
+                            "a save transiently needs ~%s",
+                            human_bytes(free_disk).c_str(), cfg_.checkpoint_dir.c_str(),
+                            published, human_bytes(need_disk).c_str()));
+            if (free_disk < need_disk) {
+                GAI_FAIL(strfmt("disk guard: %s free at %s but a checkpoint save needs "
+                                "~%s (%zu published + one .tmp + 25%% margin). Free space "
+                                "or point --checkpoint-dir at a bigger volume; ENOSPC at "
+                                "hour 6 would lose the run.",
+                                human_bytes(free_disk).c_str(), cfg_.checkpoint_dir.c_str(),
+                                human_bytes(need_disk).c_str(), published));
+            }
+        } else {
+            log_warn("[disk] could not stat free space for " + cfg_.checkpoint_dir +
+                     " — cannot pre-flight the checkpoint budget");
+        }
+    }
+
     // ---- resume
     std::string resume_path;
     if (cfg_.resume == "auto")      resume_path = Checkpoint::latest_in(cfg_.checkpoint_dir);
@@ -1085,6 +1147,10 @@ void Trainer::save(const std::string& name) {
 i64 Trainer::planned_total() const { return total_steps_; }
 
 void Trainer::run() {
+    // A Kaggle session ends at its wall clock and the process dies wherever it
+    // is. From here on, SIGINT/SIGTERM only raise a flag: the loops break at the
+    // next step boundary and save, instead of losing up to save_every steps.
+    signals::install_stop_handlers();
     // DeepSeek DDP budgeting: global consumption = per-rank * world_size.
     // Old code planned steps from per-rank throughput, so 4xGPU ran 4x too
     // many steps with a 4x-stretched scheduler. Resolve ws once here.
@@ -1116,6 +1182,28 @@ void Trainer::run() {
                         human_count(static_cast<u64>(cfg_.tokens_per_step_global(world_sz))).c_str(),
                         world_sz));
     }
+    // ---- multi-session continuation: NEVER shrink a planned schedule ----
+    // A budgeted session (train_1b.sh --time-budget-min) recomputes
+    // max_steps from the time it has LEFT, so the second session always plans
+    // FEWER total steps than the first. Accepting that silently reshapes the LR
+    // curve of steps that already ran: the WSD decay no longer lands on its
+    // 10% floor, so the run ends hot and consolidates worse. When a
+    // checkpoint records a longer plan, that plan is the run's identity —
+    // keep it and report honestly that this session will not reach it.
+    if (state_.sched_total > 0 && state_.sched_total > total_steps_) {
+        log_warn(strfmt("[sched] continuation: checkpoint planned %lld steps, this session "
+                        "budgeted %lld — KEEPING the original %lld-step plan so the LR curve "
+                        "of the steps already run stays valid. This session simply stops "
+                        "early; resume again to continue.",
+                        (long long)state_.sched_total, (long long)total_steps_,
+                        (long long)state_.sched_total));
+        total_steps_ = state_.sched_total;
+        if (!(cfg_.warmup_steps < total_steps_)) {
+            log_warn(strfmt("[sched] warmup %lld >= kept total %lld: clamping to total/10",
+                            (long long)cfg_.warmup_steps, (long long)total_steps_));
+            cfg_.warmup_steps = std::max<i64>(1, total_steps_ / 10);
+        }
+    }
     // DeepSeek schedule guard: warmup >= total pins the entire run in the
     // warmup branch (<2% peak) and decay_frac<=0 disables decay silently.
     GAI_CHECK(cfg_.warmup_steps >= 0 && cfg_.warmup_steps < total_steps_,
@@ -1143,8 +1231,7 @@ void Trainer::run() {
                         "(max_steps/epochs/data changed) — past LR curve reshaped; "
                         "keep the original schedule to stay bit-consistent",
                         (long long)state_.sched_total, (long long)total_steps_));
-    }
-    if (state_.sched_warmup > 0 && state_.sched_warmup != cfg_.warmup_steps) {
+    }    if (state_.sched_warmup > 0 && state_.sched_warmup != cfg_.warmup_steps) {
         log_warn(strfmt("[sched] RESUME MISMATCH: checkpoint warmup %lld but now %lld",
                         (long long)state_.sched_warmup, (long long)cfg_.warmup_steps));
     }
@@ -1321,20 +1408,31 @@ void Trainer::run_pretrain() {
         // F-07: a dead checkpoint disk must stop the run at a save boundary,
         // not thousands of steps later.
         check_ckpt_health();
+        check_stop_requested();
         // Release the retained snapshot once every save for this step is
         // queued: a queued job owns its own shared_ptr, so the multi-GB CPU
         // clone does not outlive the step (matches the SFT loop; without this
         // pretrain held a full extra snapshot for the whole run).
         if (main) snapshot_cache_.reset();
+        if (stopped_by_signal_) break;
     }
 
     // Phase 1C: stop prefetch thread before final save.
     stop_prefetch();
-    // FIX P1-6: skip the unconditional final save when the loop just saved
-    // (worst case was a double ~8-12GB write on the same step: best.ckpt
-    // inside eval + last.ckpt on cadence + last.ckpt here).
-    if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
+    if (stopped_by_signal_) {
+        // A session wall-clock kill used to discard up to save_every completed
+        // steps, silently, every session. Save the work we actually have.
+        log_warn(strfmt("[stop] %s received at step %lld/%lld: saving last.ckpt and exiting "
+                        "cleanly (--resume auto continues from here)",
+                        signals::stop_reason(), static_cast<long long>(state_.step),
+                        static_cast<long long>(total_steps_)));
         save("last.ckpt");
+    } else if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0)) {
+        // FIX P1-6: skip the unconditional final save when the loop just saved
+        // (worst case was a double ~8-12GB write on the same step: best.ckpt
+        // inside eval + last.ckpt on cadence + last.ckpt here).
+        save("last.ckpt");
+    }
     // Phase 1D: drain the async writer before printing the done line.
     wait_for_save();
     stop_ckpt_writer();
@@ -1467,16 +1565,25 @@ void Trainer::run_sft() {
             save("last.ckpt");
         }
         check_ckpt_health();   // F-07
+        check_stop_requested();
 
         // Release snapshot memory after all saves for this step are queued.
         if (main) snapshot_cache_.reset();
+        if (stopped_by_signal_) break;
     }
 
     // Phase 1C: stop prefetch thread before final save.
     stop_prefetch();
-    // FIX P1-6 (SFT mirror): skip redundant final save (see pretrain loop).
-    if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0))
+    if (stopped_by_signal_) {
+        log_warn(strfmt("[stop] %s received at step %lld/%lld: saving last.ckpt and exiting "
+                        "cleanly (--resume auto continues from here)",
+                        signals::stop_reason(), static_cast<long long>(state_.step),
+                        static_cast<long long>(total_steps_)));
         save("last.ckpt");
+    } else if (!(cfg_.save_every > 0 && state_.step % cfg_.save_every == 0)) {
+        // FIX P1-6 (SFT mirror): skip redundant final save (see pretrain loop).
+        save("last.ckpt");
+    }
     // Phase 1D: drain async writer.
     wait_for_save();
     stop_ckpt_writer();
@@ -1738,6 +1845,11 @@ bool Trainer::sync_eval_best(bool is_main, bool is_best) {
     return agreed_is_best;
 }
 
+void Trainer::check_stop_requested() {
+    if (stopped_by_signal_ || !signals::stop_requested) return;
+    stopped_by_signal_ = true;
+}
+
 void Trainer::check_ckpt_health() {
     // F-07: a fatal background-write error used to stay invisible until the
     // final drain, so a full disk could burn hours of T4 time. Checked at every
@@ -1899,6 +2011,24 @@ void Trainer::save_async(const std::string& path, std::shared_ptr<CheckpointSnap
     const size_t single = snapshot->bytes();
 
     std::unique_lock<std::mutex> lk(ckpt_mutex_);
+    // A budget smaller than TWO snapshots can never be satisfied: the writer
+    // holds one while the next is queued, so the backpressure loop below would
+    // spin forever instead of OOMing. Refuse up front, with the numbers.
+    {
+        const size_t budget = ckpt_ram_budget();
+        const size_t need_two = snapshot->bytes() * 2;
+        if (need_two > budget) {
+            const size_t phys = physical_ram_bytes();
+            GAI_FAIL(strfmt("host RAM cannot checkpoint this model: one snapshot is %s, "
+                            "so two live copies need %s, but the queue budget is %s "
+                            "(machine has %s). Backpressure would never clear. Use a "
+                            "smaller model/optimizer, or free host RAM.",
+                            human_bytes(snapshot->bytes()).c_str(),
+                            human_bytes(need_two).c_str(),
+                            human_bytes(budget).c_str(),
+                            phys ? human_bytes(phys).c_str() : "unknown"));
+        }
+    }
     // Explicit backpressure: a full queue means the disk cannot keep up. Wait
     // for the writer to drain instead of aborting the run — but never wait on
     // a writer that already failed or stopped.
@@ -1916,17 +2046,19 @@ void Trainer::save_async(const std::string& path, std::shared_ptr<CheckpointSnap
         if (snapshot_cache_) refs.push_back(snapshot_cache_);
         for (const auto& qs : pending_saves_) refs.push_back(qs.snapshot);
         const size_t live = unique_snapshot_bytes(refs);
+        const size_t budget = ckpt_ram_budget();
 
-        if (live <= kCkptRamBudgetBytes || ckpt_failed_ || ckpt_stop_) {
-            if (live > kCkptRamBudgetBytes) {
+        if (live <= budget || ckpt_failed_ || ckpt_stop_) {
+            if (live > budget) {
                 GAI_FAIL("checkpoint backlog exceeds the host-RAM budget and the writer "
                          "cannot drain (see ckpt_error_)");
             }
             break;
         }
         if (spins == 0)
-            log_warn(strfmt("[ckpt] host-RAM budget reached (%.0f MB live): applying backpressure",
-                            static_cast<double>(live) / (1024.0 * 1024.0)));
+            log_warn(strfmt("[ckpt] host-RAM budget reached (%.0f MB live of %.0f MB): applying backpressure",
+                            static_cast<double>(live) / (1024.0 * 1024.0),
+                            static_cast<double>(budget) / (1024.0 * 1024.0)));
         ckpt_cv_.wait_for(lk, std::chrono::milliseconds(50));
     }
 

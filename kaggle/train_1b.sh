@@ -26,7 +26,19 @@ MODE="full"
 #   bash kaggle/train_1b.sh --time-budget-min 420 --export-profile q4_0 --pt-fraction 70
 CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/en_pro.yaml}"
 CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_en_pro.yaml}"
-TIME_BUDGET_MIN=540
+# A Kaggle session is 12h wall clock, and the notebook spends a few minutes on
+# the clone/build before this script even starts. 540 min was the old default
+# and it planned a budget the session could not honour, so the run was killed
+# mid-stage. Keep a real margin below the limit.
+SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-700}"   # 12h = 720 min
+DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))     # 640 min: -60 for setup/teardown
+TIME_BUDGET_MIN="${TIME_BUDGET_MIN:-$DEFAULT_BUDGET}"
+[[ "${TIME_BUDGET_MIN}" -gt "$(( SESSION_LIMIT_MIN - 20 ))" ]] && {
+    echo "[ERROR] --time-budget-min ${TIME_BUDGET_MIN} exceeds the ${SESSION_LIMIT_MIN} min session limit."
+    echo "        Budget from the session length, not from ambition."
+    exit 1
+}
+export GAI_AI_GGUF=1
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
 PILOT_STEPS=20
@@ -229,6 +241,15 @@ EVAL_CAD=$(( TOTAL_STEPS / 10 )); [[ "${EVAL_CAD}" -lt 50 ]] && EVAL_CAD=50
 echo "[plan] budget=${TIME_BUDGET_MIN}min remain~=${REMAIN_SEC}s"
 echo "[plan] total_steps=${TOTAL_STEPS} (pretrain=${PT_STEPS}, sft=${SFT_STEPS})"
 echo "[plan] ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens this session"
+# HONESTY: the trainer now KEEPS a longer plan recorded in the checkpoint
+# (multi-session continuation), so a shrinking budget on the next session will
+# not silently reshape the LR curve. Say so here, or the log looks like the
+# trainer ignored --max-steps.
+LAST_PT_CKPT="${CKPT_PT}/last.ckpt"
+if [[ -f "${LAST_PT_CKPT}" ]]; then
+    echo "[plan] ${LAST_PT_CKPT} exists: this is a CONTINUATION. The trainer keeps that"
+    echo "       run's original step plan, so --max-steps below only bounds THIS session."
+fi
 
 echo ""
 echo "[stage-A] Pretraining Pro (${PT_STEPS} steps)..."

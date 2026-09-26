@@ -27,6 +27,17 @@ void              print_device_report();
 bool              cuda_available();
 Device            best_device();          // T4-ONLY: CUDA > CPU
 
+// ---- host resources (asked for by name, never guessed) ------------------
+// physical_ram_bytes(): total installed RAM, 0 if unknown. Budgets derived
+// from a hardcoded constant are a lie on a smaller box: the checkpoint writer
+// happily queued 32 GB of snapshots on a 30 GB Kaggle session and the OOM
+// killer won the race.
+// free_disk_bytes(path): free space on the filesystem holding `path` (0 if
+// unknown). A checkpoint save needs the previous file AND a .tmp of the same
+// size, so the transient peak is ~2x one checkpoint.
+size_t physical_ram_bytes();
+size_t free_disk_bytes(const std::string& path);
+
 void* device_alloc(size_t nbytes, Device dev, DType dt = DType::F32);
 void  device_free(void* ptr, Device dev);
 void  device_memset_zero(void* ptr, size_t nbytes, Device dev);

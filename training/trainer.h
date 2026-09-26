@@ -237,8 +237,7 @@ private:
 
     // ---- distributed training ----
     std::unique_ptr<DistributedContext> dist_;
-    void init_distributed();
-    void sync_gradients();  // fused bucketed all-reduce SUM (token-weighted; no /world_size)
+    void init_distributed();    void sync_gradients();  // fused bucketed all-reduce SUM (token-weighted; no /world_size)
     void sync_model();      // broadcast model from rank 0 (for initialization/resume)
     i64 sync_ntok_sum(i64 local); // exact global supervised count (sum over ranks)
     // F-11: aux-free router bias is optimizer-step-coupled control state, so it
@@ -261,6 +260,10 @@ private:
     // training boundary instead of letting thousands of steps burn GPU hours
     // on an unusable disk.
     void check_ckpt_health();
+    // SIGINT/SIGTERM asked us to stop: set the flag, and the loops break out at
+    // the next step boundary (never mid-step) so the final save is clean.
+    void check_stop_requested();
+    bool stopped_by_signal_ = false;
     // Persistent fused DDP staging (grows monotonically, never per-step alloc).
     Tensor dist_fused_;
     Tensor dist_ntok_; // persistent 1-i64 device buffer for ntok sync (no per-step alloc)
@@ -272,10 +275,28 @@ private:
     // immediately; wait_for_save() drains before run() exits, and a new save
     // for the same destination supersedes the queued one.
     //
-    // F-05: kCkptRamBudgetBytes bounds every LIVE snapshot reference (queued +
+    // F-05: ckpt_ram_budget() bounds every LIVE snapshot reference (queued +
     // in-flight + retained cache). Exceeding it applies backpressure to the
     // training thread rather than aborting the run.
-    static constexpr size_t kCkptRamBudgetBytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    //
+    // It was a hardcoded 32 GB, which is a LIE on a 30 GB Kaggle session: the
+    // queue happily accepted 5 snapshots (5.76 GB each for the 480M flagship)
+    // and the OOM killer won the race against the backpressure. Derived from
+    // the real machine now: a fraction of physical RAM, never above the old
+    // cap, and never below enough for one 480M snapshot to make progress.
+    static size_t ckpt_ram_budget() {
+        static const size_t kBudget = [] {
+            const size_t kCap = 32ULL << 30;                 // historical ceiling
+            const size_t kFloor = 8ULL << 30;                // >= one 480M snapshot
+            const size_t phys = physical_ram_bytes();
+            if (phys == 0) return kCap;                      // unknown: keep old behaviour
+            const size_t share = static_cast<size_t>((static_cast<double>(phys) * 0.35));
+            size_t b = share < kCap ? share : kCap;
+            if (b < kFloor) b = (kFloor < phys) ? kFloor : phys;
+            return b;
+        }();
+        return kBudget;
+    }
     std::thread            ckpt_writer_thread_;
     std::mutex             ckpt_mutex_;
     std::condition_variable ckpt_cv_;
