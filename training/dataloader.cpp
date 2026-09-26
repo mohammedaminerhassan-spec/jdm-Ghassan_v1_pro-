@@ -569,6 +569,16 @@ bool DataLoader::next(Batch& out) {
 
     out.B = B;
     out.T = T;
+    // PERF: reserve once so the prefetch slot reuse doesn't realloc 3xB*T
+    // ints every micro (384 small allocs/step at grad_accum=128). assign()
+    // reuses capacity when already sized; after std::move the slot is empty,
+    // so keep capacity via reserve on first fill.
+    const size_t need = static_cast<size_t>(B) * static_cast<size_t>(T);
+    if (out.ids.capacity() < need) {
+        out.ids.reserve(need);
+        out.targets.reserve(need);
+        out.segment_ids.reserve(need);
+    }
     out.ids.assign(static_cast<size_t>(B) * T, 0);
     out.targets.assign(static_cast<size_t>(B) * T, -100);
     out.segment_ids.assign(static_cast<size_t>(B) * T, -1);

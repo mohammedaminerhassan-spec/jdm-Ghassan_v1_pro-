@@ -34,7 +34,9 @@ CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4}"
 CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4_sft}"
 GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-2xt4_q4_0.gguf}"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
-OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-19456}"
+# Kaggle /kaggle/working cap is 20GB (build+data+train). Keep total <=17GB
+# (17408MB) so checkpoints (hardlinked best+last) + GGUF Q4 + shards fit.
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-17408}"
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
 PILOT_STEPS=20
@@ -97,8 +99,16 @@ export NCCL_SOCKET_IFNAME=^docker0,lo
 export NCCL_IB_DISABLE=1
 export MASTER_ADDR=${MASTER_ADDR:-localhost}
 export MASTER_PORT=${MASTER_PORT:-29500}
+# Concurrent sessions on one host: override MASTER_PORT per run
+# (e.g. MASTER_PORT=29501 bash kaggle/train_2xt4.sh) and optionally
+# GAI_NCCL_ID_FILE=/tmp/gai_nccl_custom.id to avoid rendezvous collision.
 export WORLD_SIZE=2
 rm -f "/tmp/gai_nccl_${MASTER_PORT}.id"
+# Also honor a custom rendezvous file if provided.
+if [[ -n "${GAI_NCCL_ID_FILE:-}" ]]; then
+    rm -f "${GAI_NCCL_ID_FILE}"
+    echo "[nccl] custom rendezvous file: ${GAI_NCCL_ID_FILE}"
+fi
 unset CUDA_VISIBLE_DEVICES
 echo "[nccl] WORLD_SIZE=2 MASTER=${MASTER_ADDR}:${MASTER_PORT} (all GPUs visible, rank picks via LOCAL_RANK)"
 
@@ -159,10 +169,11 @@ EOF
     "${PIPE_BIN}" inspect --shards "${PT_DIR}" --tokenizer "${TOK}" || return 1
     # VRAM plan per-GPU (arithmetic) + hard gate 15GiB (16GB minus headroom).
     # --strict-config: unknown/dead keys fail here, never mid-run.
-    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config || return 1
-    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config || return 1
-    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 || { echo "[preflight FAIL] PT recipe exceeds 15GiB per-GPU"; return 1; }
-    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 || { echo "[preflight FAIL] SFT recipe exceeds 15GiB per-GPU"; return 1; }
+    # Forward the output quota so the preflight gate matches the live guard.
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] PT recipe exceeds 15GiB per-GPU"; return 1; }
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] SFT recipe exceeds 15GiB per-GPU"; return 1; }
     echo "[preflight] VRAM per-GPU OK (<=15GiB, preserves B/T envelope)"
     echo "==================== preflight: ALL GATES PASSED ===================="
     return 0
@@ -200,12 +211,12 @@ P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START )); [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
 # Global tokens/step INCLUDES world_size (DDP contract, tested in code).
 B=$(yget batch_size "${CONFIG_PT}"); T=$(yget seq_len "${CONFIG_PT}"); A=$(yget grad_accum "${CONFIG_PT}")
-GLOBAL_TPS=$(( B * T * A * 2 ))
-P_TPS=$(( GLOBAL_TPS * PILOT_STEPS / P_ELAPSED ))
+TOK_PER_STEP_GLOBAL=$(( B * T * A * 2 ))
+P_TPS=$(( TOK_PER_STEP_GLOBAL * PILOT_STEPS / P_ELAPSED ))
 echo "[pilot] ${PILOT_STEPS} steps in ${P_ELAPSED}s -> ~${P_TPS} GLOBAL tok/s (per-GPU B=${B} T=${T} accum=${A} x2 ranks)"
 if [[ "${MODE}" == "pilot" ]]; then echo "[pilot] Done."; exit 0; fi
 
-FULL_TPS=${GLOBAL_TPS}
+FULL_TPS=${TOK_PER_STEP_GLOBAL}
 BUDGET_SEC=$(( TIME_BUDGET_MIN * 60 ))
 USED_SEC=$(($(date +%s) - P_START))
 REMAIN_SEC=$(( BUDGET_SEC - USED_SEC - EXPORT_MARGIN_SEC ))

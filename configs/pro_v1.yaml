@@ -1,11 +1,14 @@
 # Ghassan v1 Pro 1B — FLAGSHIP English pretrain for maximum strength (single-T4).
-# Maximum-strength variant of the Pro family: ~1.016B total / ~336M active.
-#   36 layers, 12 heads, 4 KV heads (GQA), 10 experts top-2 + shared, QK-Norm.
+# Unified 1B architecture: ~1.04B total / ~612M active.
+#   36 layers, 12 heads, 4 KV heads (GQA), 8 experts top-4 + shared, QK-Norm.
+#   E=1280 (20x64, tensor-core aligned), K=4 dense-MoE for strong dialogue.
 # Use en_pro.yaml (480M) when you want the fastest responses; use this file
 # when you want the strongest English understanding on one T4.
-# T4 fit: 1B fp32 = 4.06GB weights + 4.06GB grads + Lion 4.06GB = ~12.2GB,
+# T4 fit: 1B fp32 = 4.15GB weights + 4.15GB grads + Lion 4.15GB = ~12.4GB,
 # so optimizer MUST stay lion, batch_size=1, seq_len=512, grad_accum=128
 # (65,536 tokens/step). 32k English tokenizer is MANDATORY.
+# Output budget: Kaggle /kaggle/working is 20GB; keep total <=17GB
+# (checkpoints hardlink best+last ~7.9GB + GGUF Q4 ~0.6GB + shards).
 #
 # DATA (Parquet-only, English Hermes lake — Kaggle):
 #   Tokenizer/shards are shared with en_pro: build them once with
@@ -42,9 +45,9 @@ model:
   tie_embeddings: true
   init_std: 0.02
   use_moe: true
-  num_experts: 10
-  moe_top_k: 2
-  moe_expert_dim: 1024
+  num_experts: 8
+  moe_top_k: 4
+  moe_expert_dim: 1280
   moe_shared: true
   moe_aux_scale: 0.01      # classic aux loss (aux-free=false)
   moe_aux_free: false       # Pro: true = no aux grad (requires aux_scale 0.0)
@@ -67,6 +70,8 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true
+  fp16_weight_cache: false
+  ce_chunks: 4
   loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
   loss_scale_window: 2000
   batch_size: 1
@@ -85,6 +90,9 @@ training:
   beta2: 0.99
   eps: 1.0e-8
   grad_clip: 1.0
+  ns_steps: 5
+  muon_min_ns_dim: 256
+  muon_vec_ratio: 0.1
   seed: 42
   log_every: 10
   eval_every: 250
@@ -96,6 +104,7 @@ training:
   activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
+  output_budget_mb: 17408
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin

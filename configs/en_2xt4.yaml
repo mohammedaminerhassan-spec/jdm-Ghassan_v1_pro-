@@ -47,6 +47,7 @@ training:
   precision: fp32
   gemm_fp16: true
   fp16_weight_cache: true
+  ce_chunks: 4           # pinned (was implicit default; saves ~393MB at B=2/T=1024)
   loss_scale_init: 8192
   loss_scale_window: 2000
   batch_size: 2
@@ -65,6 +66,9 @@ training:
   beta2: 0.95
   eps: 1.0e-8
   grad_clip: 1.0
+  ns_steps: 5
+  muon_min_ns_dim: 256
+  muon_vec_ratio: 0.1
   seed: 42
   log_every: 10
   eval_every: 500
@@ -77,6 +81,7 @@ training:
   ckpt_segments: 2
   pack_sequences: true
   ddp: true
+  output_budget_mb: 17408
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin

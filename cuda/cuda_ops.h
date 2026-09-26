@@ -183,6 +183,9 @@ void  free_workspace();
 void  moe_free_workspace();
 void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
 void  moe_reserve_workspace(size_t bytes);
+// Pool footprints for OOM diagnostics (monotonic by design).
+size_t pool_bytes();
+size_t moe_pool_bytes();
 
 } // namespace cuda_ops
 } // namespace gai

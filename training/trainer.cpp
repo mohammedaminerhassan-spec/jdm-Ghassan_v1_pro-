@@ -6,6 +6,7 @@
 #ifdef GAI_CUDA
 #include <cuda_runtime.h>
 #include "cuda/cuda_ops.h"
+#include "cuda/cuda_utils.h"
 #endif
 
 #include <cmath>
@@ -82,10 +83,13 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     // under --strict-config via the list below.
     t.muon_ns_steps   = static_cast<int>(c.get_int("training.ns_steps", t.muon_ns_steps));
     t.muon_min_ns_dim = static_cast<int>(c.get_int("training.muon_min_ns_dim", t.muon_min_ns_dim));
+    t.muon_vec_ratio  = c.get_f32("training.muon_vec_ratio", t.muon_vec_ratio);
     if (t.muon_ns_steps < 1 || t.muon_ns_steps > 10)
         GAI_FAIL("training.ns_steps must be in 1..10");
     if (t.muon_min_ns_dim < 0)
         GAI_FAIL("training.muon_min_ns_dim must be >= 0");
+    if (!(t.muon_vec_ratio > 0.0f && t.muon_vec_ratio <= 1.0f))
+        GAI_FAIL("training.muon_vec_ratio must be in (0,1]");
     // precision: fp32 (default), bf16, fp16
     std::string precision = c.get_str("training.precision", "fp32");
     if (precision == "bf16") t.param_dtype = DType::BF16;
@@ -105,6 +109,9 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     t.checkpoint_dir = c.get_str("training.checkpoint_dir", t.checkpoint_dir);
     t.resume         = c.get_str("training.resume", t.resume);
     t.seed           = static_cast<u64>(c.get_int("training.seed", static_cast<i64>(t.seed)));
+    // Kaggle output quota: allow YAML pin (CLI --output-budget-mb overrides).
+    // 20GB /kaggle/working cap -> keep total <=17GB (17408MB).
+    t.output_budget_mb = c.get_int("training.output_budget_mb", t.output_budget_mb);
     t.device         = c.get_str("training.device", t.device);
     t.stage          = c.get_str("training.stage", t.stage);
     if (t.stage != "pretrain" && t.stage != "sft" && t.stage != "cpt")
@@ -240,7 +247,8 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
             "training.warmup_steps", "training.optimizer", "training.scheduler",
             "training.sched_decay_frac", "training.weight_decay", "training.beta1",
              "training.beta2", "training.eps", "training.grad_clip",
-             "training.ns_steps", "training.muon_min_ns_dim",
+              "training.ns_steps", "training.muon_min_ns_dim",
+             "training.muon_vec_ratio", "training.output_budget_mb",
 
              "training.precision", "training.gemm_fp16", "training.fp16_weight_cache",
              "training.loss_scale_init",
@@ -302,6 +310,7 @@ static MuonConfig make_muon(const TrainerConfig& c) {
     // Muon takes learning_rate DIRECTLY (orthogonal updates are inherently
     // ~Adam-scaled; no 0.1x rule). Set 0.01-0.03 in the yaml for muon runs.
     m.lr           = c.learning_rate;
+    m.vec_lr_ratio = c.muon_vec_ratio;
     m.beta1        = c.beta1;
     m.beta2        = c.beta2;
     m.eps          = c.eps;
@@ -682,7 +691,15 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         // Note: with DDP, each GPU has its own full copy of weights/grads/opt state.
         size_t slack = (1024ull << 20); // 1GB: ctx + workspaces + frag (pools are tight now)
         if (dist_ && dist_->world_size() > 1) slack += (320ull << 20); // NCCL per-GPU
-        size_t need = need_core + slack;
+        // Account for NCCL staging scratch (tens of MB) explicitly so the
+        // 14.7GB 1B runs don't rely on slack alone.
+        size_t dist_extra = 0;
+        if (dist_ && dist_->world_size() > 1) {
+            // fused grad bucket grows to largest param; coll staging 256B min.
+            // Conservative 64MB covers both on 1B/Lion.
+            dist_extra = (64ull << 20);
+        }
+        size_t need = need_core + slack + dist_extra;
         const DeviceInfo& di = device_info();
         if (model_.device() == Device::CUDA && di.cuda_available && di.total_mem > 0) {
             double frac = (double)need / (double)di.total_mem;
@@ -700,6 +717,21 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             else if (frac > 0.85)
                 log_warn(strfmt("[mem ] over 85%% of GPU memory (core %.0f%%): watch nvidia-smi; reduce batch/seq_len if unstable",
                                 frac_core * 100.0));
+#ifdef GAI_CUDA
+            // LIVE check: arithmetic guards miss fragmentation + prior pools
+            // (g_ws/g_moe_ws) + CUDA ctx. Query actual free VRAM after
+            // reserve_workspaces and fail here instead of mid-run cudaMalloc.
+            {
+                size_t live_free = cuda::free_bytes_live();
+                if (live_free > 0 && need_core > live_free) {
+                    GAI_FAIL(strfmt("OOM guard (live): need core %s but only %s free live "
+                                    "(pools/fragmentation). Lower batch_size/seq_len or disable "
+                                    "fp16_weight_cache before training.",
+                                    human_bytes(need_core).c_str(),
+                                    human_bytes(live_free).c_str()));
+                }
+            }
+#endif
         } else {
             log_info(strfmt("[mem ] est total %s (weights+grads+opt+acts+slack)%s",
                             human_bytes(need).c_str(), dist_ ? " [DDP: per-GPU]" : ""));
@@ -2174,6 +2206,7 @@ void Trainer::start_prefetch() {
         prefetch_pause_ = false;
         prefetch_in_io_ = false;
         prefetch_running_ = true;
+        prefetch_error_ = nullptr;
     }
     prefetch_thread_ = std::thread([this]() {
         while (true) {
@@ -2188,10 +2221,13 @@ void Trainer::start_prefetch() {
             bool ok = false;
             try {
                 ok = train_loader_.next(prefetch_batch_);
-            } catch (const std::exception&) {
+            } catch (...) {
+                // Preserve the real error (was swallowed -> generic message).
                 std::lock_guard<std::mutex> fail_lock(prefetch_mutex_);
+                prefetch_error_ = std::current_exception();
                 prefetch_stop_ = true;
                 prefetch_ready_ = false;
+                prefetch_cv_.notify_all();
                 break;
             }
 
@@ -2252,6 +2288,11 @@ bool Trainer::next_train_batch(Batch& out) {
             return train_loader_.next(out);
         }
         prefetch_cv_.wait(lk, [this] { return prefetch_ready_ || prefetch_stop_; });
+        if (prefetch_error_) {
+            auto e = prefetch_error_;
+            lk.unlock();
+            std::rethrow_exception(e);
+        }
         if (!prefetch_ready_) GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
         out = std::move(prefetch_batch_);
         prefetch_ready_ = false;

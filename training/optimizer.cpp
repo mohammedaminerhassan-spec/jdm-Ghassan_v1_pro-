@@ -141,12 +141,15 @@ double AdamW::step(float lr, float grad_scale) {
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
         // Last breadcrumb before the kernel: on an illegal access this line is
         // the one that names the guilty parameter.
-        log_debug(strfmt("[opt] adamw '%s' numel=%lld w=%p g=%p m=%p v=%p",
-                         p->name.c_str(), static_cast<long long>(p->numel()),
-                         static_cast<const void*>(p->w.f32()),
-                         static_cast<const void*>(p->g.f32()),
-                         static_cast<const void*>(m_[static_cast<size_t>(i)].f32()),
-                         static_cast<const void*>(v_[static_cast<size_t>(i)].f32())));
+        // PERF: vsnprintf+alloc per param (~200/step) even when debug is off.
+        // Guard so the hot path pays nothing unless debug logging is enabled.
+        if (log_level() <= LogLevel::Debug)
+            log_debug(strfmt("[opt] adamw '%s' numel=%lld w=%p g=%p m=%p v=%p",
+                             p->name.c_str(), static_cast<long long>(p->numel()),
+                             static_cast<const void*>(p->w.f32()),
+                             static_cast<const void*>(p->g.f32()),
+                             static_cast<const void*>(m_[static_cast<size_t>(i)].f32()),
+                             static_cast<const void*>(v_[static_cast<size_t>(i)].f32())));
         ops::adamw_step(dev, p->w.f32(), p->g.f32(), m_[static_cast<size_t>(i)].f32(), v_[static_cast<size_t>(i)].f32(),
                         p->numel(), lr, cfg_.beta1, cfg_.beta2, cfg_.eps, wd,
                         bc1, bc2, effective_scale);
@@ -312,6 +315,11 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     if (!std::isfinite(frob) || frob < 1e-12) { note(); return; } // degenerate: keep copy
     ops::scale_inplace(dev, O, static_cast<float>(1.0 / frob), rc);
 
+    // PRECISION: Newton-Schulz needs fp32 (fp16 rounding stalls
+    // orthogonalization at 768x768: mnk~453M exceeds the fp16 threshold).
+    // Force fp32 for the 2 GEMMs/iter, then restore the previous threshold.
+    const i64 saved_thr = ops::gemm_fp16_mnk_threshold();
+    ops::set_gemm_fp16_mnk_threshold((i64)1 << 60);
     for (int it = 0; it < cfg_.ns_steps; ++it) {
         // A = X^T X [c,c], then T = X A [r,c].
         ops::gemm(dev, true, false, cols, cols, rows, 1.0f, O, cols, O, cols, 0.0f, A, cols);
@@ -322,6 +330,7 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
         ops::add_inplace(dev, O, T, rc);
         ++iters_done;
     }
+    ops::set_gemm_fp16_mnk_threshold(saved_thr);
     note();
 }
 

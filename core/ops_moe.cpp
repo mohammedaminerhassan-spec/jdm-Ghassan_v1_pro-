@@ -28,15 +28,16 @@ void set_moe_jitter_seed_cpu(u64 seed) {
 }
 }
 static inline float jitter_u_cpu(gai::i64 tt, int ee) {
+    // UNIFIED with cuda/moe.cu jitter_u (fmix64). Old CPU hash used
+    // %1000000 with different mixing -> CPU/GPU parity break when jitter>0.
     uint64_t seed = g_jitter_seed_cpu.load(std::memory_order_relaxed);
-    uint32_t h = static_cast<uint32_t>(static_cast<uint64_t>(tt) * 2654435761ULL) ^
-                 static_cast<uint32_t>(ee * 40503u + 1u) ^
-                 static_cast<uint32_t>(seed & 0xFFFFFFFFu) ^
-                 static_cast<uint32_t>((seed >> 32) * 2246822519ULL);
-    h ^= h >> 15;
-    h *= 2246822519u;
-    h ^= h >> 13;
-    return (static_cast<float>(h % 1000000u) / 1000000.0f) - 0.5f;
+    uint64_t h = static_cast<uint64_t>(tt) * 0x9E3779B97F4A7C15ULL;
+    h ^= static_cast<uint64_t>(ee) * 0xC2B2AE3D27D4EB4FULL;
+    h ^= (seed + 0x9E3779B97F4A7C15ULL);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (static_cast<float>((h >> 40) & 0xFFFFFF) / static_cast<float>(1 << 24)) - 0.5f;
 }
 
 #ifdef GAI_OPENMP

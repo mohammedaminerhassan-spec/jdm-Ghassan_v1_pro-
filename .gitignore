@@ -4,6 +4,7 @@
 # them (Testing/, bin/, *.ninja) must never pollute git status.
 build/
 build_test/
+build_cpu/
 out/
 .vs/
 *.user

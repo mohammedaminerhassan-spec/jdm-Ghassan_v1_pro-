@@ -1,4 +1,5 @@
 # Ghassan v1 Pro 1B — English SFT stage (matches pro_v1.yaml architecture exactly).
+# Unified 1B: ~1.04B total / ~612M active (8 experts top-4 + shared, E=1280).
 # Stage 2 after pro_v1 pretrain. Same shards, heavier instruction weight.
 # Keep this file's model.* block byte-identical to pro_v1.yaml or resume
 # fails the architecture gate. Lion + B=1/T=512 like pretrain (T4 fit).
@@ -16,9 +17,9 @@ model:
   tie_embeddings: true
   init_std: 0.02
   use_moe: true
-  num_experts: 10
-  moe_top_k: 2
-  moe_expert_dim: 1024
+  num_experts: 8
+  moe_top_k: 4
+  moe_expert_dim: 1280
   moe_shared: true
   moe_aux_scale: 0.01
   moe_aux_free: false
@@ -41,6 +42,8 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true
+  fp16_weight_cache: false
+  ce_chunks: 4
   loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
   loss_scale_window: 2000
   batch_size: 1
@@ -59,6 +62,9 @@ training:
   beta2: 0.99
   eps: 1.0e-8
   grad_clip: 1.0
+  ns_steps: 5
+  muon_min_ns_dim: 256
+  muon_vec_ratio: 0.1
   seed: 138
   log_every: 10
   eval_every: 100
@@ -73,6 +79,7 @@ training:
   activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
+  output_budget_mb: 17408
 
 data:
   train_prefix: train_

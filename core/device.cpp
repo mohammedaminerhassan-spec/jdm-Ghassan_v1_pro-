@@ -214,8 +214,9 @@ void* device_alloc(size_t nbytes, Device dev, DType /*dt*/) {
         // FIX P2-1: old guard compared against stale startup free_mem
         // (device_info() is cached once). Query live VRAM so the guard
         // stays correct after GBs of weights/workspaces.
-        // Only guard huge allocs (>64MB) to avoid a MemGetInfo per tiny tensor.
-        if (nbytes > (64ull << 20)) {
+        // Guard allocs >16MB (was 64MB): dozens of <64MB activation tensors
+        // ([N,d] ~6MB at N=2048) could cumulatively OOM with no early message.
+        if (nbytes > (16ull << 20)) {
             size_t live_free = cuda::free_bytes_live();
             if (live_free > 0 && nbytes > live_free) {
                 GAI_FAIL(strfmt("CUDA OOM guard: need %s but only %s free live. "

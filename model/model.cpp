@@ -1422,6 +1422,10 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
     // reuses one (B,T) across all 128 micros. Skip the rebuild + H2D entirely
     // when the buffer already holds this (B,T) — 127/128 forwards do no work.
     if (!act.pos.defined() || act.pos.numel() < N) {
+        // FIX: subtract the old buffer before replacing it; the old Tensor
+        // frees via refcount but act.bytes (used in the OOM log) drifted up
+        // on every shape change.
+        if (act.pos.defined()) act.bytes -= act.pos.nbytes();
         act.pos = Tensor::empty({N}, DType::I32, device_);
         act.bytes += act.pos.nbytes();
         act.pos_cached_B = -1;

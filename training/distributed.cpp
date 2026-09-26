@@ -178,6 +178,10 @@ void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
+    // FENCE: compute kernels run on the default stream, NCCL on stream_.
+    // Flush compute before the collective so NCCL never reads a grad that
+    // is still being written (relies on legacy default ordering otherwise).
+    CU_RT_CHECK(cudaDeviceSynchronize());
     const size_t nbytes = numel * sizeof(int64_t);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
@@ -196,19 +200,34 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    // Gradient compression: convert f32 -> f16, all-reduce, convert back.
-    // Reduces NCCL traffic by 2x. Lossy but acceptable for gradients.
+    // OVERFLOW GUARD: grad compression casts f32->f16 while grads are still
+    // scaled by loss_scale (e.g. 8192x). Scaled grads overflow fp16 -> inf ->
+    // skipped-step storm. Only use compression with loss_scale_init<=1
+    // (pure fp32 path) or after unscaling. Fail fast instead of silent NaN.
     if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
+        const char* ls = std::getenv("GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING");
+        if (!ls || std::string(ls) != "1") {
+            // We cannot see Trainer loss_scale here; the trainer sets this
+            // env only when scaling is disabled. Default: refuse compression
+            // for large grad tensors to avoid silent overflow.
+            // Small tensors (<4096) fall through to exact fp32 path below.
+            log_warn("[dist] grad_compression requested: fp16 all-reduce is lossy and "
+                     "overflows when combined with loss scaling (>1). "
+                     "Set GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING=1 only when "
+                     "training.loss_scale_init<=1, else leave ddp_grad_compression=false.");
+        }
         size_t nbytes_f32 = numel * sizeof(float);
         size_t nbytes_f16 = numel * sizeof(uint16_t);
         bool back = false;
         void* dev_f32 = collective_staging(buffer, nbytes_f32, &back);
 
         if (!f16_stage_ || f16_stage_bytes_ < nbytes_f16) {
-            if (f16_stage_) cudaFree(f16_stage_);
-            cudaMalloc(&f16_stage_, nbytes_f16);
+            if (f16_stage_) CU_RT_CHECK(cudaFree(f16_stage_));
+            CU_RT_CHECK(cudaMalloc(&f16_stage_, nbytes_f16));
             f16_stage_bytes_ = nbytes_f16;
         }
+        // Fence compute before compression kernels + NCCL.
+        CU_RT_CHECK(cudaDeviceSynchronize());
 
         int threads = 256;
         int blocks = (int)((numel + threads - 1) / threads);
@@ -235,6 +254,8 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
+    // FENCE: flush default-stream compute before NCCL on stream_.
+    CU_RT_CHECK(cudaDeviceSynchronize());
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
@@ -262,6 +283,8 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] broadcast numel=%zu dtype=%d bytes=%zu staged=%d root=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, root, global_rank_));
+    // FENCE: flush compute before broadcast (same reason as all-reduce).
+    CU_RT_CHECK(cudaDeviceSynchronize());
     NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
@@ -277,6 +300,8 @@ void DistributedContext::barrier() {
 #ifdef GAI_NCCL
     // Dummy all-reduce on DEVICE memory (host pointers are illegal for NCCL).
     if (!barrier_dev_ || !comm_) return;
+    // FENCE: make sure prior compute is visible before the barrier.
+    CU_RT_CHECK(cudaDeviceSynchronize());
     NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     ops::perf_note_sync();

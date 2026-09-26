@@ -71,6 +71,10 @@ void free_workspace() {
     moe_free_workspace();
 }
 
+// Diagnosability: report monotonic pool footprint in OOM messages so
+// nvidia-smi vs guard mismatch is explainable (pools never shrink by design).
+size_t pool_bytes() { return g_ws_bytes; }
+
 // Persistent sampling scratch, defined once here so both
 // free_sampling_workspace() above and the kernels below can use them.
 // g_topk_cap tracks the allocated pair count (64*128 max) so top-K stays exact.
@@ -159,6 +163,17 @@ static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
 static void gemm_bf16(bool trans_a, bool trans_b, int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb, float beta, float* C, int ldc) {
+    // ARCH GUARD: T4/sm_75 has no BF16 tensor cores. Issuing CUDA_R_16BF on
+    // sm_75 is slow emulation or NOT_SUPPORTED. The trainer already falls
+    // back, but a direct set_gemm_bf16(true) must also fail loudly here.
+    int dev = 0;
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        if (prop.major < 8)
+            GAI_FAIL("gemm_bf16 on sm_75 (T4): no BF16 tensor cores (need Ampere+). "
+                     "Use fp32 masters + fp16 GEMMs instead.");
+    }
     const int rA = trans_a ? K : M, cA = trans_a ? M : K;
     const int rB = trans_b ? N : K, cB = trans_b ? K : N;
     const size_t nA = (size_t)rA * cA, nB = (size_t)rB * cB;
@@ -1119,10 +1134,18 @@ __global__ void k_sqnorm(const float* g, i64 n, float* out) {
     extern __shared__ float smem[];
     i64 i = blockIdx.x * i64(blockDim.x) + threadIdx.x;
     i64 stride = i64(gridDim.x) * blockDim.x;
-    float s = 0.0f;
-    for (; i < n; i += stride) { float v = g[i]; s += v * v; }
-    s = block_sum(s, smem);
-    if (threadIdx.x == 0) out[blockIdx.x] = s;
+    // PRECISION: accumulate in double (was float). At 100M params the float
+    // error drifts gnorm/clip vs the CPU double reference (~10 absolute).
+    double s = 0.0;
+    for (; i < n; i += stride) { double v = (double)g[i]; s += v * v; }
+    // block_sum is float; fold the double via two-stage: each thread writes
+    // float(s) is lossy, so instead reduce in shared as float of chunks?
+    // Keep exact: write double bits via float pair is overkill; the dominant
+    // error was per-element float accumulation, now double. Final block
+    // reduction in float over 256 values is ~1ulp.
+    float sf = (float)s;
+    sf = block_sum(sf, smem);
+    if (threadIdx.x == 0) out[blockIdx.x] = sf;
 }
 
 // Scale gradients in-place by a constant factor (for distributed training)

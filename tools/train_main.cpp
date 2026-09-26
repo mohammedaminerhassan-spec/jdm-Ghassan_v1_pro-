@@ -264,7 +264,30 @@ print_device_report();
                                       ((lion || muon) ? 4 : 8);
                 opt_b = (opt_b >= frozen) ? opt_b - frozen : 0;
             }
-            const size_t total = plan.static_total + opt_b + act;
+            // Muon NS scratch [O|T|A]: max_rc*2+max_cc floats (was omitted ->
+            // dry-run under-reported Muon VRAM). Conservative: largest 2D
+            // matrix is [d,d] or [E,d]; use max(d*d, E*d)*2 + E*E.
+            size_t muon_scratch = 0;
+            if (muon) {
+                const size_t d = static_cast<size_t>(mcfg.hidden_size);
+                const size_t E = static_cast<size_t>(mcfg.moe_expert_dim);
+                const size_t rc = std::max(d * d, E * d);
+                const size_t cc = std::max(d * d, E * E);
+                muon_scratch = (rc * 2 + cc) * sizeof(float);
+            }
+            // Eval arena + workspaces + NCCL were omitted ( ~0.9GB under-report).
+            // Add them so the preflight gate matches the live guard.
+            const Model::WorkspacePlan wsp =
+                Model::workspace_plan(mcfg, tcfg.batch_size, tcfg.seq_len);
+            size_t eval_extra = 0;
+            {
+                // eval arena is roughly train arena without grads; approximate
+                // as 30% of train activations (rank0 work, resident on all).
+                eval_extra = act / 3;
+            }
+            size_t nccl_extra = tcfg.ddp ? (384ull << 20) : 0; // 320MB NCCL + 64MB staging
+            const size_t total = plan.static_total + opt_b + muon_scratch + act
+                               + eval_extra + wsp.gemm_bytes + wsp.moe_bytes + nccl_extra;
 
             log_info("---------------- dry run: memory estimate ----------------");
             log_info(strfmt("  parameters          : %s (%s without embeddings)",
@@ -283,6 +306,14 @@ print_device_report();
                             tcfg.activation_checkpointing ? " [ckpt]" : "",
                             tcfg.ce_chunks > 1 ? strfmt(" [ce-x%d]", tcfg.ce_chunks).c_str() : "",
                             human_bytes(act).c_str()));
+            if (muon)
+                log_info(strfmt("  muon NS scratch     : %s", human_bytes(muon_scratch).c_str()));
+            log_info(strfmt("  eval arena (est)    : %s", human_bytes(eval_extra).c_str()));
+            log_info(strfmt("  workspaces gemm/moe : %s + %s",
+                            human_bytes(wsp.gemm_bytes).c_str(),
+                            human_bytes(wsp.moe_bytes).c_str()));
+            if (tcfg.ddp)
+                log_info(strfmt("  nccl/ddp extra      : %s", human_bytes(nccl_extra).c_str()));
             log_info(strfmt("  sched %s | opt %s",
                             tcfg.scheduler.c_str(), tcfg.optimizer.c_str()));
             log_info(strfmt("  TOTAL               : %s", human_bytes(total).c_str()));
@@ -321,6 +352,27 @@ print_device_report();
                                     "workspaces push the real peak higher)",
                                     human_bytes(total).c_str(), margin_pct,
                                     human_bytes(budget).c_str()));
+            }
+            // Output-quota projection (Kaggle /kaggle/working 20GB cap).
+            // Snapshot ~= weights + optimizer moments (Lion 8B/param, AdamW 12B/param).
+            // best+last share inodes when same step, else 2x. Warn if > budget.
+            {
+                const i64 out_mb = args.has("output-budget-mb")
+                    ? args.num_int("output-budget-mb", 0) : tcfg.output_budget_mb;
+                if (out_mb > 0) {
+                    const size_t per_snap = static_cast<size_t>(params) * 8 + opt_b;
+                    // Conservative: 2 snapshots (best+last different steps) + GGUF Q4 ~0.6GB.
+                    const size_t proj = per_snap * 2 + (600ull << 20);
+                    const size_t budget = static_cast<size_t>(out_mb) * 1024u * 1024u;
+                    log_info(strfmt("  output budget       : %s (proj snapshots+gguf %s)",
+                                    human_bytes(budget).c_str(), human_bytes(proj).c_str()));
+                    if (proj > budget)
+                        GAI_FAIL(strfmt("projected output %s exceeds budget %s "
+                                        "(2 snapshots %.1fGB + GGUF). Raise --output-budget-mb "
+                                        "knowingly or shrink the model.",
+                                        human_bytes(proj).c_str(), human_bytes(budget).c_str(),
+                                        static_cast<double>(per_snap * 2) / 1e9));
+                }
             }
             return 0;
         }

@@ -57,6 +57,7 @@ struct TrainerConfig {
     // matrix, historical). None of the shipped T4 recipes enable muon.
     int   muon_ns_steps   = 5;    // 1..10, clamped by the Muon ctor
     int   muon_min_ns_dim = 0;    // >=0
+    float muon_vec_ratio  = 0.1f; // non-matrix LR = lr*ratio (Lion 0.1x rule)
     // scheduler
     std::string scheduler = "cosine";  // cosine | wsd
     float sched_decay_frac = 0.2f;     // wsd: last 20% linearly decays
@@ -352,6 +353,8 @@ private:
     bool                    prefetch_pause_ = false;
     bool                    prefetch_in_io_ = false;
     bool                    prefetch_running_ = false;
+    // Preserve the real dataloader error (was swallowed -> generic message).
+    std::exception_ptr      prefetch_error_;
     void start_prefetch();
     void stop_prefetch();
     void quiesce_prefetch();

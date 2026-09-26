@@ -78,19 +78,26 @@ void set_moe_jitter_seed(u64 s) { g_moe_jitter_seed = s; }
 static void grp_ensure(size_t nk, int ne) {
     if (nk > g_grp_grouped_cap) {
         // Over-allocate 12% headroom so B/T jitter doesn't realloc every step.
+        // NOTE: exact free+malloc here (not 64MB chunks) can stall mid-run if
+        // B/T changes after pre-size; workspace_plan() sizes the main pools,
+        // this covers slot variance. Pools never shrink by design.
         size_t want = nk + nk / 8 + 1024;
         if (g_grp_grouped) CU_CHECK(cudaFree(g_grp_grouped));
+        check_free_vram(sizeof(i32) * want, "MoE grouped slots");
         CU_CHECK(cudaMalloc(&g_grp_grouped, sizeof(i32) * (want > 0 ? want : 1)));
         g_grp_grouped_cap = want;
     }
     if (ne > g_grp_ne_cap) {
         if (g_grp_cnt) CU_CHECK(cudaFree(g_grp_cnt));
         if (g_grp_cur) CU_CHECK(cudaFree(g_grp_cur));
+        check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
         CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
         CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));
         g_grp_ne_cap = ne;
     }
 }
+
+size_t moe_pool_bytes() { return g_moe_ws_bytes; }
 
 // ================================================================ kernels
 // One block per token: stable softmax over ne logits + K argmax passes.
@@ -126,6 +133,8 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
     const int tid = (int)threadIdx.x;
     const int W = (int)blockDim.x;
     if (t >= N) return;
+    // HARDEN: sred[256] assumes W<=256; launch is 32 today.
+    // (device-side assert via return: host validates launch separately)
     const float* lg = logits + t * ne;
     const bool train = (probs != nullptr);
     __shared__ float sred[256];  // partial max/sum (launch W <= 256)
@@ -638,13 +647,18 @@ __global__ void k_router_dl(const float* x, const float* router_w,
         for (int e = 0; e < ne; ++e) pdot += pt[e] * sdp[e];
         for (int e = 0; e < ne; ++e) {
             float dl = pt[e] * (sdp[e] - pdot);
-            // P0-06 FIX: forward jitter z'=z*(1+j*2*u) needs chain-rule factor.
-            // Same hash as k_route forward (deterministic, no state).
+            // P0-06 FIX (unified): forward jitter z'=z*(1+j*2*u) needs
+            // chain-rule factor with the EXACT same fmix64 hash as k_route
+            // jitter_u(t,e,seed). Old code used a different %1000000 hash
+            // here -> drouter wrong whenever moe_jitter>0.
             if (jitter > 0.0f) {
-                uint32_t h = (uint32_t)(t * 2654435761ULL) ^ (uint32_t)(e * 40503u + 1u)
-                           ^ (uint32_t)(seed & 0xFFFFFFFFu) ^ (uint32_t)((seed >> 32) * 2246822519ULL);
-                h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-                float u = ((h % 1000000u) / 1000000.0f) - 0.5f;
+                uint64_t hh = (uint64_t)t * 0x9E3779B97F4A7C15ULL;
+                hh ^= (uint64_t)e * 0xC2B2AE3D27D4EB4FULL;
+                hh ^= (seed + 0x9E3779B97F4A7C15ULL);
+                hh ^= hh >> 33; hh *= 0xff51afd7ed558ccdULL;
+                hh ^= hh >> 33; hh *= 0xc4ceb9fe1a85ec53ULL;
+                hh ^= hh >> 33;
+                float u = ((hh >> 40) & 0xFFFFFF) / (float)(1 << 24) - 0.5f;
                 dl *= (1.0f + jitter * 2.0f * u);
             }
             sdl[e] = dl;
@@ -782,8 +796,7 @@ void moe_forward(const float* x, const float* router_w,
     // ne-expert row instead of 1 thread doing it serially — audit P0 #4)
     i32* idx_use = idx_cache ? idx_cache : tmp_idx;
     float* w_use = w_cache ? w_cache : tmp_w;
-    GAI_CHECK(K >= 1 && K <= 8, "moe routing: top_k out of kernel range [1,8]");
-    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing: num_experts out of kernel range [1,64]");
+    // (range checks done at function entry)
     k_route<<<(unsigned)N, 32>>>(rlogits, probs_cache, idx_use, w_use, N, ne, K, g_moe_jitter, g_moe_jitter_seed);
     CU_CHECK(cudaGetLastError());
 
@@ -927,6 +940,9 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
+    GAI_CHECK(N <= 2147483647LL, "moe_forward: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe routing: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing: num_experts out of kernel range [1,64]");
     const i64 NK = N * K;
     const float aux_coef = (aux_frac && aux_scale != 0.0f)
         ? aux_scale * (float)ne / (float)N : 0.0f;
