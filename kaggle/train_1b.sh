@@ -94,10 +94,19 @@ echo "============================================================"
 persist_output() {
     if [[ -d "/kaggle/working" ]]; then
         mkdir -p /kaggle/working/output 2>/dev/null || true
-        cp -r "${CKPT_PT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -r "${CKPT_SFT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
-        echo "[persist] snapshot copied to /kaggle/working/output"
+        # FIXED: /kaggle/working is already the persisted Kaggle output tree.
+        # Copying multi-GB checkpoints back into a child directory duplicated
+        # the data and could push the 20GB autosaved quota over the limit at EXIT.
+        for src in "${CKPT_PT}" "${CKPT_SFT}" "${GGUF_OUT}"; do
+            case "${src}" in
+                /kaggle/working/*)
+                    echo "[persist] already under /kaggle/working: ${src} (no duplicate copy)" ;;
+                *)
+                    echo "[persist] copying external artifact: ${src}"
+                    if [[ -d "${src}" ]]; then cp -r "${src}" /kaggle/working/output/ 2>/dev/null || true;
+                    elif [[ -f "${src}" ]]; then cp -f "${src}" /kaggle/working/output/ 2>/dev/null || true; fi ;;
+            esac
+        done
     fi
 }
 trap persist_output EXIT INT TERM

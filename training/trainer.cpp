@@ -94,7 +94,12 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     std::string precision = c.get_str("training.precision", "fp32");
     if (precision == "bf16") t.param_dtype = DType::BF16;
     else if (precision == "fp16") t.param_dtype = DType::F16;
-    else t.param_dtype = DType::F32;
+    else if (precision == "fp32") t.param_dtype = DType::F32;
+    else {
+        // FIXED: a misspelled precision used to silently fall back to fp32,
+        // turning a fast T4 FP16 run into a much slower one without failing.
+        GAI_FAIL("training.precision must be one of: fp32, fp16, bf16 (got '" + precision + "')");
+    }
     // compute GEMMs in fp16 on CUDA tensor cores (weights/grads stay fp32)
     t.gemm_fp16          = c.get_bool("training.gemm_fp16", t.gemm_fp16);
     t.fp16_weight_cache  = c.get_bool("training.fp16_weight_cache", t.fp16_weight_cache);
@@ -382,7 +387,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         if (cfg_.optimizer == "adamw" && total_params > 800000000LL &&
             model_.device() == Device::CUDA) {
             GAI_FAIL(strfmt("optimizer mismatch: %s params with AdamW needs ~%.1fGB extra moments vs Lion and OOMs T4 16GB. "
-                            "Use optimizer: lion for 1B models (see configs/t4_1b.yaml, ultra_1b.yaml). "
+                            "Use optimizer: lion for 1B models (see configs/t4_1b.yaml, pro_v1.yaml). "
                             "AdamW is optimal only for <=500M models (flash/pro).",
                             human_count(static_cast<u64>(total_params)).c_str(),
                             static_cast<double>(total_params) * 4.0 / 1e9));
@@ -991,6 +996,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
             }
 
             train_loader_.set_state(state_.loader);
+            // FIXED: the checkpoint cursor refers to the last trainer-consumed
+            // batch, not a speculative prefetch. Rank-specific reconstruction
+            // below updates it again for non-root DDP ranks.
+            last_consumed_loader_state_ = state_.loader;
             // restore the dynamic loss scaler exactly (v3 checkpoint fields)
             if (cfg_.loss_scale_init > 0.0 && state_.loss_scale >= 1.0) {
                 loss_scale_ = state_.loss_scale;
@@ -1018,6 +1027,10 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                     const u64 rank_seed = cfg_.seed + static_cast<u64>(rank) * 1000003ULL;
                     train_loader_.reseed(rank_seed);
                     if (saved_batches > 0) train_loader_.skip_batches(saved_batches);
+                    // FIXED: record the rebuilt rank-local consumed cursor so
+                    // a subsequent checkpoint does not fall back to rank 0's
+                    // state or to an unconsumed speculative batch.
+                    last_consumed_loader_state_ = train_loader_.get_state();
                     log_info(strfmt("[ckpt] DDP resume: rank %d rebuilt exact stream (seed %llu + %lld batches)",
                                     rank, (unsigned long long)rank_seed, (long long)saved_batches));
                 }
@@ -1257,7 +1270,11 @@ void Trainer::save(const std::string& name) {
     u8 capture_ok = 1;
     if (is_main_rank()) {
         try {
-            state_.loader = train_loader_.get_state();
+            // FIXED: the prefetch worker may already have generated the next
+            // batch. Saving train_loader_.get_state() here would skip that
+            // unconsumed batch on exact resume. Use the cursor captured when
+            // the main training loop actually took the batch.
+            state_.loader = last_consumed_loader_state_;
             state_.loss_scale = loss_scale_;
             state_.clean_steps = clean_steps_;
             state_.tok_vocab = model_.config().vocab_size;
@@ -2383,7 +2400,12 @@ bool Trainer::next_train_batch(Batch& out) {
         std::unique_lock<std::mutex> lk(prefetch_mutex_);
         if (!prefetch_running_) {
             lk.unlock();
-            return train_loader_.next(out);
+            const bool ok = train_loader_.next(out);
+            if (ok) {
+                // FIXED: direct consumption advances the checkpoint cursor.
+                last_consumed_loader_state_ = train_loader_.get_state();
+            }
+            return ok;
         }
         prefetch_cv_.wait(lk, [this] { return prefetch_ready_ || prefetch_stop_; });
         if (prefetch_error_) {
@@ -2393,6 +2415,10 @@ bool Trainer::next_train_batch(Batch& out) {
         }
         if (!prefetch_ready_) GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
         out = std::move(prefetch_batch_);
+        // FIXED: while prefetch_ready_ is true, the worker is blocked and
+        // cannot advance the DataLoader. get_state() therefore corresponds
+        // exactly to the batch we are handing to the trainer.
+        last_consumed_loader_state_ = train_loader_.get_state();
         prefetch_ready_ = false;
     }
     prefetch_cv_.notify_all();
