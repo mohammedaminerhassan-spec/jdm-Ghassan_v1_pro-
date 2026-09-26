@@ -54,13 +54,13 @@ struct ModelConfig {
     float rope_yarn_low     = 1.0f;   // YaRN ramp: الأبعاد < low تبقى خطية
     float rope_yarn_high    = 32.0f;  // الأبعاد > high تُستكمل NTK كاملة
     int   sliding_window    = 0;      // 0=off (full causal). >0 نافذة انزلاقية
-                                      // (Mistral/SWA؛ kernel block-mask TODO —
-                                      // الحقل محفوظ ومصدّر لـGGUF + مرفوض في
-                                      // llama_compat حتى يكتمل الـkernel)
+                                      // (Mistral/SWA; forward + backward kernels implemented.
+                                      // llama_compat/export paths may still restrict this
+                                      // feature for format-compatibility reasons.)
     int   rope_type         = 0;      // 0=interleaved (legacy هذا المشروع),
                                       // 1=neox half-rotate (HF/Llama/Qwen/DS
                                       // التوافق؛ للـcheckpoints الجديدة فقط —
-                                      // kernels الحالية interleaved)
+                                      // CPU + CUDA kernels support both layouts.)
 
     int head_dim() const { return hidden_size / num_heads; }
     int kv_dim()   const { return num_kv_heads * head_dim(); }
