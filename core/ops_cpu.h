@@ -193,6 +193,10 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
 // DeepSeek-V2 router jitter (CPU mirror; set via ops::set_moe_jitter).
 void set_moe_jitter_cpu(float j);
 void set_moe_jitter_seed_cpu(u64 seed);
+// Test hook: the exact hash used for train-only router noise (fmix64, shared
+// with cuda/moe.cu jitter_u). Exposed so tests/test_jitter_stats.cpp can
+// verify uniformity/determinism instead of trusting the comment.
+float jitter_u_for_test(i64 token, int expert);
 
 // in-place softmax over a row (fp32 accumulators, max-subtracted)
 void softmax_row(float* x, int n);

@@ -64,7 +64,10 @@ BINARY="${REPO_DIR}/build/bin/gai_train"
 # is a different limit from free disk space (~57 GB). Everything the run
 # produces counts: clone + build tree + shards + checkpoints + GGUF. The gate
 # projects it before the first step instead of failing at Save Version.
-OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-17408}"   # 17GB: 20GB cap minus build+shards margin
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"   # unset = per-recipe default below
+if [[ -z "${OUTPUT_BUDGET_MB}" ]]; then
+    case "${CONFIG_PT}" in *pro_v1*|*t4_1b*|*1b*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
+fi
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
 # PRO-HARDEN: fallback الصامت إلى 16k كان يضيع run كاملا ثم يفشل عند البوابة.

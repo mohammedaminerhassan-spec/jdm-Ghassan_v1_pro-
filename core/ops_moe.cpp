@@ -40,6 +40,13 @@ static inline float jitter_u_cpu(gai::i64 tt, int ee) {
     return (static_cast<float>((h >> 40) & 0xFFFFFF) / static_cast<float>(1 << 24)) - 0.5f;
 }
 
+namespace gai {
+namespace cpu {
+// Test hook (declared in ops_cpu.h): exposes the production hash above.
+float jitter_u_for_test(i64 tt, int ee) { return jitter_u_cpu(tt, ee); }
+} // namespace cpu
+} // namespace gai
+
 #ifdef GAI_OPENMP
 #include <omp.h>
 #endif

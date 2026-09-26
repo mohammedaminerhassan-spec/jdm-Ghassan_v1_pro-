@@ -47,6 +47,9 @@ bool DistributedContext::init(const Config& cfg) {
     // ID through a file. torchrun users can skip this via GAI_NCCL_ID_FILE.
     CU_RT_CHECK(cudaSetDevice(local_rank_));
     CU_RT_CHECK(cudaStreamCreate(&stream_));
+    // Ordering event: lets the NCCL stream wait for default-stream compute
+    // without blocking the host (see wait_for_compute).
+    CU_RT_CHECK(cudaEventCreateWithFlags(&fence_event_, cudaEventDisableTiming));
     // Device-side word for barrier (NCCL forbids host pointers).
     CU_RT_CHECK(cudaMalloc(&barrier_dev_, sizeof(int)));
     CU_RT_CHECK(cudaMemset(barrier_dev_, 0, sizeof(int)));
@@ -131,6 +134,10 @@ void DistributedContext::finalize() {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
     }
+    if (fence_event_) {
+        cudaEventDestroy(fence_event_);
+        fence_event_ = nullptr;
+    }
     // Rank 0 cleans the rendezvous file (single-node /tmp).
     if (global_rank_ == 0 && !id_file_.empty()) {
         std::error_code ec;
@@ -144,6 +151,19 @@ void DistributedContext::finalize() {
 }
 
 #ifdef GAI_NCCL
+void DistributedContext::wait_for_compute() {
+    // Compute kernels + staged copies run on the default stream (0), NCCL on
+    // stream_. Recording here captures ALL prior default-stream work; the
+    // NCCL stream then waits, so collectives never read in-flight grads.
+    // Unlike cudaDeviceSynchronize(), the host does not block and the GPU
+    // keeps executing unrelated work: communication/computation overlap.
+    // NOTE: legacy default-stream semantics also order stream_ after stream 0,
+    // but the explicit event keeps this correct under per-thread default
+    // streams too (--default-stream per-thread).
+    CU_RT_CHECK(cudaEventRecord(fence_event_, 0));
+    CU_RT_CHECK(cudaStreamWaitEvent(stream_, fence_event_, 0));
+}
+
 void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_back) {
     *copy_back = false;
     if (cuda::is_device_memory(p)) return p;
@@ -178,10 +198,9 @@ void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    // FENCE: compute kernels run on the default stream, NCCL on stream_.
-    // Flush compute before the collective so NCCL never reads a grad that
-    // is still being written (relies on legacy default ordering otherwise).
-    CU_RT_CHECK(cudaDeviceSynchronize());
+    // FENCE (event-based): order the NCCL stream after default-stream compute
+    // without blocking the host (see wait_for_compute).
+    wait_for_compute();
     const size_t nbytes = numel * sizeof(int64_t);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
@@ -226,13 +245,14 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
             CU_RT_CHECK(cudaMalloc(&f16_stage_, nbytes_f16));
             f16_stage_bytes_ = nbytes_f16;
         }
-        // Fence compute before compression kernels + NCCL.
-        CU_RT_CHECK(cudaDeviceSynchronize());
 
         int threads = 256;
         int blocks = (int)((numel + threads - 1) / threads);
         k_f32_to_f16<<<blocks, threads>>>(static_cast<float*>(dev_f32),
                                           static_cast<uint16_t*>(f16_stage_), numel);
+        // FENCE after the conversion kernels (not before): the NCCL stream
+        // must wait for THESE launches, which are also on the default stream.
+        wait_for_compute();
         NCCL_CHECK(ncclAllReduce(f16_stage_, f16_stage_, numel, ncclFloat16, ncclSum, comm_, stream_));
         CU_RT_CHECK(cudaStreamSynchronize(stream_));
         k_f16_to_f32<<<blocks, threads>>>(static_cast<uint16_t*>(f16_stage_),
@@ -254,8 +274,8 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
-    // FENCE: flush default-stream compute before NCCL on stream_.
-    CU_RT_CHECK(cudaDeviceSynchronize());
+    // FENCE (event-based): order the NCCL stream after default-stream compute.
+    wait_for_compute();
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
@@ -283,8 +303,8 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] broadcast numel=%zu dtype=%d bytes=%zu staged=%d root=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, root, global_rank_));
-    // FENCE: flush compute before broadcast (same reason as all-reduce).
-    CU_RT_CHECK(cudaDeviceSynchronize());
+    // FENCE (event-based): order the broadcast after default-stream compute.
+    wait_for_compute();
     NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev, nbytes, cudaMemcpyDeviceToHost));
@@ -300,8 +320,8 @@ void DistributedContext::barrier() {
 #ifdef GAI_NCCL
     // Dummy all-reduce on DEVICE memory (host pointers are illegal for NCCL).
     if (!barrier_dev_ || !comm_) return;
-    // FENCE: make sure prior compute is visible before the barrier.
-    CU_RT_CHECK(cudaDeviceSynchronize());
+    // FENCE (event-based): prior compute visible before the barrier.
+    wait_for_compute();
     NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
     ops::perf_note_sync();

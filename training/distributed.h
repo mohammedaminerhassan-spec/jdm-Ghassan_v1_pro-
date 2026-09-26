@@ -69,6 +69,12 @@ private:
     // device pointer of at least nbytes for NCCL to use, copying the caller's
     // data in; *copy_back tells the caller to read the result out again.
     void* collective_staging(void* p, size_t nbytes, bool* copy_back);
+    // Compute->NCCL ordering without a full device sync: records default-
+    // stream progress and makes the NCCL stream wait for it. Replaces
+    // cudaDeviceSynchronize() before collectives (which blocked the host and
+    // killed communication/computation overlap). The NCCL stream still sees
+    // all prior compute, so collectives never read in-flight grads.
+    void wait_for_compute();
 #endif
 
 private:
@@ -81,6 +87,7 @@ private:
 #ifdef GAI_NCCL
     ncclComm_t comm_ = nullptr;
     cudaStream_t stream_ = nullptr;
+    cudaEvent_t fence_event_ = nullptr; // compute->NCCL ordering event
     void* barrier_dev_ = nullptr;   // device-side word for barrier()
     void* coll_dev_ = nullptr;      // staging scratch for host-side collectives
     size_t coll_dev_bytes_ = 0;

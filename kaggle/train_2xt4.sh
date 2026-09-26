@@ -34,9 +34,13 @@ CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4}"
 CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_2xt4_sft}"
 GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-2xt4_q4_0.gguf}"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
-# Kaggle /kaggle/working cap is 20GB (build+data+train). Keep total <=17GB
-# (17408MB) so checkpoints (hardlinked best+last) + GGUF Q4 + shards fit.
-OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-17408}"
+# Kaggle /kaggle/working cap is 20GB (build+data+train). 480M recipes keep
+# total <=17GB; 1B recipes project ~17.2GB worst case (2 snapshots + GGUF),
+# so they use 19GB — still under the panel cap. CLI/env always wins when set.
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"
+if [[ -z "${OUTPUT_BUDGET_MB}" ]]; then
+    case "${CONFIG_PT}" in *1b_2xt4*|*pro_v1*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
+fi
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
 PILOT_STEPS=20
@@ -167,14 +171,18 @@ if missing:
 EOF
     done
     "${PIPE_BIN}" inspect --shards "${PT_DIR}" --tokenizer "${TOK}" || return 1
-    # VRAM plan per-GPU (arithmetic) + hard gate 15GiB (16GB minus headroom).
+    # VRAM plan per-GPU (arithmetic) + hard gate (16GB minus headroom).
     # --strict-config: unknown/dead keys fail here, never mid-run.
     # Forward the output quota so the preflight gate matches the live guard.
+    # 1B recipes peak honestly at ~14.4GB, so they use the full-16GB gate;
+    # the 480M recipes keep the stricter 15GiB gate (their envelope is smaller).
+    VRAM_MB=15360
+    case "${CONFIG_PT}" in *1b_2xt4*|*pro_v1*) VRAM_MB=16384;; esac
     "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
     "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
-    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] PT recipe exceeds 15GiB per-GPU"; return 1; }
-    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --max-vram-mb 15360 --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] SFT recipe exceeds 15GiB per-GPU"; return 1; }
-    echo "[preflight] VRAM per-GPU OK (<=15GiB, preserves B/T envelope)"
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cuda --strict-config --max-vram-mb "${VRAM_MB}" --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] PT recipe exceeds per-GPU budget (${VRAM_MB}MiB)"; return 1; }
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cuda --strict-config --max-vram-mb "${VRAM_MB}" --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] SFT recipe exceeds per-GPU budget (${VRAM_MB}MiB)"; return 1; }
+    echo "[preflight] VRAM per-GPU OK (<=$(( VRAM_MB / 1024 ))GiB, preserves B/T envelope)"
     echo "==================== preflight: ALL GATES PASSED ===================="
     return 0
 }

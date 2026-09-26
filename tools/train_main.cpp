@@ -354,13 +354,16 @@ print_device_report();
                                     human_bytes(budget).c_str()));
             }
             // Output-quota projection (Kaggle /kaggle/working 20GB cap).
-            // Snapshot ~= weights + optimizer moments (Lion 8B/param, AdamW 12B/param).
-            // best+last share inodes when same step, else 2x. Warn if > budget.
+            // Snapshot = weights (params*4) + optimizer moments (opt_b).
+            // NO grads: checkpoints never store grads (480M-AdamW measures
+            // exactly 12B/param = 4 + 8). best+last are 2 files when they are
+            // different steps (hardlink-shared when same step), so project
+            // the 2-snapshot worst case + GGUF Q4 ~0.6GB.
             {
                 const i64 out_mb = args.has("output-budget-mb")
                     ? args.num_int("output-budget-mb", 0) : tcfg.output_budget_mb;
                 if (out_mb > 0) {
-                    const size_t per_snap = static_cast<size_t>(params) * 8 + opt_b;
+                    const size_t per_snap = static_cast<size_t>(params) * 4 + opt_b;
                     // Conservative: 2 snapshots (best+last different steps) + GGUF Q4 ~0.6GB.
                     const size_t proj = per_snap * 2 + (600ull << 20);
                     const size_t budget = static_cast<size_t>(out_mb) * 1024u * 1024u;

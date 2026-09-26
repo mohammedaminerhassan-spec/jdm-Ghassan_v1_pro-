@@ -1,8 +1,9 @@
-# Ghassan v1 Pro 1B — English SFT stage (matches pro_v1.yaml architecture exactly).
-# Unified 1B: ~1.04B total / ~612M active (8 experts top-4 + shared, E=1280).
-# Stage 2 after pro_v1 pretrain. Same shards, heavier instruction weight.
-# Keep this file's model.* block byte-identical to pro_v1.yaml or resume
+# Ghassan v1 Pro 1B — 2xT4 DDP SFT stage (matches pro_1b_2xt4.yaml exactly).
+# Stage 2 after pro_1b_2xt4 pretrain. Same shards, heavier instruction weight.
+# Keep this file's model.* block byte-identical to pro_1b_2xt4.yaml or resume
 # fails the architecture gate. Lion + B=1/T=512 like pretrain (T4 fit).
+# DDP contract: per-GPU B=1 T=512, accum=32 => global 1*512*32*2 = 32,768
+# (== sft_pro_v1 single 1*512*64=32,768). LR NOT scaled with world size.
 
 model:
   vocab_size: 32000
@@ -48,10 +49,10 @@ training:
   loss_scale_window: 2000
   batch_size: 1
   seq_len: 512
-  grad_accum: 64
+  grad_accum: 32           # 1*512*32*2GPUs = 32,768 global (== sft_pro_v1)
   max_steps: 0
   epochs: 3
-  learning_rate: 1.2e-4
+  learning_rate: 1.2e-4    # Lion effective LR = 0.1x = 1.2e-5
   min_lr_ratio: 0.1
   warmup_steps: 200
   optimizer: lion
@@ -71,14 +72,15 @@ training:
   eval_batches: 15
   save_every: 500
   data_dir: artifacts/shards_en
-  checkpoint_dir: artifacts/checkpoints/pro_v1_sft
+  checkpoint_dir: artifacts/checkpoints/pro_1b_2xt4_sft
   resume: auto
-  pretrained_checkpoint: artifacts/checkpoints/pro_v1/last.ckpt
+  pretrained_checkpoint: artifacts/checkpoints/pro_1b_2xt4/last.ckpt
   allow_no_pretrained: false
   freeze_embeddings: false
   activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
+  ddp: true
   output_budget_mb: 19456
 
 data:

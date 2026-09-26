@@ -90,6 +90,7 @@ static void test_arch_parity() {
         {"configs/en_pro.yaml", "configs/sft_en_pro.yaml"},
         {"configs/en_pro.yaml", "configs/sft_en_4xt4.yaml"},
         {"configs/pro_v1.yaml", "configs/sft_pro_v1.yaml"},
+        {"configs/pro_1b_2xt4.yaml", "configs/sft_pro_1b_2xt4.yaml"},
         {"configs/en_pro.yaml", "configs/en_2xt4.yaml"},
         {"configs/en_2xt4.yaml", "configs/sft_en_2xt4.yaml"},
         {"configs/sft_en_pro.yaml", "configs/sft_en_2xt4.yaml"},
