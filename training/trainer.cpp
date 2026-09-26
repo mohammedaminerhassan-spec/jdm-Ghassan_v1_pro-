@@ -94,7 +94,12 @@ TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     std::string precision = c.get_str("training.precision", "fp32");
     if (precision == "bf16") t.param_dtype = DType::BF16;
     else if (precision == "fp16") t.param_dtype = DType::F16;
-    else t.param_dtype = DType::F32;
+    else if (precision == "fp32") t.param_dtype = DType::F32;
+    else {
+        // FIXED: a misspelled precision used to silently fall back to fp32,
+        // turning a fast T4 FP16 run into a much slower one without failing.
+        GAI_FAIL("training.precision must be one of: fp32, fp16, bf16 (got '" + precision + "')");
+    }
     // compute GEMMs in fp16 on CUDA tensor cores (weights/grads stay fp32)
     t.gemm_fp16          = c.get_bool("training.gemm_fp16", t.gemm_fp16);
     t.fp16_weight_cache  = c.get_bool("training.fp16_weight_cache", t.fp16_weight_cache);
