@@ -772,8 +772,14 @@ static int cmd_logits(const Args& args) {
     device_copy(dev_ids.data_ptr(), m.device(), ids.data(), Device::CPU,
                 sizeof(i32) * ids.size());
     Tensor& logits = m.forward(dev_ids.i32p(), 1, T, act);
-    const float* L = logits.f32();
     const int V = m.config().vocab_size;
+
+    // CUDA: forward() returns DEVICE memory. The dump loop below reads it from
+    // the host, which segfaulted on any GPU run. Stage the whole [T,V] block on
+    // the host in bounded row blocks (T<=512 and V<=32k caps it at 64 MiB).
+    std::vector<float> host_logits;
+    device_stage_f32_2d(logits.data_ptr(), m.device(), T, V, host_logits);
+    const float* L = host_logits.data();
 
     std::ofstream out;
     if (args.has("out")) {

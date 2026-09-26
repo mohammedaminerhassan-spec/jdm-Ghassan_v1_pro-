@@ -198,10 +198,20 @@ std::string ChatSession::send(const std::string& user_message) {
 }
 
 void ChatSession::run_repl() {
-    std::cout <<
-        "\n  Ghassan AI - chat\n"
-        "  اكتب رسالتك بالدارجة. الأوامر: /help /clear /system <text> /stats /quit\n"
-        "  ------------------------------------------------------------------\n\n";
+    // The banner must match the persona: telling an English user to "type your
+    // message in Darija" is a real UX bug, not decoration.
+    const bool en = (opts_.persona == "en" || opts_.persona == "english");
+    if (en) {
+        std::cout <<
+            "\n  Ghassan AI - chat (English)\n"
+            "  Type your message. Commands: /help /clear /system <text> /stats /quit\n"
+            "  ------------------------------------------------------------------\n\n";
+    } else {
+        std::cout <<
+            "\n  Ghassan AI - chat\n"
+            "  اكتب رسالتك بالدارجة. الأوامر: /help /clear /system <text> /stats /quit\n"
+            "  ------------------------------------------------------------------\n\n";
+    }
 
     std::string line;
     while (true) {

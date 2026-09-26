@@ -178,6 +178,27 @@ void device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, siz
     GAI_FAIL("device copy involving unsupported device combination (only cpu/cuda exist)");
 }
 
+void device_stage_f32_2d(const void* src, Device src_dev, i64 rows, i64 cols,
+                          std::vector<float>& out, size_t block_bytes) {
+    GAI_CHECK(rows >= 0 && cols >= 0, "device_stage_f32_2d: negative extent");
+    GAI_CHECK(cols <= (1LL << 30), "device_stage_f32_2d: column count out of range");
+    if (rows == 0 || cols == 0) { out.clear(); return; }
+    GAI_CHECK(src != nullptr, "device_stage_f32_2d: null source");
+    out.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    const size_t cols_sz = static_cast<size_t>(cols);
+    const size_t row_bytes = cols_sz * sizeof(float);
+    // At least one row per block, even when a single row exceeds the budget:
+    // silently truncating the block would drop the tail of every such row.
+    const size_t rows_per_block = std::max<size_t>(1, block_bytes / std::max<size_t>(1, row_bytes));
+    const char* base = static_cast<const char*>(src);
+    for (i64 r = 0; r < rows; r += static_cast<i64>(rows_per_block)) {
+        const i64 n = std::min<i64>(static_cast<i64>(rows_per_block), rows - r);
+        device_copy(out.data() + static_cast<size_t>(r) * cols_sz, Device::CPU,
+                    base + static_cast<size_t>(r) * row_bytes, src_dev,
+                    static_cast<size_t>(n) * row_bytes);
+    }
+}
+
 void device_synchronize(Device dev) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
