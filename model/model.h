@@ -67,6 +67,14 @@ struct ModelConfig {
     void validate() const;
     static ModelConfig from_config(const Config& c, const std::string& prefix = "model");
     std::string summary() const;
+    // Canonical architecture identity: every field that changes the model
+    // FUNCTION (shapes, norms, routing, positions). Training-only fields
+    // (lr, batch, optimizer, dropout-like jitter is train-only noise but
+    // kept here because it changes routing exploration semantics) are
+    // excluded by the parity test, not by this string. Two configs with
+    // different identity MUST NOT share checkpoints (SFT must match pretrain).
+    std::string arch_identity() const;
+    bool same_architecture_as(const ModelConfig& o, std::string* reason = nullptr) const;
 };
 
 // Effective RoPE theta with NTK scaling (rope_scale==1 -> base theta).

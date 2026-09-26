@@ -453,8 +453,31 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     }
 
     // ---- explicit pretrained policy: SFT must never silently start from scratch
+    // P0 SFT parity: the SFT model FUNCTION must equal the pretrain function.
+    // arch_match() inside load() only fails on shapes; z/rope/yarn/sliding
+    // drift would only warn and then train a different model on old weights.
+    // Compare canonical arch_identity() up front and fail fast (unless
+    // --allow-recipe-drift for research).
     if (cfg_.is_sft()) {
         if (!cfg_.pretrained_checkpoint.empty()) {
+            {
+                ModelConfig pt_cfg;
+                TrainState pt_peek;
+                GAI_CHECK(Checkpoint::peek(cfg_.pretrained_checkpoint, pt_cfg, pt_peek),
+                          "cannot peek pretrained checkpoint for SFT: " + cfg_.pretrained_checkpoint);
+                std::string why;
+                if (!pt_cfg.same_architecture_as(model_.config(), &why) && !cfg_.allow_recipe_drift) {
+                    GAI_FAIL("SFT architecture mismatch: " + why +
+                             " (pretrain checkpoint vs SFT config define different model functions; " +
+                             "SFT would silently train the wrong architecture. Align model.* blocks or pass " +
+                             "--allow-recipe-drift for research). pretrain=" + pt_cfg.arch_identity() +
+                             " sft=" + model_.config().arch_identity());
+                }
+                if (!pt_cfg.same_architecture_as(model_.config(), &why))
+                    log_warn("[sft ] proceeding WITH architecture drift (--allow-recipe-drift): " + why);
+                else
+                    log_info("[sft ] architecture parity OK: " + model_.config().arch_identity());
+            }
             TrainState pretrained_state;
             GAI_CHECK(Checkpoint::load(cfg_.pretrained_checkpoint, model_, static_cast<AdamW*>(nullptr), pretrained_state),
                       "cannot load pretrained checkpoint for SFT: " + cfg_.pretrained_checkpoint);
@@ -1684,6 +1707,21 @@ void Trainer::init_distributed() {
     log_info(strfmt("[dist] Training on %d GPUs (rank %d/%d)",
                     dist_->world_size(), dist_->global_rank(), dist_->local_rank()));
 #else
+    // P1 NCCL fail-fast: a CPU-only (or CUDA-less) binary can never do DDP.
+    // Never burn a build + data session only to discover this at step 0.
+    if (cfg_.ddp) {
+        GAI_FAIL("training.ddp=true but this binary was built without CUDA+NCCL "
+                 "(GAI_CUDA off). Rebuild with CUDA+NCCL (kaggle/setup.sh on a GPU "
+                 "session) or set training.ddp=false for single-GPU/CPU.");
+    }
+    {
+        const char* ws = std::getenv("WORLD_SIZE");
+        int env_ws = ws ? std::atoi(ws) : 1;
+        if (env_ws > 1) {
+            GAI_FAIL("WORLD_SIZE>1 but this binary was built without CUDA+NCCL. "
+                     "DDP needs NCCL; rebuild with CUDA+NCCL or run a single rank.");
+        }
+    }
     (void)model_; // suppress unused warning
 #endif
 }
@@ -2040,20 +2078,22 @@ void Trainer::save_async(const std::string& path, std::shared_ptr<CheckpointSnap
     const size_t single = snapshot->bytes();
 
     std::unique_lock<std::mutex> lk(ckpt_mutex_);
-    // A budget smaller than TWO snapshots can never be satisfied: the writer
-    // holds one while the next is queued, so the backpressure loop below would
-    // spin forever instead of OOMing. Refuse up front, with the numbers.
+    // 2xT4 fix: fail only when even ONE snapshot cannot fit. Two live copies
+    // (active writer + one queued) are handled by the backpressure loop below,
+    // which WAITS for the writer to drain instead of aborting. The old
+    // need_two gate rejected valid 480M/1B runs on 29GB Kaggle
+    // deterministically (5.76GB x2 > 10GB old budget). Unique-pointer dedup
+    // (same-step best+last share snapshot_cache_) means the common case holds
+    // only ONE unique copy.
     {
         const size_t budget = ckpt_ram_budget();
-        const size_t need_two = snapshot->bytes() * 2;
-        if (need_two > budget) {
+        if (single > budget) {
             const size_t phys = physical_ram_bytes();
             GAI_FAIL(strfmt("host RAM cannot checkpoint this model: one snapshot is %s, "
-                            "so two live copies need %s, but the queue budget is %s "
-                            "(machine has %s). Backpressure would never clear. Use a "
+                            "but the queue budget is %s "
+                            "(machine has %s). Even a single copy does not fit. Use a "
                             "smaller model/optimizer, or free host RAM.",
-                            human_bytes(snapshot->bytes()).c_str(),
-                            human_bytes(need_two).c_str(),
+                            human_bytes(single).c_str(),
                             human_bytes(budget).c_str(),
                             phys ? human_bytes(phys).c_str() : "unknown"));
         }

@@ -50,7 +50,7 @@ echo "=== [2/5] GPU parity (F-02/F-03/F-10) ==="
 pass "fused MoE + slot counters + CE accumulate match CPU"
 
 echo "=== [3/5] VRAM pre-flight (all shipped recipes) ==="
-for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1; do
+for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 en_2xt4 sft_en_2xt4 sft_en_4xt4; do
   "${BIN}/gai_train" --config "configs/${cfg}.yaml" --dry-run --device cuda \
     > /tmp/verify_dry_${cfg}.log 2>&1 || fail "dry-run ${cfg}"
   grep -q "TOTAL" /tmp/verify_dry_${cfg}.log || fail "dry-run ${cfg} printed no TOTAL"

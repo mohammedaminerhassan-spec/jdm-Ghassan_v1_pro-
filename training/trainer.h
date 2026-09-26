@@ -179,6 +179,9 @@ public:
 
     const TrainState& state() const { return state_; }
 
+    // Public for tests + preflight scripts (pure arithmetic over host RAM).
+    static size_t ckpt_ram_budget_public() { return ckpt_ram_budget(); }
+
 private:
     void run_pretrain();
     void run_sft();
@@ -286,20 +289,27 @@ private:
     // in-flight + retained cache). Exceeding it applies backpressure to the
     // training thread rather than aborting the run.
     //
-    // It was a hardcoded 32 GB, which is a LIE on a 30 GB Kaggle session: the
-    // queue happily accepted 5 snapshots (5.76 GB each for the 480M flagship)
-    // and the OOM killer won the race against the backpressure. Derived from
-    // the real machine now: a fraction of physical RAM, never above the old
-    // cap, and never below enough for one 480M snapshot to make progress.
+    // 2xT4 production: the queue holds at most 2 UNIQUE snapshots
+    // (one being written + one queued; same-step best+last share one pointer
+    // via snapshot_cache_, deduped by unique_snapshot_bytes). The old 35%
+    // budget (10GB on 29GB Kaggle) rejected a valid 480M run (5.76GB x2 =
+    // 11.5GB) and any 1B run deterministically. New rule: reserve 8GB for
+    // OS + training heap, give the rest to the checkpoint queue, clamped to
+    // [8GB, 32GB]. On 29GB Kaggle -> 21GB: 2x 8GB Lion-1B snapshots (16GB)
+    // progress with margin; on tiny boxes a too-large model still fails fast
+    // via the single-copy gate in save_async (not via spinning backpressure).
+    // Gradients are NEVER in the snapshot (bytes() = weights + optimizer
+    // moments only), so the budget never pays for grads.
     static size_t ckpt_ram_budget() {
         static const size_t kBudget = [] {
             const size_t kCap = 32ULL << 30;                 // historical ceiling
             const size_t kFloor = 8ULL << 30;                // >= one 480M snapshot
+            const size_t kReserve = 8ULL << 30;              // OS + runtime heap
             const size_t phys = physical_ram_bytes();
             if (phys == 0) return kCap;                      // unknown: keep old behaviour
-            const size_t share = static_cast<size_t>((static_cast<double>(phys) * 0.35));
-            size_t b = share < kCap ? share : kCap;
-            if (b < kFloor) b = (kFloor < phys) ? kFloor : phys;
+            if (phys <= kReserve + kFloor) return (kFloor < phys) ? kFloor : phys;
+            size_t b = phys - kReserve;
+            if (b > kCap) b = kCap;
             return b;
         }();
         return kBudget;

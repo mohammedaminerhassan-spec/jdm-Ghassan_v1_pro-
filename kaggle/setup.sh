@@ -12,6 +12,7 @@ SKIP_DATA=0
 DO_CLEAN=0
 FORCE_CPU=0
 REQUIRE_GPU=0
+REQUIRE_NCCL=0
 WITH_PARQUET=OFF
 
 # Parse args (tests are SKIPPED by default to save Kaggle time; pass
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
         --skip-data)   SKIP_DATA=1;    shift ;;
         --cpu-only)    FORCE_CPU=1;     shift ;;
         --require-gpu) REQUIRE_GPU=1;   shift ;;
+        --require-nccl) REQUIRE_NCCL=1;  shift ;;
         --with-parquet) WITH_PARQUET=ON; shift ;;
         *) shift ;;
     esac
@@ -197,6 +199,27 @@ fi
 echo ""
 echo "[build] Build complete. Binaries:"
 ls -lh "${BUILD_DIR}/bin/"
+
+# ---- 7b. NCCL gate for the 2-GPU production path (P1).
+# Never spend a long build and discover at runtime that DDP was not compiled:
+# an explicit --require-nccl (used by train_2xt4.sh) fails here with the numbers.
+if [[ "${REQUIRE_NCCL}" -eq 1 ]]; then
+    echo ""
+    echo "[nccl] --require-nccl: verifying NCCL multi-GPU capability..."
+    if [[ "${FORCE_CPU}" -eq 1 ]] || [[ "${HAVE_CUDA:-OFF}" != "ON" ]]; then
+        echo "[ERROR] --require-nccl but CUDA is OFF (nvcc missing or --cpu-only)."
+        echo "[ERROR] 2xT4 DDP needs CUDA+NCCL on a GPU session."
+        exit 1
+    fi
+    if grep -q "GAI_HAVE_NCCL:BOOL=ON" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+        echo "[nccl] OK: binary built with NCCL (GAI_HAVE_NCCL=ON)"
+    else
+        echo "[ERROR] NCCL not found at configure time (single-GPU build)."
+        echo "[ERROR] Install NCCL dev headers (libnccl-dev) and re-run setup.sh --with-parquet --require-nccl."
+        grep -i "nccl" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null || true
+        exit 1
+    fi
+fi
 
 # ---- 8. Run tests (unless skipped)
 if [[ "${SKIP_TESTS}" -eq 0 ]]; then

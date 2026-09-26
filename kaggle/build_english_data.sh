@@ -32,12 +32,12 @@ EN_DIR="${1:-${EN_PARQUET_DIR:-}}"
 if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
     # maxdepth 8: same deep-nesting contract as setup.sh find_english_lake
     # (dataset uploads like .../Users/<name>/Desktop/english_parquet).
-    local hit=""
+    hit=""
     hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
     if [[ -n "${hit}" ]]; then
         EN_DIR="$(dirname "${hit}")"
     else
-        local any=""
+        any=""
         any="$(find /kaggle/input -maxdepth 8 -name '*.parquet' 2>/dev/null | head -n 1)"
         if [[ -n "${any}" ]]; then
             EN_DIR="$(dirname "${any}")"

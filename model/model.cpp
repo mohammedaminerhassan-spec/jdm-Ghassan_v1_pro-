@@ -475,6 +475,67 @@ std::string ModelConfig::summary() const {
     return ss.str();
 }
 
+std::string ModelConfig::arch_identity() const {
+    // Fixed field order + fixed float formatting: identity must be stable
+    // across processes/ranks so DDP and checkpoint gates agree bit-exactly.
+    std::ostringstream ss;
+    ss << "v1|voc=" << vocab_size << "|d=" << hidden_size << "|L=" << num_layers
+       << "|H=" << num_heads << "|KV=" << num_kv_heads << "|ffn=" << intermediate_size
+       << "|ctx=" << max_seq_len << "|theta=" << strfmt("%.6f", (double)rope_theta).c_str()
+       << "|eps=" << strfmt("%.9f", (double)rms_eps).c_str()
+       << "|tie=" << (tie_embeddings ? 1 : 0)
+       << "|moe=" << (use_moe ? 1 : 0) << "|ne=" << num_experts << "|k=" << moe_top_k
+       << "|E=" << moe_expert_dim << "|sh=" << (moe_shared ? 1 : 0)
+       << "|aux=" << strfmt("%.6f", (double)moe_aux_scale).c_str()
+       << "|auxfree=" << (moe_aux_free ? 1 : 0)
+       << "|denseok=" << (moe_allow_dense ? 1 : 0)
+       << "|jit=" << strfmt("%.6f", (double)moe_jitter).c_str()
+       << "|qkn=" << (use_qk_norm ? 1 : 0)
+       << "|z=" << strfmt("%.7f", (double)z_loss_scale).c_str()
+       << "|rs=" << strfmt("%.4f", (double)rope_scale).c_str()
+       << "|ym=" << strfmt("%.4f", (double)rope_yarn_mscale).c_str()
+       << "|yl=" << strfmt("%.4f", (double)rope_yarn_low).c_str()
+       << "|yh=" << strfmt("%.4f", (double)rope_yarn_high).c_str()
+       << "|swa=" << sliding_window << "|rt=" << rope_type;
+    return ss.str();
+}
+
+bool ModelConfig::same_architecture_as(const ModelConfig& o, std::string* reason) const {
+    auto fail = [&](const char* f) {
+        if (reason) *reason = std::string("arch mismatch: ") + f;
+        return false;
+    };
+    if (vocab_size != o.vocab_size) return fail("vocab_size");
+    if (hidden_size != o.hidden_size) return fail("hidden_size");
+    if (num_layers != o.num_layers) return fail("num_layers");
+    if (num_heads != o.num_heads) return fail("num_heads");
+    if (num_kv_heads != o.num_kv_heads) return fail("num_kv_heads");
+    if (intermediate_size != o.intermediate_size) return fail("intermediate_size");
+    if (max_seq_len != o.max_seq_len) return fail("max_seq_len");
+    if (rope_theta != o.rope_theta) return fail("rope_theta");
+    if (rms_eps != o.rms_eps) return fail("rms_eps");
+    if (tie_embeddings != o.tie_embeddings) return fail("tie_embeddings");
+    if (use_moe != o.use_moe) return fail("use_moe");
+    if (num_experts != o.num_experts) return fail("num_experts");
+    if (moe_top_k != o.moe_top_k) return fail("moe_top_k");
+    if (moe_expert_dim != o.moe_expert_dim) return fail("moe_expert_dim");
+    if (moe_shared != o.moe_shared) return fail("moe_shared");
+    if (moe_aux_scale != o.moe_aux_scale) return fail("moe_aux_scale");
+    if (moe_aux_free != o.moe_aux_free) return fail("moe_aux_free");
+    if (moe_allow_dense != o.moe_allow_dense) return fail("moe_allow_dense");
+    if (moe_jitter != o.moe_jitter) return fail("moe_jitter");
+    if (use_qk_norm != o.use_qk_norm) return fail("use_qk_norm");
+    if (z_loss_scale != o.z_loss_scale) return fail("z_loss_scale");
+    if (rope_scale != o.rope_scale) return fail("rope_scale");
+    if (rope_yarn_mscale != o.rope_yarn_mscale) return fail("rope_yarn_mscale");
+    if (rope_yarn_low != o.rope_yarn_low) return fail("rope_yarn_low");
+    if (rope_yarn_high != o.rope_yarn_high) return fail("rope_yarn_high");
+    if (sliding_window != o.sliding_window) return fail("sliding_window");
+    if (rope_type != o.rope_type) return fail("rope_type");
+    // init_std excluded: same function, different init randomness only.
+    return true;
+}
+
 float rope_theta_eff(const ModelConfig& m) { return rope_theta_eff_local(m); }
 float rope_mscale(const ModelConfig& m) { return rope_mscale_local(m); }
 

@@ -84,7 +84,6 @@ training:
   pack_sequences: true
 
 data:
-  data_dir: artifacts/shards_en
   train_prefix: train_
   val_prefix: val_
   # english_behavior = authored persona/discipline dialogues (synth --lang en):
