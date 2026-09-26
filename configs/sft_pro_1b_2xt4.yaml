@@ -81,7 +81,7 @@ training:
   ckpt_segments: 1
   pack_sequences: true
   ddp: true
-  output_budget_mb: 19456
+  output_budget_mb: 18432
 
 data:
   train_prefix: train_

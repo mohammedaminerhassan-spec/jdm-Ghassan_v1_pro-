@@ -104,7 +104,7 @@ training:
   activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
-  output_budget_mb: 19456
+  output_budget_mb: 18432
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin

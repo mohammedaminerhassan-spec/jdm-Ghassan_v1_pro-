@@ -66,7 +66,7 @@ BINARY="${REPO_DIR}/build/bin/gai_train"
 # projects it before the first step instead of failing at Save Version.
 OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"   # unset = per-recipe default below
 if [[ -z "${OUTPUT_BUDGET_MB}" ]]; then
-    case "${CONFIG_PT}" in *pro_v1*|*t4_1b*|*1b*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
+    case "${CONFIG_PT}" in *pro_v1*|*t4_1b*|*1b*) OUTPUT_BUDGET_MB=18432;; *) OUTPUT_BUDGET_MB=17408;; esac
 fi
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
@@ -113,7 +113,8 @@ SFT_SHARDS=$(find "${SFT_DIR}" -name "train_*.gbin" 2>/dev/null | wc -l)
 [[ "${PT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No pretrain shards in ${PT_DIR}. Run build_english_data.sh first."; exit 1; }
 [[ "${SFT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No SFT shards in ${SFT_DIR}. Run build_english_data.sh first."; exit 1; }
 echo "[data] pretrain shards: ${PT_SHARDS} | sft shards: ${SFT_SHARDS}"
-# DISK FIT (19.5GB Kaggle): Pro ckpt is ~4GB each (last+best=8GB per stage).
+# DISK FIT (Kaggle cap 20GB): one snapshot = weights + optimizer moments
+# (480M-AdamW ~5.8GB, 1B-Lion ~8.3GB; last+best = 2x at most).
 # Auto-clean intermediates that are never needed during training, then guard.
 echo "[disk] before training:"; df -h "${REPO_DIR}" | tail -n 1
 rm -rf "${REPO_DIR}/artifacts/corpus" "${REPO_DIR}/artifacts/synth" 2>/dev/null || true

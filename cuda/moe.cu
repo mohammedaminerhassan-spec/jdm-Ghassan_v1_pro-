@@ -67,7 +67,9 @@ void moe_reserve_workspace(size_t bytes) {
 static i32*   g_grp_grouped = nullptr;
 static size_t g_grp_grouped_cap = 0;
 static int*   g_grp_cnt = nullptr;
-static int*   g_grp_cur = nullptr;
+static int*   g_grp_cur = nullptr;   // fill cursors (mutated by k_group_fill)
+static int*   g_grp_off = nullptr;   // clean offsets (never mutated after
+                                     // k_group_offsets, safe to copy D2H late)
 static int    g_grp_ne_cap = 0;
 
 static float g_moe_jitter = 0.0f;
@@ -90,9 +92,11 @@ static void grp_ensure(size_t nk, int ne) {
     if (ne > g_grp_ne_cap) {
         if (g_grp_cnt) CU_CHECK(cudaFree(g_grp_cnt));
         if (g_grp_cur) CU_CHECK(cudaFree(g_grp_cur));
+        if (g_grp_off) CU_CHECK(cudaFree(g_grp_off));
         check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
         CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
         CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));
+        CU_CHECK(cudaMalloc(&g_grp_off, sizeof(int) * (size_t)(ne + 1)));
         g_grp_ne_cap = ne;
     }
 }
@@ -727,12 +731,11 @@ static void ensure_offsets_pinned(int ne) {
 // Fills h_counts[ne], h_offsets[ne+1] on host; grouped slots on device.
 // h_counts/h_offsets must have room for ne / ne+1 ints. grouped_out receives
 // the device pointer (valid until the next call with larger NK).
-// PERF FIX: uses pinned host buffer + async D2H + event sync instead of a
-// blocking cudaMemcpy. The old blocking copy stalled the GPU pipeline for
-// ~10-20us per layer per microbatch (36 layers x 128 micros = ~4600 stalls
-// per step). The async copy lets the GPU continue executing while the data
-// transfers, and the event sync only waits when the host actually needs the
-// offsets for GEMM pointer arithmetic.
+// PERF: pinned host buffer + async D2H + event sync instead of a blocking
+// cudaMemcpy (~10-20us per layer per microbatch). Offsets and fill cursors
+// live in SEPARATE device buffers, so k_group_fill is queued BEFORE the host
+// reads the offsets: the GPU never idles on the host round-trip, it only
+// costs the host-side wait for ne+1 ints needed by the GEMM loop below.
 static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
                              i32** grouped_out, int* h_counts, int* h_offsets) {
     const i64 NK = N * K;
@@ -745,10 +748,17 @@ static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
     if (NK <= 0) return;
     CU_CHECK(cudaMemset(g_grp_cnt, 0, sizeof(int) * (size_t)ne));
     k_group_hist<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_cnt, NK, ne);
-    k_group_offsets<<<1, 1>>>(g_grp_cnt, g_grp_cur, g_grp_cur, ne);
+    // Offsets and fill cursors live in SEPARATE buffers (g_grp_off is never
+    // mutated after this kernel, g_grp_cur is consumed by k_group_fill), so
+    // the fill below may run BEFORE the host reads the offsets: the GPU no
+    // longer idles waiting for the host round-trip.
+    k_group_offsets<<<1, 1>>>(g_grp_cnt, g_grp_off, g_grp_cur, ne);
     CU_CHECK(cudaGetLastError());
-    // Async D2H into pinned buffer — GPU continues executing while copy runs.
-    CU_CHECK(cudaMemcpyAsync(g_h_offsets_pinned, g_grp_cur,
+    k_group_fill<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
+    CU_CHECK(cudaGetLastError());
+    // Async D2H of the CLEAN offsets into pinned buffer — queued after the
+    // fill on the same stream; disjoint memory, so no race either way.
+    CU_CHECK(cudaMemcpyAsync(g_h_offsets_pinned, g_grp_off,
                              sizeof(int) * (size_t)(ne + 1),
                              cudaMemcpyDeviceToHost, 0));
     CU_CHECK(cudaEventRecord(g_offsets_event, 0));
@@ -760,8 +770,6 @@ static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
         h_counts[e] = c < 0 ? 0 : c;
     }
     if (h_offsets[ne] <= 0) return;
-    k_group_fill<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
-    CU_CHECK(cudaGetLastError());
 }
 
 // ================================================================ forward
@@ -1191,6 +1199,7 @@ void moe_free_workspace() {
     if (g_grp_grouped) { cudaFree(g_grp_grouped); g_grp_grouped = nullptr; g_grp_grouped_cap = 0; }
     if (g_grp_cnt) { cudaFree(g_grp_cnt); g_grp_cnt = nullptr; }
     if (g_grp_cur) { cudaFree(g_grp_cur); g_grp_cur = nullptr; }
+    if (g_grp_off) { cudaFree(g_grp_off); g_grp_off = nullptr; }
     g_grp_ne_cap = 0;
     if (g_aux_cnt) { cudaFree(g_aux_cnt); g_aux_cnt = nullptr; }
     if (g_aux_psum) { cudaFree(g_aux_psum); g_aux_psum = nullptr; }

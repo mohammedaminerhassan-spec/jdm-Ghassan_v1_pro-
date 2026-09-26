@@ -52,6 +52,16 @@ public:
     void all_reduce_sum(float* buffer, size_t numel);
     void all_reduce_sum(void* buffer, size_t numel, int dtype_size);
     void all_reduce_sum_i64(int64_t* buffer, size_t numel);
+    // Grouped (async) variant: launches the collective on the NCCL stream
+    // WITHOUT the trailing host sync. The caller must bracket a batch of
+    // independent collectives with begin_group()/end_group() and call
+    // sync_stream() once before touching any result on the host. Used by
+    // Trainer::sync_gradients so ~200 params cost 1 group + 1 sync instead
+    // of N launches + N syncs. Buffers must stay alive until sync_stream().
+    void all_reduce_sum_nosync(void* buffer, size_t numel, int dtype_size);
+    void begin_group();
+    void end_group();
+    void sync_stream();
 
     // Broadcast from root to all
     void broadcast(void* buffer, size_t numel, int dtype_size, int root = 0);

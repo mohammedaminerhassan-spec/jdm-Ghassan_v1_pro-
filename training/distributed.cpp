@@ -221,19 +221,18 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
 #ifdef GAI_NCCL
     // OVERFLOW GUARD: grad compression casts f32->f16 while grads are still
     // scaled by loss_scale (e.g. 8192x). Scaled grads overflow fp16 -> inf ->
-    // skipped-step storm. Only use compression with loss_scale_init<=1
-    // (pure fp32 path) or after unscaling. Fail fast instead of silent NaN.
+    // skipped-step storm. FAIL FAST instead of warning-and-continuing: a
+    // warning scrolls past and the run then trains on garbage for hours.
+    // All shipped recipes keep ddp_grad_compression=false (exact fp32 path
+    // below), so this only fires when someone opts into compression.
     if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
         const char* ls = std::getenv("GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING");
         if (!ls || std::string(ls) != "1") {
-            // We cannot see Trainer loss_scale here; the trainer sets this
-            // env only when scaling is disabled. Default: refuse compression
-            // for large grad tensors to avoid silent overflow.
-            // Small tensors (<4096) fall through to exact fp32 path below.
-            log_warn("[dist] grad_compression requested: fp16 all-reduce is lossy and "
-                     "overflows when combined with loss scaling (>1). "
-                     "Set GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING=1 only when "
-                     "training.loss_scale_init<=1, else leave ddp_grad_compression=false.");
+            GAI_FAIL("ddp_grad_compression=true with loss scaling active: scaled "
+                     "grads overflow fp16 and corrupt training. Either set "
+                     "training.ddp_grad_compression=false (exact fp32 all-reduce, "
+                     "recommended), or set training.loss_scale_init<=1 AND export "
+                     "GAI_ALLOW_GRAD_COMPRESSION_WITH_SCALING=1 knowingly.");
         }
         size_t nbytes_f32 = numel * sizeof(float);
         size_t nbytes_f16 = numel * sizeof(uint16_t);
@@ -282,6 +281,58 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     ops::perf_note_sync();
 #else
     (void)buffer; (void)numel; (void)dtype_size;
+#endif
+}
+
+// Grouped/async collectives: same launch as all_reduce_sum but the caller
+// owns completion via sync_stream(). All buffers in one group must be
+// independent (different memory, no host reads until the trailing sync);
+// ncclGroupStart/End fuses the launches into fewer NCCL kernels.
+void DistributedContext::all_reduce_sum_nosync(void* buffer, size_t numel, int dtype_size) {
+    if (world_size_ <= 1) return;
+
+#ifdef GAI_NCCL
+    ncclDataType_t nccl_dtype = ncclFloat32;
+    if (dtype_size == 2) nccl_dtype = ncclFloat16;
+    else if (dtype_size == 4) nccl_dtype = ncclFloat32;
+    else if (dtype_size == 8) nccl_dtype = ncclFloat64;
+    else if (dtype_size == 1) nccl_dtype = ncclInt8;
+
+    const size_t nbytes = numel * static_cast<size_t>(dtype_size);
+    bool back = false;
+    void* dev = collective_staging(buffer, nbytes, &back);
+    // Host-staged buffers (back==true) need their H2D copy visible: the
+    // blocking memcpy above already completes before we return, so the
+    // grouped kernel is safe. A grouped collective whose result must come
+    // back to the host is a caller bug — refuse loudly instead of racing.
+    if (back) GAI_FAIL("all_reduce_sum_nosync: host buffer needs copy-back; "
+                       "use the syncing all_reduce_sum for host-side results");
+    wait_for_compute();
+    NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
+#else
+    (void)buffer; (void)numel; (void)dtype_size;
+#endif
+}
+
+void DistributedContext::begin_group() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    NCCL_CHECK(ncclGroupStart());
+#endif
+}
+
+void DistributedContext::end_group() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    NCCL_CHECK(ncclGroupEnd());
+#endif
+}
+
+void DistributedContext::sync_stream() {
+    if (world_size_ <= 1) return;
+#ifdef GAI_NCCL
+    CU_RT_CHECK(cudaStreamSynchronize(stream_));
+    ops::perf_note_sync();
 #endif
 }
 

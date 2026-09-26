@@ -15,6 +15,7 @@
 #   bash kaggle/train_2xt4.sh --pilot-only                       # 2-rank pilot, measures global tok/s
 #   bash kaggle/train_2xt4.sh --time-budget-min 500 --pt-fraction 60
 #   CONFIG_PT=configs/en_2xt4.yaml bash kaggle/train_2xt4.sh    # 480M family
+#   bash kaggle/train_2xt4.sh --time-budget-min 240             # short quota (~4h train)
 #
 # Everything downstream of the recipe (checkpoint dirs, GGUF name, VRAM gate,
 # output budget) is DERIVED from the config basename, so a recipe pair can
@@ -50,15 +51,26 @@ CKPT_SFT="${CKPT_SFT:-${CKPT_PT}_sft}"
 GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-${RECIPE_TAG}_q4_0.gguf}"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
 # Kaggle /kaggle/working cap is 20GB (build+data+train). 480M recipes project
-# ~11.3GB; 1B recipes ~16.0GB (2 snapshots + GGUF), so they get 19GB. Both stay
+# ~11.3GB; 1B recipes ~16.0GB (2 snapshots + GGUF), so they get 18GB. Both stay
 # under the panel cap. An explicit OUTPUT_BUDGET_MB always wins.
 if [[ -z "${OUTPUT_BUDGET_MB:-}" ]]; then
-    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) OUTPUT_BUDGET_MB=19456;; *) OUTPUT_BUDGET_MB=17408;; esac
+    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) OUTPUT_BUDGET_MB=18432;; *) OUTPUT_BUDGET_MB=17408;; esac
 fi
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
-PILOT_STEPS=20
-EXPORT_MARGIN_SEC=900
+# PILOT cost scales with grad_accum (1B: 64 micros/step). 20 pilot steps on 1B
+# would burn ~30-45min of quota just measuring; 8 steps (512 micros) measures
+# the same steady-state tok/s. Explicit PILOT_STEPS (or --pilot-steps) wins.
+PILOT_STEPS="${PILOT_STEPS:-}"
+if [[ -z "${PILOT_STEPS}" ]]; then
+    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) PILOT_STEPS=8;; *) PILOT_STEPS=20;; esac
+fi
+# Export margin: q4_0 quant of 1B params + 8GB writes on 4 Kaggle cores needs
+# more than the 480M's 15min. Recipe-aware so the plan never eats the export.
+EXPORT_MARGIN_SEC="${EXPORT_MARGIN_SEC:-}"
+if [[ -z "${EXPORT_MARGIN_SEC}" ]]; then
+    case "${CONFIG_PT}" in *1b*|*pro_v1*|*t4_1b*) EXPORT_MARGIN_SEC=1200;; *) EXPORT_MARGIN_SEC=900;; esac
+fi
 PT_FRACTION=60
 SKIP_PREFLIGHT=0
 
@@ -71,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --no-export) EXPORT_GGUF=0; shift ;;
         --export-profile) EXPORT_PROFILE="$2"; shift 2 ;;
         --pt-fraction) PT_FRACTION="$2"; shift 2 ;;
+        --pilot-steps) PILOT_STEPS="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -286,19 +299,30 @@ PT_STEPS=$(( TOTAL_STEPS * PT_FRACTION / 100 ))
 SFT_STEPS=$(( TOTAL_STEPS - PT_STEPS ))
 [[ "${PT_STEPS}" -lt 50 ]] && PT_STEPS=50
 [[ "${SFT_STEPS}" -lt 50 ]] && SFT_STEPS=50
-PT_WARM=$(( PT_STEPS / 10 ));  [[ "${PT_WARM}" -gt 800 ]] && PT_WARM=800
-SFT_WARM=$(( SFT_STEPS / 10 )); [[ "${SFT_WARM}" -gt 200 ]] && SFT_WARM=200
+# Warmup follows the YAML (stability-critical: 1B+Lion was validated at 1500,
+# the old 800 cap silently shortened it). Short runs scale down to steps/10.
+YAML_PT_WARM=$(yget warmup_steps "${CONFIG_PT}");  [[ "${YAML_PT_WARM}" =~ ^[0-9]+$ ]] || YAML_PT_WARM=800
+YAML_SFT_WARM=$(yget warmup_steps "${CONFIG_SFT}"); [[ "${YAML_SFT_WARM}" =~ ^[0-9]+$ ]] || YAML_SFT_WARM=200
+PT_WARM=$(( PT_STEPS / 10 ));  [[ "${PT_WARM}" -gt "${YAML_PT_WARM}" ]] && PT_WARM="${YAML_PT_WARM}"
+SFT_WARM=$(( SFT_STEPS / 10 )); [[ "${SFT_WARM}" -gt "${YAML_SFT_WARM}" ]] && SFT_WARM="${YAML_SFT_WARM}"
+[[ "${PT_WARM}" -lt 50 ]] && PT_WARM=50
+[[ "${SFT_WARM}" -lt 50 ]] && SFT_WARM=50
+echo "[plan] warmup PT=${PT_WARM} (yaml ${YAML_PT_WARM}) SFT=${SFT_WARM} (yaml ${YAML_SFT_WARM})"
 EVAL_CAD=$(( TOTAL_STEPS / 10 )); [[ "${EVAL_CAD}" -lt 50 ]] && EVAL_CAD=50
 echo "[plan] budget=${TIME_BUDGET_MIN}min remain~=${REMAIN_SEC}s total=${TOTAL_STEPS} (PT=${PT_STEPS} SFT=${SFT_STEPS}) ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens"
 
 # How much of the corpus does that plan actually cover? The decision "is one
 # 8h session enough" depends on it: more than ~2 epochs means we are fitting
-# the data, not learning from it. Parsed from `data_pipeline inspect` ("  total:
-# N tokens"); best-effort only (never fails the run).
+# the data, not learning from it. Parsed from `data_pipeline inspect`
+# ("  total: N tokens", human_count style: 850 / 1.20K / 427.76M / 1.04B).
+# Best-effort only (never fails the run).
 DATASET_TOKENS=0
-if [[ -f "${PT_DIR}" ]]; then
+if [[ -d "${PT_DIR}" ]]; then
     DATASET_TOKENS=$("${PIPE_BIN}" inspect --shards "${PT_DIR}" 2>/dev/null \
-        | awk '/^  total: /{gsub(/[^0-9.]/,"",$2); t+=$2} END{printf "%d", t+0}' || echo 0)
+        | awk '/^  total: /{v=$2; m=1;
+               if (v ~ /K$/) m=1000; else if (v ~ /M$/) m=1000000;
+               else if (v ~ /B$/) m=1000000000; else if (v ~ /T$/) m=1000000000000;
+               gsub(/[^0-9.]/,"",v); t+=v*m} END{printf "%.0f", t+0}' || echo 0)
 fi
 if [[ "${DATASET_TOKENS}" -gt 0 ]]; then
     PT_TOKENS=$(( PT_STEPS * FULL_TPS ))

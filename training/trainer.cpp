@@ -752,9 +752,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
     // 6 with the run half done.
     {
         const u64 params = static_cast<u64>(model_.num_parameters());
-        // weights fp32 + grads fp32 + adamw m/v (lion: m only). Matches the
-        // measured 12.0002 bytes/param of a real checkpoint.
-        const size_t per_snapshot = static_cast<size_t>(params) * 8 + opt_state_bytes();
+        // Snapshot = weights fp32 + optimizer moments (lion: m only). NO grads:
+        // capture_common() clones p->w only ("Gradients are NEVER in the
+        // snapshot"). The old params*8 double-counted grads (+4GB phantom per
+        // 1B snapshot, +8GB in the 2x transient math) and could FALSELY fail
+        // the RAM/disk/quota guards on a valid run. Matches the measured
+        // 12.0002 bytes/param of a real AdamW checkpoint (4+4+4, no grads).
+        const size_t per_snapshot = static_cast<size_t>(params) * 4 + opt_state_bytes();
 
         const size_t ram = physical_ram_bytes();
         const size_t ram_budget = ckpt_ram_budget();
@@ -1805,28 +1809,39 @@ void Trainer::sync_gradients() {
     // exact global ntok (sync_ntok_sum). ~200 params => ~200 NCCL launches was
     // the dominant DDP overhead; large tensors (>=1M) go individually,
     // small packed into one persistent staging buffer, reduced once.
+    // GROUPED LAUNCH: all grad collectives in one ncclGroupStart/End with a
+    // SINGLE trailing host sync (was N launches + N syncs). Transfer bytes
+    // are unchanged — the win is launch/sync overhead, and the host stays
+    // free to queue work while NCCL runs.
     constexpr size_t kLarge = 1 << 20;
     struct Item { float* ptr; size_t n; };
+    std::vector<Item> large;   // reduced individually inside one NCCL group
     std::vector<Item> small;
+    large.reserve(16);
     small.reserve(64);
     size_t small_total = 0;
     for (Parameter* p : model_.parameters()) {
         if (!p->g.defined() || p->frozen) continue;
         // FIX P2 (silent DDP divergence): a CPU-resident grad was skipped
         // from the NCCL SUM yet the step still divided by global ntok,
-        // so ranks diverged silently. Fail fast instead.
+        // so ranks diverged silently. Fail fast instead. (Also guarantees
+        // every grouped buffer below is device memory.)
         if (p->g.device() != Device::CUDA)
             GAI_FAIL("DDP requires all trainable grads on CUDA (param '" + p->name +
                      "' is CPU); move the model to CUDA or disable ddp");
         size_t numel = static_cast<size_t>(p->g.numel());
         if (numel == 0) continue;
         if (numel >= kLarge) {
-            dist_->all_reduce_sum(static_cast<float*>(p->g.data_ptr()), numel);
+            large.push_back({static_cast<float*>(p->g.data_ptr()), numel});
         } else {
             small.push_back({static_cast<float*>(p->g.data_ptr()), numel});
             small_total += numel;
         }
     }
+    // Stage the small grads BEFORE the group: staging does (grow-once)
+    // cudaMalloc + blocking copies, which must not sit between
+    // ncclGroupStart/End (the group region is for NCCL launches only).
+    float* stage = nullptr;
     if (!small.empty() && small_total > 0) {
         // Grow-once staging (monotonic, no per-step cudaMalloc).
         if (!dist_fused_.defined() ||
@@ -1834,15 +1849,25 @@ void Trainer::sync_gradients() {
             size_t want = small_total + small_total / 8 + 1024;
             dist_fused_ = Tensor::empty({(i64)want}, DType::F32, Device::CUDA);
         }
-        float* stage = dist_fused_.f32();
+        stage = dist_fused_.f32();
         size_t off = 0;
         for (auto& it : small) {
             device_copy(stage + off, Device::CUDA, it.ptr, Device::CUDA,
                         it.n * sizeof(float));
             off += it.n;
         }
-        dist_->all_reduce_sum(stage, small_total);
-        off = 0;
+    }
+    // One group, one completion: every launch below is independent device
+    // memory, and no host read happens before the trailing sync.
+    dist_->begin_group();
+    for (auto& it : large)
+        dist_->all_reduce_sum_nosync(it.ptr, it.n, sizeof(float));
+    if (stage)
+        dist_->all_reduce_sum_nosync(stage, small_total, sizeof(float));
+    dist_->end_group();
+    dist_->sync_stream();
+    if (stage) {
+        size_t off = 0;
         for (auto& it : small) {
             device_copy(it.ptr, Device::CUDA, stage + off, Device::CUDA,
                         it.n * sizeof(float));
