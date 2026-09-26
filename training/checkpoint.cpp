@@ -326,9 +326,23 @@ static void publish_file(const std::string& path, const std::string& tmp) {
         if (fs::exists(backup, restore_ec) && !restore_ec) fs::rename(backup, target, restore_ec);
         GAI_CHECK(false, "cannot finalise checkpoint: " + reason);
     }
-    fs::remove(backup, ec);
     if (ec) log_warn("checkpoint backup cleanup failed: " + ec.message());
 }
+
+size_t unique_snapshot_bytes(const std::vector<std::shared_ptr<CheckpointSnapshot>>& refs) {
+    size_t total = 0;
+    std::vector<const CheckpointSnapshot*> seen;
+    for (const auto& s : refs) {
+        if (!s) continue;
+        const CheckpointSnapshot* ptr = s.get();
+        if (std::find(seen.begin(), seen.end(), ptr) == seen.end()) {
+            seen.push_back(ptr);
+            total += s->bytes();
+        }
+    }
+    return total;
+}
+
 void Checkpoint::save(const std::string& path, const Model& model,
                       const AdamW& opt, const TrainState& state) {
     save(capture(model, opt, state), path);

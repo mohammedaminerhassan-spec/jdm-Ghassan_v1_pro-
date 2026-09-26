@@ -46,6 +46,8 @@ struct CheckpointSnapshot {
     }
 };
 
+size_t unique_snapshot_bytes(const std::vector<std::shared_ptr<CheckpointSnapshot>>& refs);
+
 class Checkpoint {
 public:
     static void save(const std::string& path,

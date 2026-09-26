@@ -267,78 +267,82 @@ __global__ void k_route_bias(const float* logits, const float* bias,
 // Atomic count is unchanged semantically (K=2 shares a dst row) but each
 // transaction is now coalesced 128-bit where possible.
 // dst[s] = src[t] for slot s = t*K+k (token-space gather)
+// dst[s] = src[t] for slot s = t*K+k (token-space gather)
 __global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
                              i64 nslots, int rowlen, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    i32 t = slots[s] / K;
-    const float* r = src + (i64)t * rowlen;
-    float* o = dst + s * rowlen;
-    int j = 0;
-    if ((rowlen & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (; j < rowlen / 4; ++j) o4[j] = r4[j];
-    } else {
-        for (; j < rowlen; ++j) o[j] = r[j];
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 t = slots[s] / K;
+        const float* r = src + (i64)t * rowlen;
+        float* o = dst + s * rowlen;
+        int j = 0;
+        if ((rowlen & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (; j < rowlen / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (; j < rowlen; ++j) o[j] = r[j];
+        }
     }
 }
 
 // dst[s] = src[slot]  (slot-space gather)
 __global__ void k_gather(const float* src, const i32* slots, float* dst,
                          i64 nslots, int rowlen) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    const float* r = src + (i64)slots[s] * rowlen;
-    float* o = dst + s * rowlen;
-    if ((rowlen & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
-    } else {
-        for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        const float* r = src + (i64)slots[s] * rowlen;
+        float* o = dst + s * rowlen;
+        if ((rowlen & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+        }
     }
 }
 
 // dst[slot] = src[s]  (slot-space scatter)
 __global__ void k_scatter_copy(const float* src, const i32* slots, float* dst,
                                i64 nslots, int rowlen) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    const float* r = src + s * rowlen;
-    float* o = dst + (i64)slots[s] * rowlen;
-    if ((rowlen & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
-    } else {
-        for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        const float* r = src + s * rowlen;
+        float* o = dst + (i64)slots[s] * rowlen;
+        if ((rowlen & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (int j = 0; j < rowlen; ++j) o[j] = r[j];
+        }
     }
 }
 
 // dst[t] += w[t,k] * src[s]  (atomic: slots of one token share dst rows)
 __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
                               const float* w, i64 nslots, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    i32 slot = slots[s];
-    i32 t = slot / K;
-    i32 k = slot % K;
-    float wv = w ? w[(i64)t * K + k] : 1.0f;
-    float* o = dst + (i64)t * d;
-    const float* r = src + s * d;
-    // vectorized load, scalar atomic store (float4 atomics do not exist)
-    if ((d & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        for (int j = 0; j < d / 4; ++j) {
-            float4 v = r4[j];
-            atomicAdd(&o[j * 4 + 0], wv * v.x);
-            atomicAdd(&o[j * 4 + 1], wv * v.y);
-            atomicAdd(&o[j * 4 + 2], wv * v.z);
-            atomicAdd(&o[j * 4 + 3], wv * v.w);
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 slot = slots[s];
+        i32 t = slot / K;
+        i32 k = slot % K;
+        float wv = w ? w[(i64)t * K + k] : 1.0f;
+        float* o = dst + (i64)t * d;
+        const float* r = src + s * d;
+        if ((d & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            for (int j = 0; j < d / 4; ++j) {
+                float4 v = r4[j];
+                atomicAdd(&o[j * 4 + 0], wv * v.x);
+                atomicAdd(&o[j * 4 + 1], wv * v.y);
+                atomicAdd(&o[j * 4 + 2], wv * v.z);
+                atomicAdd(&o[j * 4 + 3], wv * v.w);
+            }
+        } else {
+            for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
         }
-    } else {
-        for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
     }
 }
 
@@ -356,18 +360,19 @@ __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
 // Xpack[s] = x[grouped[s]/K] — pack every expert's input rows in one pass.
 __global__ void k_pack_all(const float* x, const i32* grouped, float* out,
                            i64 NK, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    i32 t = grouped[s] / K;
-    const float* r = x + (i64)t * d;
-    float* o = out + s * d;
-    int j = 0;
-    if ((d & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (; j < d / 4; ++j) o4[j] = r4[j];
-    } else {
-        for (; j < d; ++j) o[j] = r[j];
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i32 t = grouped[s] / K;
+        const float* r = x + (i64)t * d;
+        float* o = out + s * d;
+        int j = 0;
+        if ((d & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (; j < d / 4; ++j) o4[j] = r4[j];
+        } else {
+            for (; j < d; ++j) o[j] = r[j];
+        }
     }
 }
 
@@ -378,26 +383,27 @@ __global__ void k_save3_all(const float* G, const float* U, const float* A,
                             const i32* grouped,
                             float* s_gate, float* s_up, float* s_act,
                             i64 NK, int E) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    i64 slot = grouped[s];
-    const float* g = G + s * E;
-    const float* u = U + s * E;
-    const float* a = A + s * E;
-    float* og = s_gate + slot * E;
-    float* ou = s_up + slot * E;
-    float* oa = s_act + slot * E;
-    int j = 0;
-    if ((E & 3) == 0) {
-        const float4* g4 = reinterpret_cast<const float4*>(g);
-        const float4* u4 = reinterpret_cast<const float4*>(u);
-        const float4* a4 = reinterpret_cast<const float4*>(a);
-        float4* og4 = reinterpret_cast<float4*>(og);
-        float4* ou4 = reinterpret_cast<float4*>(ou);
-        float4* oa4 = reinterpret_cast<float4*>(oa);
-        for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
-    } else {
-        for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        const float* g = G + s * E;
+        const float* u = U + s * E;
+        const float* a = A + s * E;
+        float* og = s_gate + slot * E;
+        float* ou = s_up + slot * E;
+        float* oa = s_act + slot * E;
+        int j = 0;
+        if ((E & 3) == 0) {
+            const float4* g4 = reinterpret_cast<const float4*>(g);
+            const float4* u4 = reinterpret_cast<const float4*>(u);
+            const float4* a4 = reinterpret_cast<const float4*>(a);
+            float4* og4 = reinterpret_cast<float4*>(og);
+            float4* ou4 = reinterpret_cast<float4*>(ou);
+            float4* oa4 = reinterpret_cast<float4*>(oa);
+            for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+        } else {
+            for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+        }
     }
 }
 
@@ -406,25 +412,26 @@ __global__ void k_save3_all(const float* G, const float* U, const float* A,
 // the caller zeroes `out` for the routed contribution before launching.
 __global__ void k_scatter_add_all(float* out, const float* Y, const i32* grouped,
                                   const float* w, i64 NK, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    i32 slot = grouped[s];
-    i32 t = slot / K;
-    i32 k = slot % K;
-    float wv = w ? w[(i64)t * K + k] : 1.0f;
-    float* o = out + (i64)t * d;
-    const float* r = Y + s * d;
-    if ((d & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        for (int j = 0; j < d / 4; ++j) {
-            float4 v = r4[j];
-            atomicAdd(&o[j * 4 + 0], wv * v.x);
-            atomicAdd(&o[j * 4 + 1], wv * v.y);
-            atomicAdd(&o[j * 4 + 2], wv * v.z);
-            atomicAdd(&o[j * 4 + 3], wv * v.w);
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i32 slot = grouped[s];
+        i32 t = slot / K;
+        i32 k = slot % K;
+        float wv = w ? w[(i64)t * K + k] : 1.0f;
+        float* o = out + (i64)t * d;
+        const float* r = Y + s * d;
+        if ((d & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            for (int j = 0; j < d / 4; ++j) {
+                float4 v = r4[j];
+                atomicAdd(&o[j * 4 + 0], wv * v.x);
+                atomicAdd(&o[j * 4 + 1], wv * v.y);
+                atomicAdd(&o[j * 4 + 2], wv * v.z);
+                atomicAdd(&o[j * 4 + 3], wv * v.w);
+            }
+        } else {
+            for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
         }
-    } else {
-        for (int j = 0; j < d; ++j) atomicAdd(&o[j], wv * r[j]);
     }
 }
 
@@ -433,51 +440,53 @@ __global__ void k_scatter_add_all(float* out, const float* Y, const i32* grouped
 __global__ void k_gather3_all(const float* s_gate, const float* s_up, const float* s_act,
                               const i32* grouped, float* G, float* U, float* A,
                               i64 NK, int E) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    i64 slot = grouped[s];
-    const float* g = s_gate + slot * E;
-    const float* u = s_up + slot * E;
-    const float* a = s_act + slot * E;
-    float* og = G + s * E;
-    float* ou = U + s * E;
-    float* oa = A + s * E;
-    int j = 0;
-    if ((E & 3) == 0) {
-        const float4* g4 = reinterpret_cast<const float4*>(g);
-        const float4* u4 = reinterpret_cast<const float4*>(u);
-        const float4* a4 = reinterpret_cast<const float4*>(a);
-        float4* og4 = reinterpret_cast<float4*>(og);
-        float4* ou4 = reinterpret_cast<float4*>(ou);
-        float4* oa4 = reinterpret_cast<float4*>(oa);
-        for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
-    } else {
-        for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        const float* g = s_gate + slot * E;
+        const float* u = s_up + slot * E;
+        const float* a = s_act + slot * E;
+        float* og = G + s * E;
+        float* ou = U + s * E;
+        float* oa = A + s * E;
+        int j = 0;
+        if ((E & 3) == 0) {
+            const float4* g4 = reinterpret_cast<const float4*>(g);
+            const float4* u4 = reinterpret_cast<const float4*>(u);
+            const float4* a4 = reinterpret_cast<const float4*>(a);
+            float4* og4 = reinterpret_cast<float4*>(og);
+            float4* ou4 = reinterpret_cast<float4*>(ou);
+            float4* oa4 = reinterpret_cast<float4*>(oa);
+            for (; j < E / 4; ++j) { og4[j] = g4[j]; ou4[j] = u4[j]; oa4[j] = a4[j]; }
+        } else {
+            for (; j < E; ++j) { og[j] = g[j]; ou[j] = u[j]; oa[j] = a[j]; }
+        }
     }
 }
 
 // S[s] = dout[t] * w[t,k] — pack and scale the upstream grads in one pass.
 __global__ void k_scale_all(const float* dout, const float* w, const i32* grouped,
                             float* S, i64 NK, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    i64 slot = grouped[s];
-    i64 t = slot / K;
-    i64 k = slot % K;
-    float wv = w ? w[t * K + k] : 1.0f;
-    const float* r = dout + t * d;
-    float* o = S + s * d;
-    int j = 0;
-    if ((d & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (; j < d / 4; ++j) {
-            float4 v = r4[j];
-            v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
-            o4[j] = v;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        i64 slot = grouped[s];
+        i64 t = slot / K;
+        i64 k = slot % K;
+        float wv = w ? w[t * K + k] : 1.0f;
+        const float* r = dout + t * d;
+        float* o = S + s * d;
+        int j = 0;
+        if ((d & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (; j < d / 4; ++j) {
+                float4 v = r4[j];
+                v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
+                o4[j] = v;
+            }
+        } else {
+            for (; j < d; ++j) o[j] = r[j] * wv;
         }
-    } else {
-        for (; j < d; ++j) o[j] = r[j] * wv;
     }
 }
 
@@ -505,24 +514,25 @@ void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
 // dst[s] = src[t] * w[t,k]
 __global__ void k_scale_rows(const float* src, const float* w, const i32* slots,
                              float* dst, i64 nslots, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    i32 slot = slots[s];
-    i32 t = slot / K;
-    i32 k = slot % K;
-    float wv = w[(i64)t * K + k];
-    const float* r = src + (i64)t * d;
-    float* o = dst + s * d;
-    if ((d & 3) == 0) {
-        const float4* r4 = reinterpret_cast<const float4*>(r);
-        float4* o4 = reinterpret_cast<float4*>(o);
-        for (int j = 0; j < d / 4; ++j) {
-            float4 v = r4[j];
-            v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
-            o4[j] = v;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 slot = slots[s];
+        i32 t = slot / K;
+        i32 k = slot % K;
+        float wv = w[(i64)t * K + k];
+        const float* r = src + (i64)t * d;
+        float* o = dst + s * d;
+        if ((d & 3) == 0) {
+            const float4* r4 = reinterpret_cast<const float4*>(r);
+            float4* o4 = reinterpret_cast<float4*>(o);
+            for (int j = 0; j < d / 4; ++j) {
+                float4 v = r4[j];
+                v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
+                o4[j] = v;
+            }
+        } else {
+            for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
         }
-    } else {
-        for (int j = 0; j < d; ++j) o[j] = r[j] * wv;
     }
 }
 
@@ -551,14 +561,15 @@ __global__ void k_swiglu_bwd_assign(const float* g, const float* u, const float*
 // dp[s] = dot(dout[t], expert_out[s])
 __global__ void k_dp_dot(const float* dout, const float* eout, const i32* slots,
                          float* dp, i64 nslots, int d, int K) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nslots) return;
-    i32 t = slots[s] / K;
-    const float* a = dout + (i64)t * d;
-    const float* b = eout + s * d;
-    float acc = 0.0f;
-    for (int j = 0; j < d; ++j) acc += a[j] * b[j];
-    dp[s] = acc;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
+        i32 t = slots[s] / K;
+        const float* a = dout + (i64)t * d;
+        const float* b = eout + s * d;
+        float acc = 0.0f;
+        for (int j = 0; j < d; ++j) acc += a[j] * b[j];
+        dp[s] = acc;
+    }
 }
 
 // One block per token: softmax backward over the router distribution plus the
@@ -649,10 +660,11 @@ __global__ void k_router_dl(const float* x, const float* router_w,
 // grouped[s] layout after build: expert 0 slots, then expert 1, ...
 // h_counts[e] = slots for expert e, h_offsets[e] = start index in grouped.
 __global__ void k_group_hist(const i32* idx, int* cnt, i64 NK, int ne) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    int e = idx[s];
-    if (e >= 0 && e < ne) atomicAdd(&cnt[e], 1);
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        int e = idx[s];
+        if (e >= 0 && e < ne) atomicAdd(&cnt[e], 1);
+    }
 }
 
 __global__ void k_group_offsets(const int* cnt, int* offsets, int* cursors, int ne) {
@@ -668,12 +680,13 @@ __global__ void k_group_offsets(const int* cnt, int* offsets, int* cursors, int 
 
 __global__ void k_group_fill(const i32* idx, i32* grouped, int* cursors,
                              i64 NK, int ne) {
-    i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= NK) return;
-    int e = idx[s];
-    if (e < 0 || e >= ne) return;
-    int pos = atomicAdd(&cursors[e], 1);
-    grouped[pos] = (i32)s;
+    i64 stride = (i64)gridDim.x * blockDim.x;
+    for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < NK; s += stride) {
+        int e = idx[s];
+        if (e < 0 || e >= ne) continue;
+        int pos = atomicAdd(&cursors[e], 1);
+        grouped[pos] = (i32)s;
+    }
 }
 
 // Fills h_counts[ne], h_offsets[ne+1] on host; grouped slots on device.

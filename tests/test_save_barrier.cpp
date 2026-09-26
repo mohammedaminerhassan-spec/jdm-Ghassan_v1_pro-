@@ -49,6 +49,7 @@ int main() {
     CHECK(Checkpoint::load(good.string(), model, &opt, loaded), "baseline checkpoint loads");
 
     std::filesystem::create_directories(blocked, ec);
+    const std::string blocked_tmp = blocked.string() + ".tmp";
     bool threw = false;
     try {
         Checkpoint::save(Checkpoint::capture(model, opt, state), blocked.string());
@@ -56,9 +57,14 @@ int main() {
         threw = true;
     }
     CHECK(threw, "invalid checkpoint destination fails before publishing");
+    CHECK(!std::filesystem::exists(blocked_tmp), "TmpGuard: no stale .tmp file remains after save failure");
+    CHECK(std::filesystem::is_directory(blocked), "blocked directory target remains a directory");
+
     TrainState reloaded;
     CHECK(Checkpoint::load(good.string(), model, &opt, reloaded), "last checkpoint survives failed save");
     CHECK(reloaded.step == 3, "surviving checkpoint state is intact");
+    CHECK(!std::filesystem::exists(good.string() + ".tmp"), "successful save cleans up .tmp file");
+    CHECK(!std::filesystem::exists(good.string() + ".bak"), "successful save cleans up .bak file");
 
     const std::filesystem::path backup = good.string() + ".bak";
     std::filesystem::rename(good, backup, ec);

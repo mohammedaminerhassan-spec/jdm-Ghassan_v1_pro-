@@ -105,6 +105,50 @@ int main() {
         CHECK(threw, "ns_steps outside 1..10 fails fast");
     }
 
+    // Contract test: grad_scale invariance (scaling g by S and passing 1/S gives identical weight updates).
+    {
+        ModelConfig cfg = cfg_of();
+        Model m1(cfg, Device::CPU); m1.init_weights(42); m1.enable_grad(true);
+        Model m2(cfg, Device::CPU); m2.init_weights(42); m2.enable_grad(true);
+
+        MuonConfig oc;
+        oc.min_ns_dim = 0;
+        Muon opt1(m1, oc);
+        Muon opt2(m2, oc);
+
+        // Populate identical gradients on m1 and m2
+        auto& p1 = m1.parameters();
+        auto& p2 = m2.parameters();
+        for (size_t i = 0; i < p1.size(); ++i) {
+            p1[i]->g = Tensor::zeros(p1[i]->shape, DType::F32, Device::CPU);
+            p2[i]->g = Tensor::zeros(p2[i]->shape, DType::F32, Device::CPU);
+            float* g1 = p1[i]->g.f32();
+            float* g2 = p2[i]->g.f32();
+            for (i64 k = 0; k < p1[i]->numel(); ++k) {
+                float val = std::sin(static_cast<float>(k + 1) * 0.1f);
+                g1[k] = val;         // unscaled (grad_scale = 1.0)
+                g2[k] = val * 8.0f;  // scaled by 8.0 (grad_scale = 1.0 / 8.0)
+            }
+        }
+
+        const double gnorm1 = opt1.step(0.01f, 1.0f);
+        const double gnorm2 = opt2.step(0.01f, 1.0f / 8.0f);
+
+        CHECK(std::abs(gnorm1 - gnorm2) < 1e-4, "Muon: unscaled and scaled grad norms match");
+
+        // Verify weights across all parameters match
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < p1.size(); ++i) {
+            const float* w1 = p1[i]->w.f32();
+            const float* w2 = p2[i]->w.f32();
+            for (i64 k = 0; k < p1[i]->numel(); ++k) {
+                float diff = std::abs(w1[k] - w2[k]);
+                if (diff > max_diff) max_diff = diff;
+            }
+        }
+        CHECK(max_diff < 1e-5f, "Muon: weight update is strictly grad_scale invariant");
+    }
+
     if (failures == 0) {
         std::cout << "test_muon_gate: ALL PASS\n";
         return 0;
