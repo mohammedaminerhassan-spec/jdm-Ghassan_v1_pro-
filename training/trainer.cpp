@@ -387,7 +387,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         if (cfg_.optimizer == "adamw" && total_params > 800000000LL &&
             model_.device() == Device::CUDA) {
             GAI_FAIL(strfmt("optimizer mismatch: %s params with AdamW needs ~%.1fGB extra moments vs Lion and OOMs T4 16GB. "
-                            "Use optimizer: lion for 1B models (see configs/t4_1b.yaml, ultra_1b.yaml). "
+                            "Use optimizer: lion for 1B models (see configs/t4_1b.yaml, pro_v1.yaml). "
                             "AdamW is optimal only for <=500M models (flash/pro).",
                             human_count(static_cast<u64>(total_params)).c_str(),
                             static_cast<double>(total_params) * 4.0 / 1e9));
