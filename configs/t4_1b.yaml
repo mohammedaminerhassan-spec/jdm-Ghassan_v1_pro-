@@ -11,7 +11,7 @@
 #   36 layers + final_norm                         = ~1037M total
 # Active per token (top-4 of 8 + shared + full attention): ~612M (59%).
 #
-# T4 MEMORY (fp32 master, Lion, K=5, seq 512, per GPU): 4.15 + 4.15 + 4.15
+# T4 MEMORY (fp32 master, Lion, K=4, seq 512, per GPU): 4.15 + 4.15 + 4.15
 #   = 12.4GB + MoE caches + logits + NCCL buffers => ~14.5GB / 16GB.
 #   optimizer MUST be lion (AdamW OOMs). batch_size MUST be 1.
 #   seq_len 512 (not 1024). Scale with grad_accum and 4x DDP.
