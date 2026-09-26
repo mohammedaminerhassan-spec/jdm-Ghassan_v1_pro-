@@ -5,7 +5,8 @@
 # Inputs (Kaggle dataset, attach it to the notebook/session):
 #   english_parquet/english_chat_part*.parquet        (~3.0GB, 298k rows)
 #   english_parquet/english_instruction_part*.parquet (~126MB, 51k rows)
-#   english_parquet/manifest.json
+#   english_parquet/manifest.json                     (optional, informational only —
+#     some Kaggle uploads drop it; the build globs *.parquet and never reads it)
 #   => mount under /kaggle/input/<dataset>/ or pass EN_PARQUET_DIR=<path>
 #
 # Tokenizer: artifacts/tokenizer/english32k.gtok SHIPS in the repo zip
