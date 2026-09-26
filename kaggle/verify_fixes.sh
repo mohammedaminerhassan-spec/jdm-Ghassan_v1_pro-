@@ -71,6 +71,9 @@ if [[ "${DO_DDP}" == "1" ]]; then
   # (F-01). `timeout` turns a hang into a FAIL instead of a burnt session.
   # The model is shrunk via CLI overrides (vocab/layers/hidden) so the smoke
   # fits anywhere; shards are generated inline from 200 text lines.
+  # --warmup 0 is mandatory: en_pro.yaml ships warmup_steps=500, and the LR
+  # scheduler contract requires warmup < total_steps (3 here), so a short smoke
+  # MUST clamp it or it aborts before the first collective.
   SMOKE_DIR=/tmp/verify_ddp
   rm -rf "${SMOKE_DIR}"
   mkdir -p "${SMOKE_DIR}/shards" "${SMOKE_DIR}/ckpt"
@@ -88,7 +91,7 @@ if [[ "${DO_DDP}" == "1" ]]; then
     RANK="${RANK}" LOCAL_RANK="${RANK}" timeout 600 "${BIN}/gai_train" \
       --config configs/en_pro.yaml --device cuda \
       --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
-      --batch-size 1 --seq-len 32 --grad-accum 1 --max-steps 3 \
+      --batch-size 1 --seq-len 32 --grad-accum 1 --max-steps 3 --warmup 0 \
       --eval-every 1 --eval-batches 1 --save-every 1 --log-every 1 \
       --data "${SMOKE_DIR}/shards" --checkpoint-dir "${SMOKE_DIR}/ckpt" \
       --tokenizer "${TOK}" --resume none --seed 7 \
