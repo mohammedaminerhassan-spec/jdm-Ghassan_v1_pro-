@@ -665,13 +665,20 @@ ParamReport Model::parameter_report() const {
     return r;
 }
 
-void Model::to(Device dev) {
+void Model::to(Device dev) { move_to_device(dev, true); }
+
+void Model::move_to_device(Device dev, bool announce) {
     if (device_ == dev) return;
     const bool restore_fp16_cache = fp16_weight_cache_;
     if (restore_fp16_cache) enable_fp16_weight_cache(false);
-    log_warn("[model] Model::to() moved weights; REBUILD Trainer activations and "
-             "Generator cache/scratch on the new device before next step "
-             "(cross-device use-after-move crashes T4).");
+    // Only meaningful for a move that happens AFTER a Trainer/Generator exists.
+    // init_weights() round-trips through the CPU on purpose (to fill weights
+    // with the host RNG) and there is nothing to rebuild at that point, so
+    // announcing it produced two alarming warnings on every single run.
+    if (announce)
+        log_warn("[model] Model::to() moved weights; REBUILD Trainer activations and "
+                 "Generator cache/scratch on the new device before next step "
+                 "(cross-device use-after-move crashes T4).");
     for (Parameter* p : params_) {
         if (p->w.defined()) p->w = p->w.to(dev);
         if (p->g.defined()) p->g = p->g.to(dev);
@@ -761,7 +768,7 @@ void Model::init_weights(u64 seed) {
 
     Device orig_dev = device_;
     if (device_ != Device::CPU) {
-        to(Device::CPU);
+        move_to_device(Device::CPU, false);
     }
 
     auto fill_normal = [&](Parameter& p, float sd) {
@@ -806,7 +813,7 @@ void Model::init_weights(u64 seed) {
     }
 
     if (orig_dev != Device::CPU) {
-        to(orig_dev);
+        move_to_device(orig_dev, false);
     }
     if (fp16_weight_cache_) enable_fp16_weight_cache(true);
 }

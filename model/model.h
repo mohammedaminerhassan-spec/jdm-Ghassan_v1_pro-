@@ -361,6 +361,9 @@ public:
 private:
     void alloc_param(Parameter& p, const std::string& name, std::vector<i64> shape, bool decay);
     void rebuild_rope_cache();
+    // Device move. announce=true warns that live Trainer/Generator scratch must
+    // be rebuilt; init_weights() passes false for its intentional CPU round-trip.
+    void move_to_device(Device dev, bool announce);
 
     // per-layer aux-loss helper (also accumulates routing stats below).
     // want_stats=false (training hot path): no host copies at all; the raw
