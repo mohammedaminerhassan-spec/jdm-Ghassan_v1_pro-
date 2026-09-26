@@ -143,15 +143,29 @@ struct PipelineCounters {
 // configs/synth_*.yaml document `data_pipeline synth --config <file>`, but the
 // command never read --config: every documented run silently produced the
 // DEFAULT 20k conversations at the default path instead of the configured
-// 200k/700k. Load the file's `synth:` section, then let explicit CLI flags win,
-// and refuse unknown keys so a typo cannot be ignored either.
+// 200k/700k. Load the file's section, then let explicit CLI flags win, and
+// refuse unknown keys so a typo cannot be ignored either. synth_billion.yaml
+// ships two sections (synth: for pretrain, sft_synth: for the SFT split), so
+// --section picks which one to generate.
 struct SynthConfigFile {
     SynthConfig cfg;
     std::string output_path;
     std::string shards_output;
     std::string tokenizer_path;
+    std::string section;
     bool loaded = false;
 };
+
+static const std::vector<std::string>& synth_cfg_suffixes() {
+    static const std::vector<std::string> kKeys = {
+        "seed", "num_conversations", "min_turns", "max_turns",
+        "p_arabic_script", "p_latin_script", "p_msa", "p_french_switch",
+        "p_followup", "p_correction", "p_misunderstand", "p_governor",
+        "p_reasoning", "include_system", "p_system", "max_template_uses",
+        "max_attempts_multiplier", "output_path", "shards_output", "tokenizer_path",
+    };
+    return kKeys;
+}
 
 static SynthConfigFile load_synth_config(const Args& args) {
     SynthConfigFile out;
@@ -159,42 +173,45 @@ static SynthConfigFile load_synth_config(const Args& args) {
     const std::string path = args.str("config");
     Config c = Config::from_file(path);
     out.loaded = true;
-    c.check_known({
-        "synth.seed", "synth.num_conversations", "synth.min_turns", "synth.max_turns",
-        "synth.p_arabic_script", "synth.p_latin_script", "synth.p_msa",
-        "synth.p_french_switch", "synth.p_followup", "synth.p_correction",
-        "synth.p_misunderstand", "synth.p_governor", "synth.p_reasoning",
-        "synth.include_system", "synth.p_system", "synth.max_template_uses",
-        "synth.max_attempts_multiplier", "synth.output_path",
-        "synth.shards_output", "synth.tokenizer_path",
-    }, {}, true);
+    out.section = args.str("section", "synth");
+    GAI_CHECK(out.section == "synth" || out.section == "sft_synth",
+              path + ": --section must be 'synth' or 'sft_synth' (got '" + out.section + "')");
+    // Both sections are known so a file that ships them (synth_billion.yaml)
+    // passes; anything else is a typo and must fail.
+    std::vector<std::string> exact;
+    for (const char* sec : {"synth", "sft_synth"})
+        for (const std::string& k : synth_cfg_suffixes())
+            exact.push_back(std::string(sec) + "." + k);
+    c.check_known(exact, {}, true);
+
+    const std::string p = out.section + ".";
     SynthConfig& s = out.cfg;
-    s.seed           = static_cast<u64>(c.get_int("synth.seed", static_cast<i64>(s.seed)));
-    s.num_conversations = static_cast<int>(c.get_int("synth.num_conversations", s.num_conversations));
-    s.min_turns      = static_cast<int>(c.get_int("synth.min_turns", s.min_turns));
-    s.max_turns      = static_cast<int>(c.get_int("synth.max_turns", s.max_turns));
-    s.p_arabic_script = c.get_f64("synth.p_arabic_script", s.p_arabic_script);
-    s.p_latin_script  = c.get_f64("synth.p_latin_script", s.p_latin_script);
-    s.p_msa           = c.get_f64("synth.p_msa", s.p_msa);
-    s.p_french_switch = c.get_f64("synth.p_french_switch", s.p_french_switch);
-    s.p_followup      = c.get_f64("synth.p_followup", s.p_followup);
-    s.p_correction    = c.get_f64("synth.p_correction", s.p_correction);
-    s.p_misunderstand = c.get_f64("synth.p_misunderstand", s.p_misunderstand);
-    s.p_governor      = c.get_f64("synth.p_governor", s.p_governor);
-    s.p_reasoning     = c.get_f64("synth.p_reasoning", s.p_reasoning);
-    s.include_system  = c.get_bool("synth.include_system", s.include_system);
-    s.p_system        = c.get_f64("synth.p_system", s.p_system);
-    s.max_template_uses = static_cast<int>(c.get_int("synth.max_template_uses", s.max_template_uses));
+    s.seed           = static_cast<u64>(c.get_int(p + "seed", static_cast<i64>(s.seed)));
+    s.num_conversations = static_cast<int>(c.get_int(p + "num_conversations", s.num_conversations));
+    s.min_turns      = static_cast<int>(c.get_int(p + "min_turns", s.min_turns));
+    s.max_turns      = static_cast<int>(c.get_int(p + "max_turns", s.max_turns));
+    s.p_arabic_script = c.get_f64(p + "p_arabic_script", s.p_arabic_script);
+    s.p_latin_script  = c.get_f64(p + "p_latin_script", s.p_latin_script);
+    s.p_msa           = c.get_f64(p + "p_msa", s.p_msa);
+    s.p_french_switch = c.get_f64(p + "p_french_switch", s.p_french_switch);
+    s.p_followup      = c.get_f64(p + "p_followup", s.p_followup);
+    s.p_correction    = c.get_f64(p + "p_correction", s.p_correction);
+    s.p_misunderstand = c.get_f64(p + "p_misunderstand", s.p_misunderstand);
+    s.p_governor      = c.get_f64(p + "p_governor", s.p_governor);
+    s.p_reasoning     = c.get_f64(p + "p_reasoning", s.p_reasoning);
+    s.include_system  = c.get_bool(p + "include_system", s.include_system);
+    s.p_system        = c.get_f64(p + "p_system", s.p_system);
+    s.max_template_uses = static_cast<int>(c.get_int(p + "max_template_uses", s.max_template_uses));
     s.max_attempts_multiplier =
-        static_cast<int>(c.get_int("synth.max_attempts_multiplier", s.max_attempts_multiplier));
-    out.output_path     = c.get_str("synth.output_path", "");
-    out.shards_output   = c.get_str("synth.shards_output", "");
-    out.tokenizer_path  = c.get_str("synth.tokenizer_path", "");
+        static_cast<int>(c.get_int(p + "max_attempts_multiplier", s.max_attempts_multiplier));
+    out.output_path     = c.get_str(p + "output_path", "");
+    out.shards_output   = c.get_str(p + "shards_output", "");
+    out.tokenizer_path  = c.get_str(p + "tokenizer_path", "");
     GAI_CHECK(s.min_turns > 0 && s.max_turns >= s.min_turns,
-              path + ": synth.min_turns/max_turns invalid (" +
+              path + ": " + p + "min_turns/max_turns invalid (" +
               std::to_string(s.min_turns) + "/" + std::to_string(s.max_turns) + ")");
-    GAI_CHECK(s.num_conversations >= 0, path + ": synth.num_conversations must be >= 0");
-    GAI_CHECK(s.max_template_uses > 0, path + ": synth.max_template_uses must be > 0");
+    GAI_CHECK(s.num_conversations >= 0, path + ": " + p + "num_conversations must be >= 0");
+    GAI_CHECK(s.max_template_uses > 0, path + ": " + p + "max_template_uses must be > 0");
     return out;
 }
 
@@ -256,10 +273,10 @@ static int cmd_synth(const Args& args) {
     std::string out = args.str("out", file.output_path.empty() ? "data/synth.jsonl"
                                                                : file.output_path);
     if (file.loaded)
-        log_info(strfmt("[synth] config %s: n=%d seed=%llu turns=[%d,%d] out=%s",
-                        args.str("config").c_str(), cfg.num_conversations,
-                        (unsigned long long)cfg.seed, cfg.min_turns, cfg.max_turns,
-                        out.c_str()));
+        log_info(strfmt("[synth] config %s [%s]: n=%d seed=%llu turns=[%d,%d] out=%s",
+                        args.str("config").c_str(), file.section.c_str(),
+                        cfg.num_conversations, (unsigned long long)cfg.seed,
+                        cfg.min_turns, cfg.max_turns, out.c_str()));
     if (!file.tokenizer_path.empty() && !args.has("tokenizer"))
         log_warn("[synth] config declares tokenizer_path=" + file.tokenizer_path +
                  " but shard building is a separate step (data_pipeline build --tokenizer ...)");

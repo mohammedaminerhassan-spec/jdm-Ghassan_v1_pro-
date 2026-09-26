@@ -61,19 +61,44 @@ if [[ -d "${EN_LAKE}" ]]; then
         "${BIN}/corpus_stats" --input "${WORK}/corpus_${dom}.txt" --tokenizer "${TOK}" \
             --dedup --pii --quality 2>&1 | tail -30
     done
-    echo "  ---- data_pipeline retrieve (RAG needs QA objects, not raw text) ----"
-    "${BIN}/data_pipeline" synth --lang en --n 200 --seed 99 \
-        --out "${WORK}/rag_train.json" > /dev/null 2>&1 || bad "synth for RAG index"
+    echo "  ---- data_pipeline retrieve (RAG needs {question,answer} objects) ----"
+    python3 - <<'PY'
+import json, random
+random.seed(7)
+topics = [("how do I stay consistent with my training routine?",
+           "Pick one fixed slot, train at the same hour daily, and track nothing else for four weeks."),
+          ("what should I do when my code throws a null pointer?",
+           "Print the pointer and the allocation site first; most null dereferences are a failed malloc or a double free."),
+          ("how can I learn English conversation faster?",
+           "Shadow real dialogue daily and answer out loud; input-only study plateaus after the basics."),
+          ("what is gradient clipping for?",
+           "It caps the global gradient norm so one bad batch cannot blow up the weights; the update is rescaled, not discarded."),
+          ("how do I keep a T4 from running out of memory?",
+           "Price the peak arithmetically before allocating, stage the optimizer states, and keep the activation arena segmented.")]
+with open("/tmp/cell7/rag_train.json", "w", encoding="utf-8") as f:
+    for q, a in topics:
+        f.write(json.dumps({"question": q, "answer": a}) + "\n")
+print("wrote 5 QA objects")
+PY
     "${BIN}/data_pipeline" retrieve --index "${WORK}/rag_train.json" \
         --query "how do I stay consistent with my training routine?" --top 2 2>&1 | tail -14 \
         || bad "retrieve on the QA index"
+    echo "  ---- synth conversations are NOT a QA index (must fail loudly, not silently) ----"
+    "${BIN}/data_pipeline" synth --lang en --n 20 --seed 5 --out "${WORK}/conv.jsonl" > /dev/null 2>&1
+    if "${BIN}/data_pipeline" retrieve --index "${WORK}/conv.jsonl" --query "hello" > "${WORK}/ret_bad.log" 2>&1; then
+        bad "retrieve accepted a conversation JSONL as a QA index"
+    else
+        ok "conversation JSONL correctly refused ($(grep -c 'cannot parse' "${WORK}/ret_bad.log") parse warnings)"
+    fi
     echo "  ---- shipped synth configs are REAL (they are data_pipeline configs) ----"
-    for cfg in synth_large synth_billion; do
-        if "${BIN}/data_pipeline" synth --config "configs/${cfg}.yaml" --n 5 \
-             --out "${WORK}/${cfg}.jsonl" > "${WORK}/${cfg}.log" 2>&1; then
-            printf "  [ok] %-14s %s\n" "${cfg}" "$(grep -m1 '\[synth\] config' "${WORK}/${cfg}.log" | sed 's/.*config //')"
+    for spec in "synth_large:synth" "synth_billion:synth" "synth_billion:sft_synth"; do
+        cfg="${spec%%:*}"; sec="${spec##*:}"
+        if "${BIN}/data_pipeline" synth --config "configs/${cfg}.yaml" --section "${sec}" --n 5 \
+             --out "${WORK}/${cfg}_${sec}.jsonl" > "${WORK}/${cfg}_${sec}.log" 2>&1; then
+            printf "  [ok] %-14s %s\n" "${cfg}[$sec]" "$(grep -m1 '\[synth\] config' "${WORK}/${cfg}_${sec}.log" | sed 's/.*: //')"
         else
-            printf "  [FAIL] %-14s\n" "${cfg}"; tail -5 "${WORK}/${cfg}.log" | sed 's/^/         /'
+            printf "  [FAIL] %-14s [%s]\n" "${cfg}" "${sec}"
+            tail -5 "${WORK}/${cfg}_${sec}.log" | sed 's/^/         /'
             FAILURES=$((FAILURES + 1))
         fi
     done

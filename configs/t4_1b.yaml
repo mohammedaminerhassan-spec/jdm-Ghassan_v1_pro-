@@ -55,7 +55,7 @@ training:
   device: cuda
   precision: fp32
   gemm_fp16: true            # T4 FP16 tensor cores, fp32 masters + loss scaling
-  loss_scale_init: 16384     # fp16-safe max (trainer clamps to this)
+  loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
   loss_scale_window: 2000
   batch_size: 1              # T4 16GB: B=1 only for the 1B model
   seq_len: 512               # 512 (not 1024): 1B only fits T4 with halved activations
