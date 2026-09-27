@@ -2,7 +2,7 @@
 # Launch script for 4x T4 training with NCCL DDP.
 # Usage: ./train_4xt4.sh [config.yaml]
 # Default: configs/t4_1b.yaml (LEGACY 4xT4-DDP experiment, NOT the single-T4
-# flagship — that is configs/ultra_1b.yaml via kaggle/train_1b.sh).
+# flagship — that is configs/pro_v1.yaml via kaggle/train_1b.sh (explicit override)).
 # Pass an SFT config for stage 2.
 set -euo pipefail
 

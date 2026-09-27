@@ -137,6 +137,12 @@ int main() {
         CHECK(Checkpoint::peek(last.string(), c1, st_last), "last.ckpt header is readable");
         CHECK(Checkpoint::peek(best.string(), c2, st_best), "best.ckpt header is readable");
         CHECK(st_last.step == final_step, "last.ckpt records the final step");
+        // The trainer runs a one-batch-ahead prefetch worker: the checkpoint
+        // cursor must describe the last batch actually consumed, not the
+        // speculative batch sitting in the prefetch buffer (else exact resume
+        // silently skips training data).
+        CHECK(st_last.loader.batches == final_step,
+              "last.ckpt loader cursor matches consumed batches (no prefetched batch skipped on resume)");
         CHECK(st_best.step > 0 && st_best.step <= final_step, "best.ckpt records a real step");
         CHECK(st_best.step == st_last.step,
               "with save_every == eval_every == 1 the last step is also the best step, "

@@ -60,7 +60,7 @@ struct ItemResult {
     int          words = 0;
     double       seconds = 0;
     double       score = 0;   // 0..1 automatic score
-    double       tokens_per_sec = 0;  // FIX P2: was never filled; now estimated
+    double       tokens_per_sec = 0;  // estimated from word count
 };
 
 struct CategoryScore {

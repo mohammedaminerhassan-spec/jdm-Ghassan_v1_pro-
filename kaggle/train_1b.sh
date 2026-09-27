@@ -92,13 +92,23 @@ echo "============================================================"
 # artifacts المؤقتة فقط. trap عند EXIT/INT/TERM ينسخ آخر حالة حتى لو
 # أوقفت Kaggle الجلسة — بلا هذا يضيع 9h تدريب.
 persist_output() {
-    if [[ -d "/kaggle/working" ]]; then
-        mkdir -p /kaggle/working/output 2>/dev/null || true
-        cp -r "${CKPT_PT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -r "${CKPT_SFT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
-        echo "[persist] snapshot copied to /kaggle/working/output"
-    fi
+    # /kaggle/working itself is what "Save Version" persists. Sources already
+    # inside it must NOT be copied into output/ — that stores every multi-GB
+    # checkpoint TWICE against the 20GB quota (a successful train could then
+    # fail at Save). Only outside sources are copied.
+    [[ -d "/kaggle/working" ]] || return 0
+    local dest="/kaggle/working/output"
+    mkdir -p "${dest}" 2>/dev/null || true
+    local src
+    for src in "${CKPT_PT}" "${CKPT_SFT}" "${GGUF_OUT}"; do
+        case "${src}" in
+            /kaggle/working/*)
+                echo "[persist] already persisted by the platform, skip copy: ${src}" ;;
+            *)
+                echo "[persist] copying ${src} -> ${dest}/"
+                cp -r "${src}" "${dest}/" 2>/dev/null || true ;;
+        esac
+    done
 }
 trap persist_output EXIT INT TERM
 

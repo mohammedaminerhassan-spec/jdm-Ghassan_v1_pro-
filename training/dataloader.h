@@ -188,8 +188,8 @@ private:
 
     // Pick one window [B,T] from a single shard (shared by both paths).
     // Returns false ONLY on storage read failure (never for short docs —
-    // those legitimately leave PAD tails). Callers must retry or fail loud;
-    // a failed window must never masquerade as an unsupervised row (P1-20).
+    // those legitimately leave PAD tails). A failed window must never
+    // masquerade as an unsupervised row.
     bool fill_from_shard(const Shard& sh, Batch& out, int b);
     bool fill_packed_row(const Shard& sh, Batch& out, int b);
 };

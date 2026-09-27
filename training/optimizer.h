@@ -4,11 +4,11 @@
 
 namespace gai {
 
-// Optimizer state-blob versions (P2-4): v0 is the legacy layout (raw config
-// struct + moments for every parameter). v1 is field-wise config + a per
-// parameter presence flag, so frozen parameters store nothing and old/new
-// binaries never misparse each other (the checkpoint container version
-// selects the layout; see Checkpoint::load).
+// Optimizer state-blob versions: v0 is the legacy layout (raw config struct +
+// moments for every parameter). v1 is field-wise config + a per-parameter
+// presence flag, so frozen parameters store nothing and old/new binaries
+// never misparse each other (the checkpoint container version selects the
+// layout; see Checkpoint::load).
 constexpr int OPT_STATE_LEGACY = 0;
 constexpr int OPT_STATE_CURRENT = 1;
 
@@ -105,9 +105,9 @@ struct MuonConfig {
     float weight_decay = 0.1f;
     float grad_clip    = 1.0f;   // 0 disables
     int   ns_steps     = 5;      // Newton-Schulz iterations (1..10)
-    // F-04 (T4-aware Muon): only matrices with min(rows, cols) >= min_ns_dim
+    // T4-aware Muon: only matrices with min(rows, cols) >= min_ns_dim
     // run Newton-Schulz. Smaller decay matrices (routers, small projections)
-    // fall back to the cheap Lion-style branch of step(). 0 = historical
+    // fall back to the cheap Lion-style branch of step(). 0 = NS on every
     // behavior (NS on every decay matrix). A T4 recipe that enables Muon
     // should set this (e.g. 256) so the ~300 small-matrix orthogonalizations
     // per step — each 5 NS iterations of GEMMs — do not dominate step time.
@@ -165,7 +165,7 @@ public:
     void orthogonalize(const float* G, float* O, int rows, int cols);
 
 private:
-    // F-04: single source of truth for "does this parameter get NS". Used by
+    // Single source of truth for "does this parameter get NS". Used by the
     // the constructor (scratch sizing) AND step() (routing), so the two can
     // never disagree about which matrices are orthogonalized.
     bool uses_ns(const Parameter* p) const {

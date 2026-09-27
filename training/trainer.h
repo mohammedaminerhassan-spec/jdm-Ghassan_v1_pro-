@@ -52,7 +52,7 @@ struct TrainerConfig {
     float beta2         = 0.95f;   // lion default overridden to 0.99 when optimizer==lion
     float eps           = 1e-8f;   // adamw only
     float grad_clip     = 1.0f;
-    // F-04: muon-only knobs. ns_steps tunes the Newton-Schulz cost directly;
+    // Muon-only knobs. ns_steps tunes the Newton-Schulz cost directly;
     // muon_min_ns_dim gates small matrices out of NS (0 = NS on every decay
     // matrix, historical). None of the shipped T4 recipes enable muon.
     int   muon_ns_steps   = 5;    // 1..10, clamped by the Muon ctor
@@ -67,6 +67,10 @@ struct TrainerConfig {
     bool  fp16_weight_cache = false;
     double loss_scale_init   = 65536.0; // dynamic loss-scaler start (0 disables scaling)
     int    loss_scale_window = 2000;    // clean steps before doubling the scale
+    // Growth ceiling (0 = fp16-safe hard max 16384). Pin BELOW a level measured
+    // to overflow on the target GPU so the scaler never cycles into it
+    // (T4 recipes use 8192: 16384 overflows there). Never above the hard max.
+    double loss_scale_max    = 0.0;
     // T4 memory saver: gradient/activation checkpointing via micro-batch
     // splitting. When true, each (B,T) micro-batch is run as `ckpt_segments`
     // sequential forward/backward slices along the batch dim (e.g. B=2,S=2 ->
@@ -121,8 +125,8 @@ struct TrainerConfig {
     // only appears at "Save Version", long after the training. Project it up
     // front instead (--output-budget-mb).
     i64   output_budget_mb    = 0;
-    // F-08 resume contract.
-    //   "migrate" (default): keep the historical forgiving behavior — a math
+    // Resume contract.
+    //   "migrate" (default): forgiving behavior — a math drift warns, a
     //                      drift warns, a missing parameter keeps its fresh
     //                      init, an optimizer-kind switch restarts moments at
     //                      t_=0. Always LOGS exactly what was reset.
@@ -141,7 +145,7 @@ struct TrainerConfig {
     std::string stage = "pretrain";
 
     // strict=true upgrades unknown/dead config keys from warnings to a
-    // fail-fast error (P2-5; see --strict-config).
+    // fail-fast error (see --strict-config).
     static TrainerConfig from_config(const Config& c, bool strict = false);
     // Per-rank micro throughput (one process). Global throughput multiplies by
     // world_size — DeepSeek budgeting rule: scheduler/steps must use GLOBAL.
@@ -232,8 +236,7 @@ private:
     Tensor ckpt_segments_;
     bool use_ckpt_ = false;
     // Persistent CPU staging for ckpt batch-slicing (grows monotonically,
-    // never per-segment malloc). Old code allocated 2 vectors per segment per
-    // micro per step -> allocator churn that starved the T4 GPU.
+    // never per-segment malloc).
     std::vector<i32> ckpt_staging_ids_;
     std::vector<i32> ckpt_staging_tgt_;
     // one micro-batch (possibly split into segments); returns ntok-weighted loss
@@ -251,29 +254,33 @@ private:
     float  scaler_for_step();                 // current scale (1.0 when disabled)
     void   scaler_update(double gnorm);       // shrink on overflow, grow when clean
     void   log_scaler_summary() const;
+    // Effective growth ceiling: min(yaml max, fp16-safe hard max). Keeps the
+    // scaler from revisiting a level measured to overflow on this hardware
+    // (T4 recipes pin 8192; 16384 overflows there on step 0-1).
+    double loss_scale_cap() const;
 
     // ---- distributed training ----
     std::unique_ptr<DistributedContext> dist_;
     void init_distributed();    void sync_gradients();  // fused bucketed all-reduce SUM (token-weighted; no /world_size)
     void sync_model();      // broadcast model from rank 0 (for initialization/resume)
     i64 sync_ntok_sum(i64 local); // exact global supervised count (sum over ranks)
-    // F-11: aux-free router bias is optimizer-step-coupled control state, so it
+    // Aux-free router bias is optimizer-step-coupled control state, so it
     // only moves when the optimizer actually applied an update. All-reduces the
     // [L*ne] slot-count accumulator across ranks, then applies the EMA once.
     void sync_moe_bias(bool opt_step_applied);
     bool is_main_rank() const;    // rank 0 or single-GPU (logs/writes checkpoints)
-    // F-01: collective helpers. Every rank must call these unconditionally so
+    // Collective helpers. Every rank must call these unconditionally so
     // the NCCL collective order stays identical across ranks; they are no-ops
     // for single-process runs.
     void broadcast_from_main(void* buf, size_t numel, int dtype_size);
-    // F-01: agree on the rank-0-only "new best?" decision so every rank enters
+    // Agree on the rank-0-only "new best?" decision so every rank enters
     // save() (which contains collectives) the same number of times. RETURNS the
     // agreed decision and callers MUST use the return value: the argument is
     // rank-local (only the main rank evaluates), so keeping a local copy makes
     // rank 0 save while the others skip it, desyncing the collective order —
     // which NCCL surfaces as an illegal memory access mid-run.
     bool sync_eval_best(bool is_main, bool is_best);
-    // F-07: surface a fatal background-checkpoint failure at the next safe
+    // Surface a fatal background-checkpoint failure at the next safe
     // training boundary instead of letting thousands of steps burn GPU hours
     // on an unusable disk.
     void check_ckpt_health();
@@ -292,7 +299,7 @@ private:
     // immediately; wait_for_save() drains before run() exits, and a new save
     // for the same destination supersedes the queued one.
     //
-    // F-05: ckpt_ram_budget() bounds every LIVE snapshot reference (queued +
+    // ckpt_ram_budget() bounds every LIVE snapshot reference (queued +
     // in-flight + retained cache). Exceeding it applies backpressure to the
     // training thread rather than aborting the run.
     //
@@ -326,7 +333,7 @@ private:
     std::condition_variable ckpt_cv_;
     struct QueuedSave {
         std::string path;
-        i64 step = -1;   // model step, so a second name can reuse the file (F-06)
+        i64 step = -1;   // model step, so a second name can reuse the file
         std::shared_ptr<CheckpointSnapshot> snapshot;
     };
     std::vector<QueuedSave> pending_saves_;
@@ -336,7 +343,7 @@ private:
     std::string            ckpt_error_;
     // Snapshot currently being serialized (counted in the RAM budget).
     std::shared_ptr<CheckpointSnapshot> ckpt_active_;
-    // Committed step -> path, bounded to the newest few (F-06 reuse source).
+    // Committed step -> path, bounded to the newest few.
     std::map<i64, std::string>          ckpt_committed_;
     std::shared_ptr<CheckpointSnapshot> snapshot_cache_;
     i64                    snapshot_step_ = -1;
@@ -360,6 +367,11 @@ private:
     bool                    prefetch_running_ = false;
     // Preserve the real dataloader error (was swallowed -> generic message).
     std::exception_ptr      prefetch_error_;
+    // Checkpoint the last batch actually handed to the trainer, NOT the
+    // speculative batch the prefetch thread may already have generated.
+    // Saving train_loader_.get_state() at save() time could resume one batch
+    // ahead and silently skip training data, breaking exact resume.
+    DataLoader::State       last_consumed_loader_state_{};
     void start_prefetch();
     void stop_prefetch();
     void quiesce_prefetch();

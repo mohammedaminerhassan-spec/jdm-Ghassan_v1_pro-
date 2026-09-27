@@ -23,8 +23,7 @@ void  memset_zero(void* ptr, size_t nbytes);
 bool  is_device_memory(const void* ptr);
 void  copy(void* dst, bool dst_is_device, const void* src, bool src_is_device, size_t nbytes);
 void  synchronize();
-    // FIX P2-1: live free-VRAM query (device.cpp OOM guard used stale startup
-    // free_mem and false-passed after GBs of weights). Returns 0 if unavailable.
+    // Live free-VRAM query for the device.cpp OOM guard. Returns 0 if unavailable.
     size_t free_bytes_live();
     // Check that at least `need` bytes of VRAM are free; GAI_FAIL with a clear
     // message if not. Call before large workspace allocations for better
@@ -38,9 +37,9 @@ void  shutdown();
 const char* last_error();
 
 #ifdef __CUDACC__
-// ---- RAII wrappers for CUDA resources (P2-3: prevent leaks on exception) ----
-// PRO-HARDEN: الكونستركتور القديم كان يتجاهل فشل cudaStreamCreate/EventCreate
-// فيبني كائن بـhandle قمامة ويدمر قمامة. الآن نفشل بصوت عال فورا.
+// ---- RAII wrappers for CUDA resources (leak-safe on exceptions) ----
+// Constructors fail loudly on cudaStreamCreate/EventCreate errors instead of
+// building objects around invalid handles.
 class CudaStream {
     cudaStream_t stream_ = nullptr;
     bool own_ = true;

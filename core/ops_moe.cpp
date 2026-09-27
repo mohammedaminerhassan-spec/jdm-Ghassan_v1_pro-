@@ -28,8 +28,7 @@ void set_moe_jitter_seed_cpu(u64 seed) {
 }
 }
 static inline float jitter_u_cpu(gai::i64 tt, int ee) {
-    // UNIFIED with cuda/moe.cu jitter_u (fmix64). Old CPU hash used
-    // %1000000 with different mixing -> CPU/GPU parity break when jitter>0.
+    // Same fmix64 hash as cuda/moe.cu jitter_u (CPU/GPU parity).
     uint64_t seed = g_jitter_seed_cpu.load(std::memory_order_relaxed);
     uint64_t h = static_cast<uint64_t>(tt) * 0x9E3779B97F4A7C15ULL;
     h ^= static_cast<uint64_t>(ee) * 0xC2B2AE3D27D4EB4FULL;
@@ -118,9 +117,7 @@ void moe_forward(const float* x, const float* router_w,
                  float* s_gate, float* s_up, float* s_act,
                  i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
-    // FIX: stack buffers t_idx[8]/t_w[8] below overflow when K>8 (direct
-    // cpu::moe_* call bypassing ModelConfig::validate) -> stack smash,
-    // silent corruption on training. Fail fast (Kaggle/T4 + low-PC safety).
+    // Stack buffers t_idx[8]/t_w[8] below require K in [1,8]: fail fast.
     GAI_CHECK(K >= 1 && K <= 8, "moe_forward: K must be in [1,8]");
     GAI_CHECK(ne > 0 && ne <= 64, "moe_forward: ne out of range");
     GAI_CHECK(d > 0 && E > 0, "moe_forward: bad dims");
@@ -388,15 +385,14 @@ void moe_backward(const float* x, const float* router_w,
 
         // aux load-balance term. NOTE: aux_scale here is pre-scaled by the
         // caller (Model::forward_backward) to aux_orig*eff_scale*N so both
-        // main (sum*dscale) and aux live in the same scaled+sum space (P0-02).
-        // Hence aux_coef = aux_scale*ne/N = aux_orig*ne*eff_scale (sum, scaled).
+        // main (sum*dscale) and aux live in the same scaled+sum space.
+        // Hence aux_coef = aux_scale*ne/N (sum, scaled).
         if (aux_coef != 0.0f)
             for (int e = 0; e < ne; ++e) sc.dp[e] += aux_coef * aux_frac[e];
 
-        // softmax backward: dlogit = p * (dp - dot(p, dp))
-        // P0-06 FIX: forward is z'=z*(1+j*2*u) (jitter), so chain rule is
-        // dL/dz = (1+j*2*u)*dL/dz'. Old code omitted the factor (invisible at
-        // j=0, wrong router grad at j>0). Same hash as forward => exact match.
+        // softmax backward: dlogit = p * (dp - dot(p, dp)). Forward jitter
+        // z'=z*(1+j*2*u) contributes its chain-rule factor here (same hash
+        // as forward).
         float pdot = 0.0f;
         for (int e = 0; e < ne; ++e) pdot += pt[e] * sc.dp[e];
         {
@@ -416,7 +412,7 @@ void moe_backward(const float* x, const float* router_w,
     }
 }
 
-// ---------------------------------------------------------------- F-03 fused grouped helpers
+// ---------------------------------------------------------------- fused grouped helpers
 // CPU reference for the fused CUDA kernels in cuda/moe.cu (k_pack_all,
 // k_save3_all, k_scatter_add_all). Same grouped-slot layout, same indexing,
 // verified bit-exact against moe_forward() by tests/test_moe_fused.cpp.
@@ -509,7 +505,7 @@ void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
 }
 
 void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
-    // F-02 CPU reference: identical math to k_count_slots in cuda/moe.cu.
+    // CPU reference: identical math to k_count_slots in cuda/moe.cu.
     for (i64 s = 0; s < NK; ++s) {
         const int e = idx[s];
         if (e >= 0 && e < ne) acc[e] += 1.0f;

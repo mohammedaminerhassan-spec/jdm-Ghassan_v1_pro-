@@ -25,17 +25,13 @@ bool gemm_fp16_enabled();
 void set_gemm_bf16(bool on);
 bool gemm_bf16_enabled();
 
-// PERF (audit #6/decode): the fp16 fast path engages for GEMMs with
-// M*N*K >= threshold (default 1M: conversion overhead eats the win below).
-// Decode is M==1, so small projections decode in fp32 by design — the generic
-// threshold is NOT a decode bug (converting ~MBs to save ~kMACs loses).
-// Exposed for Kaggle/Nsight autotuning (e.g. lower it when a persistent fp16
-// weight cache removes the per-call conversion cost).
+// PERF: the fp16 fast path engages for GEMMs with M*N*K >= threshold
+// (default 1M: conversion overhead eats the win below). Decode is M==1, so
+// small projections decode in fp32 by design. Exposed for autotuning.
 void set_gemm_fp16_mnk_threshold(i64 mnk);
 i64  gemm_fp16_mnk_threshold();
 
-// PERF telemetry (audit P2-2, extended for the repair-prompt acceptance
-// criterion 9): lightweight global counters for launch/memory analysis.
+// PERF telemetry: lightweight global counters for launch/memory analysis.
 // Counting is unconditional and cheap (relaxed atomics); report via
 // perf_report() on the main rank at log cadence. All counters are lifetime
 // totals — call perf_reset() to delimit a window (e.g. per eval).
@@ -82,8 +78,8 @@ void perf_note_muon_ns(int iters, u64 us);      // one orthogonalize() call
 // exploration). 0 = deterministic. Set once per run from ModelConfig.
 void set_moe_jitter(float j);
 float moe_jitter();
-// P2-02 jitter entropy: deterministic (step, rank, sample) context folded
-// into the hash so the same position gets different noise each step/rank
+// Jitter entropy: deterministic (step, rank, sample) context folded into the
+// hash so the same position gets different noise each step/rank
 // (reproducible from base seed). Set per step by the Trainer.
 void set_moe_jitter_seed(u64 seed);
 u64 moe_jitter_seed();
@@ -267,7 +263,7 @@ void attention_decode_ring(Device dev,
 // ---------------------------------------------------------------- loss
 // logits[n, V], targets[n] (-100 = ignore). Returns sum of losses and count.
 // If dlogits != null it is filled with dL/dlogits in SUM form (caller scales
-// by its loss scale only; no divide-by-n_valid roundtrip, audit P1).
+// by its loss scale only (SUM form, no divide-by-n_valid roundtrip).
 // z_scale adds the z-loss stabilizer: loss += z_scale * mean(logZ^2),
 // grad += 2*z_scale*logZ*p (SUM form; prevents logit explosion at 1B+).
 void softmax_cross_entropy(Device dev,
@@ -275,21 +271,19 @@ void softmax_cross_entropy(Device dev,
                            float* dlogits, i64 n, int V,
                            double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
-// F-10: device-side loss/count accumulation for the chunked training loop.
-// softmax_cross_entropy() above performs one host sync per call; with
-// grad_accum=128 that is 128+ blocking reductions per optimizer step. The
-// accumulate API folds loss+count into a persistent device-side accumulator
-// across all chunks/micros with ZERO host traffic, and sce_acc_end() performs
-// the single synchronized reduction per optimizer step. dlogits are still
-// written per chunk (the backward needs them immediately); only the scalar
-// loss/count stay on device. The old single-shot op is unchanged and stays
-// for eval/inference ( Generator::score_tokens, Trainer::evaluate ).
+// Device-side loss/count accumulation for the chunked training loop.
+// The accumulate API folds loss+count into a persistent device-side
+// accumulator across all chunks/micros with no host traffic, and sce_acc_end()
+// performs the single synchronized reduction per optimizer step. dlogits are
+// still written per chunk (the backward needs them immediately); only the
+// scalar loss/count stay on device. The single-shot op above stays for
+// eval/inference (Generator::score_tokens, Trainer::evaluate).
 void sce_acc_begin(Device dev);      // zero the persistent accumulators
 void sce_accumulate(Device dev,
                     const float* logits, const i32* targets, float* dlogits,
                     i64 n, int V, float z_scale = 0.0f);
 void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count);
-// F-02: acc[e] += 1 per routed slot (atomic on CUDA). The aux-free bias path
+// acc[e] += 1 per routed slot (atomic on CUDA). The aux-free bias path
 // counts on-device into the model's persistent [L*ne] buffer; the host loop
 // in cpu::moe_count_slots is the reference.
 void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne);
@@ -309,7 +303,7 @@ double global_sq_norm(Device dev, const float* g, i64 n);
 double global_sq_norm_multi(Device dev,
                             const std::vector<std::pair<const float*, i64>>& parts);
 
-// ---- inference fast sampling (audit P1: no full-vocab D2H per token)
+// ---- inference fast sampling (no full-vocab D2H per token)
 // top-K (descending, ties by lowest id) of logits[V] into out_vals/ids[K].
 // K<=0 or K>V fails fast. CUDA keeps everything on device; the caller copies
 // only K pairs to the host.

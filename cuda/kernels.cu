@@ -31,9 +31,8 @@ static inline int grid_for(i64 n, int block) {
 }
 
 // ---------------------------------------------------------------- workspace
-// FIX: round up to 64MB chunks so warmup size variations don't cause
-// repeated cudaFree/cudaMalloc (fragmentation + sync stalls that looked
-// like a GPU leak on nvidia-smi). Monotonic by design, freed at shutdown.
+// Round up to 64MB chunks so warmup size variations don't cause repeated
+// cudaFree/cudaMalloc. Monotonic by design, freed at shutdown.
 static void*  g_ws = nullptr;
 static size_t g_ws_bytes = 0;
 
@@ -53,7 +52,7 @@ static void* workspace(size_t bytes) {
     return g_ws;
 }
 
-// F-16: pre-size the GEMM/conversion pool before the first step. Called once
+// Pre-size the GEMM/conversion pool before the first step. Called once
 // from the trainer with the recipe's worst-case size; later workspace() calls
 // then hit the fast path (bytes <= g_ws_bytes) and never resize mid-run.
 void reserve_workspaces(size_t gemm_bytes, size_t moe_bytes) {
@@ -100,7 +99,7 @@ static bool g_fp16_gemm = true;
 void set_fp16_gemm(bool on) { g_fp16_gemm = on; }
 bool fp16_gemm_enabled() { return g_fp16_gemm; }
 
-// P3-5: defaults OFF (was true); see the note on g_gemm_bf16 in core/ops.cpp.
+// BF16 path defaults OFF (T4/sm_75 has no BF16 cores); strictly opt-in.
 static bool g_bf16_gemm = false;
 void set_bf16_gemm(bool on) { g_bf16_gemm = on; }
 bool bf16_gemm_enabled() { return g_bf16_gemm; }
@@ -258,8 +257,8 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     // FP16 tensor-core fast path for large GEMMs (compute-only mixed precision).
     // Small GEMMs stay fp32: conversion overhead would eat the win. The
     // threshold is tunable via ops::set_gemm_fp16_mnk_threshold() for
-    // Nsight-driven autotuning (audit #6/decode: M==1 decode stays fp32 by
-    // design at the default 1M — converting ~MBs to save ~kMACs loses).
+    // Nsight-driven autotuning (M==1 decode stays fp32 by design at the
+    // default 1M — converting ~MBs to save ~kMACs loses).
     const i64 mnk = (i64)M * N * K;
     const i64 mnk_thr = ops::gemm_fp16_mnk_threshold();
     if (g_fp16_gemm && mnk >= mnk_thr) {
@@ -426,8 +425,8 @@ __global__ void k_embed_bwd(const i32* ids, const float* dout, float* dtable,
 void embedding_forward(const i32* ids, const float* table, float* out,
                        i64 ntok, int dim, int vocab) {
     if (ntok <= 0) return;
-    // PRO-HARDEN: static_cast<int>(ntok) كان يقتطع بصمت فوق 2G فينطلق kernel
-    // بعدد بلوكات خاطئ (OOB). نفشل مبكرا بدل فساد ذاكرة T4.
+    // ntok is grid-sized as int: fail fast above 2G instead of launching
+    // with a truncated block count (OOB).
     GAI_CHECK(ntok <= 2147483647LL, "embedding_forward: ntok exceeds INT_MAX");
     int block = dim >= 256 ? 256 : ((dim + 31) / 32) * 32;
     if (block < 32) block = 32;
@@ -460,8 +459,8 @@ __global__ void k_rmsnorm_fwd(const float* x, const float* w, float* out, float*
     }
     ss = block_sum(ss, smem);
     float inv = rsqrtf(ss / float(dim) + eps);
-    // PRO-HARDEN: مرآة CPU (ops_cpu clamps non-finite إلى 0). بدونه مدخل inf
-    // واحد يفرق CPU/GPU ويطلق NaN صامت في T4 الطويل.
+    // Clamp non-finite (eps<=0 or inf input can still produce inf/NaN),
+    // mirroring the CPU reference.
     if (!isfinite(inv)) inv = 0.0f;
     if (threadIdx.x == 0 && rrms) rrms[r] = inv;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = xr[i] * inv * w[i];
@@ -486,8 +485,7 @@ __global__ void k_rmsnorm_bwd_dx(const float* x, const float* w, const float* do
 }
 
 // dweight[i] = sum_r dout[r,i] * x[r,i] * rrms[r]  -> one block per column tile
-// FIX P2-5: accumulate in double (matches CPU f64 in ops_cpu.cpp:339) so
-// exploded activations do not drift vs the CPU reference; the store stays f32.
+// Accumulate in double (matches the CPU reference); the store stays f32.
 __global__ void k_rmsnorm_bwd_dw(const float* x, const float* dout, const float* rrms,
                                  float* dweight, i64 rows, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -542,8 +540,7 @@ __global__ void k_rope(float* q, float* k, const i32* pos, i64 ntok,
     for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
         int i = idx % half;
         int h = idx / half;
-        // PRO-HARDEN: حساب الطور بدقة مضاعفة يقلل خطأ phase عند pos=4096
-        // (~1e-5 بخطأ float خالص). التكلفة نفسها، والدقة تقارب CPU (double).
+        // Double-precision phase keeps long-context angles accurate.
         double freq_d = pow((double)theta, -(2.0 * (double)i) / (double)hd);
         double ang_d  = (double)p * freq_d;
         float c, s;
@@ -745,9 +742,7 @@ void swiglu_backward(const float* g, const float* u, const float* dout,
 // One block per row. Fused: online max, sum, loss and dlogits in a single pass over V,
 // which avoids materialising a second [N, V] probability buffer.
 // z_scale adds z-loss: loss += z*logZ^2, grad += 2*z*logZ*p (SUM semantics).
-// AUDIT P1 FIX (exact math): old path wrote MEAN grads (divide by valid
-// count via host roundtrip) costing 1 kernel + 1 sync per call. Since
-// mean*x == sum elementwise, the kernel writes SUM grads directly and the
+// The kernel writes SUM grads directly (mean*x == sum elementwise) and the
 // caller scales by eff_scale only. Valid-row counting folds into this kernel
 // (one atomic per valid row). Only fp associativity differs (~1 ulp).
 __global__ void k_ce(const float* logits, const i32* targets, float* dlogits,
@@ -806,7 +801,7 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
         return;
     }
     // buffers: [n floats losses] [CeReduce: count + 64 partials].
-    // Count and loss cross the host in ONE cudaMemcpy (was two syncs).
+    // Count and loss cross the host in ONE cudaMemcpy.
     const int block = 256;
     const int red_grid = 64;
     struct CeReduce { int count; float partial[64]; };
@@ -837,13 +832,12 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     if (out_loss_sum) *out_loss_sum = total;
 }
 
-// ================================================================ F-10 device-side CE accumulation
-// The chunked training loop calls the loss once per CE chunk per microbatch;
-// the single-shot op above syncs on every call (128+ blocking reductions per
-// optimizer step at grad_accum=128). These fold loss+count into a persistent
-// 16-byte device accumulator with ZERO host traffic, and sce_acc_end()
-// performs the single synchronized reduction per microbatch. dlogits are
-// still written per chunk (the backward consumes them immediately).
+// ================================================================ device-side CE accumulation
+// The chunked training loop calls the loss once per CE chunk per microbatch.
+// These fold loss+count into a persistent 16-byte device accumulator with no
+// host traffic, and sce_acc_end() performs the single synchronized reduction
+// per microbatch. dlogits are still written per chunk (the backward consumes
+// them immediately).
 
 // Packed so loss+count cross the host in ONE 16-byte memcpy.
 struct SceAcc { double loss; long long count; };
@@ -910,19 +904,15 @@ void sce_acc_end(double* out_loss_sum, i64* out_count) {
 }
 
 // ================================================================ fast sampling
-// AUDIT P1: per-token full-vocab (32k) D2H + CPU sampling is the decode
-// ceiling. These kernels keep sampling on GPU: penalties in place, then
-// top-K (K<=128, ~1KB D2H) or full-vocab argmax (4B D2H) for greedy.
-// Math mirrors Sampler::apply_penalties + Sampler::sample bit-closely;
+// These kernels keep sampling on GPU: penalties in place, then top-K
+// (K<=128, ~1KB D2H) or full-vocab argmax (4B D2H) for greedy.
+// Math mirrors Sampler::apply_penalties + Sampler::sample;
 // CPU mirrors in core/ops_cpu.cpp serve as the test reference.
 
-// Frequency-table repetition penalties (audit v2 P0-11): the old kernel did
-// one thread per vocab id with an O(history) equality scan each —
-// O(V x history) per token (65M at V=32k,H=2048). New layout mirrors the CPU
-// Sampler::apply_penalties hashmap design on GPU: one histogram pass over
-// history (<=2048 atomic writers into a V-sized table), then one O(V)
-// elementwise apply. Formulas are elementwise-identical to the old kernel
-// (rep, then freq, then pres), so results match bit-for-bit.
+// Frequency-table repetition penalties mirror the CPU Sampler hashmap design
+// on GPU: one histogram pass over history (<=2048 atomic writers into a
+// V-sized table), then one O(V) elementwise apply. Formulas apply rep, then
+// freq, then pres — identical to the CPU path.
 __global__ void k_rep_hist(const i32* hist, int n, int* freq, int V) {
     int i = (int)((i64)blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
@@ -953,11 +943,9 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
         CU_CHECK(cudaMalloc(&g_pen_freq, sizeof(int) * (size_t)V));
         g_pen_freq_cap = V;
     }
-    // H2D staging is one small synchronous copy (<=8KB). Honest note (audit
-    // v2 P1-12): plain cudaMemcpy CAN block the host until prior queued work
-    // drains — the old "fire-and-forget, never blocks" comment was wrong.
-    // True async needs pinned history + streams (future work); the compute
-    // here dropped from O(V x history) to O(V + history), which dominates.
+    // H2D staging is one small synchronous copy (<=8KB). Note: plain
+    // cudaMemcpy can block the host until prior queued work drains; true
+    // async needs pinned history + streams.
     CU_CHECK(cudaMemcpy(g_pen_hist, hist, sizeof(i32) * (size_t)hist_n,
                         cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemset(g_pen_freq, 0, sizeof(int) * (size_t)V));
@@ -1003,11 +991,9 @@ i32 argmax_token(const float* logits, int V) {
     return h;
 }
 
-// Top-K in two stages, EXACT for K <= 128 (DeepSeek sampling rule).
-// Old code kept block-top-8 (512 pairs): when top-K concentrated in one
-// chunk (chunk=(V+63)/64), >8 winners were lost → wrong sampling vs CPU.
-// Now: stage 1 keeps block-top-K (64*K candidates, K<=128 → ≤8192), stage 2
-// exact linear-scan top-K over all candidates. Ties by lowest id.
+// Top-K in two stages, exact for K <= 128. Stage 1 keeps block-top-K (64*K
+// candidates, K<=128 → ≤8192); stage 2 is an exact linear-scan top-K over
+// all candidates. Ties by lowest id.
 __global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K) {
     __shared__ float sv[512];
     __shared__ i32 si[512];
@@ -1176,10 +1162,8 @@ double global_sq_norm(const float* g, i64 n) {
     return s;
 }
 
-// FIX (10/10): fused norm — all per-tensor tiles launch async into slices of
-// one monotonic workspace buffer, then a SINGLE D2H + host reduce.
-// 200 params: 200 launches + 1 sync instead of 200 syncs (~15ms saved/step
-// on T4, the dominant optimizer overhead after MoE grouping).
+// Fused norm: all per-tensor tiles launch async into slices of one monotonic
+// workspace buffer, then a single D2H + host reduce.
 double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& parts) {
     const int block = 256;
     const int grid = 16; // smaller per-tensor grid: 16*200=3200 partials max

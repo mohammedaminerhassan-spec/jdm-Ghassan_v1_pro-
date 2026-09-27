@@ -19,9 +19,9 @@ namespace cpu {
 // The dominant case in this model is NT (C = A * B^T) because weights are
 // stored [out_features, in_features].
 
-// P1-8: explicit AVX2+FMA kernels with RUNTIME dispatch (llama.cpp-style).
-// The default build stays baseline x86-64 (SSE2) so binaries run on old PCs;
-// on AVX2+FMA machines the hot dot/axpy loops below switch to intrinsics.
+// Explicit AVX2+FMA kernels with runtime dispatch. The default build stays
+// baseline x86-64 (SSE2) so binaries run everywhere; on AVX2+FMA machines the
+// hot dot/axpy loops switch to intrinsics.
 // Scalar path is untouched (used on ARM/MSVC/old x86 and via GAI_NO_SIMD=1).
 #if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__) && !defined(_MSC_VER)
 #define GAI_HAVE_AVX2_DISPATCH 1
@@ -140,17 +140,11 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     if (K <= 0 || alpha == 0.0f) return;
 
     // ---------------------------------------------------------------- GEMV
-    // FIX (P1-1): every GEMM below parallelises over M. At decode time M==1
-    // (one token), so the omp-for ran over a single iteration and ONE thread
-    // did 100% of the work -> single-threaded token generation on every core
-    // count. Split the M==1 NT case (the shape every linear_forward uses)
-    // over N instead. omp_in_parallel() guard: moe_forward already runs
-    // inside a parallel region during training, and nested regions would add
-    // overhead for no gain. N>2048 threshold is MEASURED (laptop: serial+SIMD
-    // wins at N=768 (0.159 vs 0.181ms) and ties at N=2048; GEMV decode is
-    // bandwidth-bound so threads add little on small rows). The V-head
-    // (N=32000, ~half of all decode weight traffic) always stays parallel,
-    // which is where engaging all cores actually matters.
+    // Every GEMM below parallelises over M, but at decode time M==1 so a
+    // plain omp-for would run one iteration on one thread. Split the M==1 NT
+    // case (the shape every linear_forward uses) over N instead, guarded
+    // against nested parallel regions. Small rows stay serial: GEMV decode is
+    // bandwidth-bound, so threads add little there.
     if (M == 1 && !trans_a && trans_b) {
         const float* a = A;
         float*       c = C;
@@ -294,12 +288,10 @@ void embedding_forward(const i32* ids, const float* table, float* out,
 
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab) {
-    // P1-7: the old code was serial over tokens (one thread for millions of
-    // adds at V=32000). Tokens sharing an id race on the same row, so a naive
-    // parallel-for is wrong. Instead: group positions by id (sort), then run
-    // groups in parallel — groups touch DISJOINT rows (race-free), and each
-    // row still accumulates positions in ascending order, i.e. BIT-IDENTICAL
-    // to the serial loop below (kept for small batches, zero overhead).
+    // Tokens sharing an id race on the same row, so a naive parallel-for is
+    // wrong. Instead: group positions by id (sort), then run groups in
+    // parallel — groups touch disjoint rows (race-free), each accumulating
+    // positions in ascending order.
     if (ntok <= 0) return;
     if (ntok < 256) {
         for (i64 t = 0; t < ntok; ++t) {
@@ -340,9 +332,8 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
     }
     bounds.push_back(order.size());
     const size_t ngroups = bounds.size() - 1;
-    // PRO-HARDEN (MSVC C3016): متغير حلقة OpenMP يجب أن يكون signed على MSVC
-    // (size_t unsigned يفشل البناء على Windows بينما GCC يقبله). long long
-    // signed يعمل على كل المنصات الثلاث.
+    // OpenMP loop variable must be signed for MSVC; long long works on all
+    // platforms.
 #ifdef GAI_OPENMP
     #pragma omp parallel for schedule(static) if(ngroups > 4)
 #endif
@@ -429,12 +420,9 @@ static inline void rope_pair(float& a, float& b, float c, float s) {
     b = nb;
 }
 
-// FIX (P1-2): `freq` depends only on `i`, never on the token, but the old
-// code called std::pow() inside the token loop -> ntok*half pow() calls per
-// layer (~2.5M transcendentals per forward at T=1024, hd=64, L=26). Hoist the
-// frequency table out of the loop: `half` pow() calls per call instead.
-// PRO-HARDEN: cache خيطي keyed بـ(head_dim,theta) يلغي ~6656 malloc/step
-// (L26*accum128) التي كانت تهش heap الـCPU وتبطئ T4 host-side.
+// `freq` depends only on `i`, never on the token: hoist the frequency table
+// out of the token loop (`half` pow() calls per call instead of ntok*half).
+// A thread-local cache keyed by (head_dim, theta) avoids per-call allocation.
 static const float* rope_freqs(int half, int head_dim, float theta,
                                std::vector<float>& buf) {
     thread_local int cached_half = -1;
@@ -624,8 +612,7 @@ void swiglu_backward(const float* g, const float* u, const float* dout,
 
 // ================================================================ softmax
 void softmax_row(float* x, int n) {
-    // FIX: guard n<=0 (MoE ne==0 / vocab==0 misconfig) — old code read x[0]
-    // unconditionally -> OOB read, NaN logits, training crash.
+    // Guard n<=0 (misconfig): never read x[0] unconditionally.
     if (n <= 0 || !x) return;
     float mx = x[0];
     for (int i = 1; i < n; ++i) mx = std::max(mx, x[i]);
@@ -638,8 +625,6 @@ void softmax_row(float* x, int n) {
 // ================================================================ attention
 // q [B,T,H,hd], k/v [B,T,KV,hd], out [B,T,H,hd]
 // probs (optional) [B,H,T,T] lower-triangular (upper part left as 0).
-// FIX (10/10): old code did `std::vector<float> s(T)` per (b,h) per layer
-// (624 allocs/step at L=26) — allocator churn that looked like a CPU leak.
 // Reuse a thread-local scratch that only grows (same monotonic-pool idea as
 // CUDA workspaces). Identical math, zero per-row mallocs.
 void attention_forward(const float* q, const float* k, const float* v,
@@ -707,7 +692,7 @@ void attention_backward(const float* q, const float* k, const float* v,
     // Parallelise over (b, kv-head) so that dk/dv writes never race:
     // all query heads in a group map to the same kv head, handled by one thread.
     // Flattened loop (no collapse clause: MSVC warns C4849 on it).
-    // FIX (10/10): same thread-local reuse as forward (was per-(b,kv) alloc).
+    // Same thread-local reuse as forward.
 #ifdef GAI_OPENMP
     #pragma omp parallel
 #endif
@@ -976,13 +961,13 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     double total = 0.0;
     i64 count = 0;
 
-    // AUDIT P1 (contract change, mirrors CUDA): dlogits are SUM grads
-    // (caller scales by its loss scale only). Count is still reported.
+    // dlogits are SUM grads (mirrors CUDA; caller scales by its loss scale
+    // only). Count is still reported.
     for (i64 i = 0; i < n; ++i) if (targets[i] >= 0 && targets[i] < V) ++count;
 
-    // P3-3: OpenMP reduction order is unspecified, so the loss scalar is not
-    // bit-reproducible run to run. Default keeps the parallel sum (fast);
-    // GAI_DETERMINISTIC=1 forces the serial order for debugging.
+    // OpenMP reduction order is unspecified, so the loss scalar is not
+    // bit-reproducible run to run. GAI_DETERMINISTIC=1 forces the serial
+    // order for debugging.
     [[maybe_unused]] const bool deterministic = [] {
         const char* e = std::getenv("GAI_DETERMINISTIC");
         return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
@@ -1021,9 +1006,8 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     if (out_count)    *out_count = count;
 }
 
-// F-10: host-side loss/count accumulator. Single-threaded by contract (the
-// model loop never calls this concurrently); the CUDA backend is the one that
-// needs to be synchronization-free, and it keeps its accumulators on device.
+// Host-side loss/count accumulator. Single-threaded by contract; the CUDA
+// backend keeps its accumulators on device.
 namespace {
 double g_sce_acc_loss = 0.0;
 i64 g_sce_acc_count = 0;

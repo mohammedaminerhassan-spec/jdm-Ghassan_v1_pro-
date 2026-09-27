@@ -25,8 +25,7 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q8_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q8_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-        // FIX: corrupt ckpt with NaN/Inf weights made amax non-finite ->
-        // scale=NaN/Inf, lround(NaN)=UB, GGUF export crash. Zero the block.
+        // Zero the block when amax is non-finite (NaN/Inf weights).
         if (!std::isfinite(amax)) {
             out[b].scale = 0.0f;
             std::memset(out[b].q, 0, sizeof(out[b].q));
@@ -92,7 +91,7 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q4_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q4_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-        // FIX: NaN/Inf guard (same contract as Q8_0 above).
+        // NaN/Inf guard (same contract as Q8_0 above).
         if (!std::isfinite(amax)) {
             out[b].scale = fp32_to_fp16(0.0f);
             // 0x88 = zero value in Q4_0 nibble encoding (+8 offset per nibble).

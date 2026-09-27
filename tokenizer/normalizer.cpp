@@ -111,7 +111,7 @@ std::string Normalizer::normalize(const std::string& text) const {
 }
 
 std::string Normalizer::canonical(const std::string& text) {
-    // FIX P2 (over-dedup): max_repeat=1 collapsed هههه/====/kkkk to one char
+    // max_repeat=1 would collapse distinct intensities (????/====/kkkk); 3 preserves هههه/====/kkkk to one char
     // so distinct intensities hashed as duplicates. 3 preserves intensity
     // classes while still normalizing runaway repeats.
     NormalizerConfig c;

@@ -11,7 +11,7 @@
 #   36 layers + final_norm                         = ~1037M total
 # Active per token (top-4 of 8 + shared + full attention): ~612M (59%).
 #
-# T4 MEMORY (fp32 master, Lion, K=5, seq 512, per GPU): 4.15 + 4.15 + 4.15
+# T4 MEMORY (fp32 master, Lion, K=4, seq 512, per GPU): 4.15 + 4.15 + 4.15
 #   = 12.4GB + MoE caches + logits + NCCL buffers => ~14.5GB / 16GB.
 #   optimizer MUST be lion (AdamW OOMs). batch_size MUST be 1.
 #   seq_len 512 (not 1024). Scale with grad_accum and 4x DDP.
@@ -60,6 +60,7 @@ training:
   fp16_weight_cache: false   # 1B: cache ~2GB would push 14GB -> OOM; keep off
   ce_chunks: 4               # pinned (was implicit default; saves ~100MB at T=512)
   loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
+  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
   loss_scale_window: 2000
   batch_size: 1              # T4 16GB: B=1 only for the 1B model
   seq_len: 512               # 512 (not 1024): 1B only fits T4 with halved activations

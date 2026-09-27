@@ -53,9 +53,8 @@ Config Config::from_string(const std::string& text) {
 
         int indent = 0;
         while (indent < static_cast<int>(raw.size()) && (raw[static_cast<size_t>(indent)] == ' ')) ++indent;
-        // FIX: tab-indented YAML silently produced indent=0 -> wrong dotted
-        // keys -> wrong hparams with no error (training misconfig). Tabs are
-        // never valid YAML indentation: fail fast with line number + content.
+        // Tabs are never valid YAML indentation: fail fast with line number +
+        // content (tab indent would read as indent=0 -> wrong dotted keys).
         if (static_cast<size_t>(indent) < raw.size() && raw[static_cast<size_t>(indent)] == '\t')
             GAI_FAIL(strfmt("config:%d: tab indentation is not allowed (use spaces): %s",
                             lineno, trim(raw).c_str()));

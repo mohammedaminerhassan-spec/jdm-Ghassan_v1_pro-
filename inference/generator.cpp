@@ -24,16 +24,15 @@ Generator::Generator(Model& model, const Tokenizer& tok, int max_context)
     Device dev = model.device();
     max_context_ = max_context > 0 ? std::min(max_context, c.max_seq_len) : c.max_seq_len;
     expected_device_ = dev;
-    // PRO-HARDEN (T4/weak-PC OOM guard): KV cache = 2*L*max_len*kv_dim*4 bytes
-    // متجاور. بدون فحص مسبق أي max_seq_len=8192 يفجر T4 فورا. نفشل برسالة
-    // واضحة تقترح تصغير max_context بدل OOM غامض وسط التوليد.
+    // KV cache = 2*L*max_len*kv_dim*4 bytes, contiguous. Pre-flight it with
+    // a clear message suggesting a smaller max_context instead of a cryptic
+    // mid-generation OOM.
     {
         size_t need = 2ULL * static_cast<size_t>(c.num_layers) *
                       static_cast<size_t>(max_context_) *
                       static_cast<size_t>(c.kv_dim()) * sizeof(float);
         if (dev == Device::CUDA && cuda_available()) {
-            // FIX P2-1: device_info().free_mem is a stale startup snapshot.
-            // Query live VRAM so ctx=4096 fails fast only when truly OOM.
+            // Query live VRAM so oversized ctx fails fast only when truly OOM.
 #ifdef GAI_CUDA
             size_t free_b = cuda::free_bytes_live();
 #else
@@ -93,7 +92,7 @@ void Generator::reset() {
     cache_.reset();
     history_.clear();
     stats_ = GenerationStats{};
-    absolute_pos_ = 0;   // P0-03: reset absolute position counter
+    absolute_pos_ = 0;
 }
 
 // ---------------------------------------------------------------- decode step
@@ -155,8 +154,8 @@ float* Generator::decode_step_logits(i32 token, int position) {
 
         const float* rope_freq = model_.rope_inv_freq_ptr();
         GAI_CHECK(rope_freq != nullptr, "decode: RoPE frequency cache is missing");
-        // T4-P1-25: the position value is loop-invariant — upload once per
-        // decode step, not once per layer (was 36 tiny H2D copies/token).
+        // The position value is loop-invariant: upload once per
+        // decode step, not once per layer.
         if (l == 0)
             device_copy(pos_dev_.data_ptr(), dev, &position, Device::CPU, sizeof(i32));
         ops::rope_forward_cached(dev, qp, kp, pos_dev_.i32p(), rope_freq, 1, H, KV, hd,
@@ -240,7 +239,7 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     Tensor d_ids({P}, DType::I32, dev);
     d_ids.copy_from(ids);
     Tensor pos({P}, DType::I32, Device::CPU);
-    for (int i = 0; i < P; ++i) pos.i32p()[i] = start_pos + i;  // P0-03: use start_pos offset
+    for (int i = 0; i < P; ++i) pos.i32p()[i] = start_pos + i;
     Tensor d_pos({P}, DType::I32, dev);
     d_pos.copy_from(pos);
 
@@ -255,10 +254,8 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     }
     Tensor att({(i64)P * qd}, DType::F32, dev);
     Tensor proj({(i64)P * d}, DType::F32, dev);
-    // FIX (10/10): old prefill allocated probs [P*H*P] transient (~1GB at
-    // P=4096,H=16) and passed it to attention_forward. Inference never needs
-    // probs (training-only for backward). nullptr = flash O(T) memory-lean
-    // path on CPU+CUDA, same numerics for `out`. Saves 1GB + H2D traffic.
+    // Prefill never needs probs (training-only for backward): nullptr selects
+    // the flash O(T) memory-lean path with identical numerics.
     const i64 nke = (i64)c.moe_top_k * c.moe_expert_dim;
     Tensor mg({(i64)P * nke}, DType::F32, dev);
     Tensor mu({(i64)P * nke}, DType::F32, dev);
@@ -325,10 +322,9 @@ void Generator::forward_prefill(const std::vector<i32>& tokens, int start_pos) {
     }
     cache_.set_length(P);
     // Final norm + head for the LAST position only (what sampling needs).
-    // AUDIT P1 FIX: old code ran the full [P,V] head (524MB temp + wasted
-    // GEMM at P=4096) then kept one row. Rows are independent, so norm+head
-    // run on row P-1 directly into the persistent [V] scratch: bit-identical
-    // logits, O(V) memory instead of O(P*V).
+    // Final norm + head for the LAST position only (what sampling needs).
+    // Rows are independent, so norm+head run on row P-1 directly into the
+    // persistent [V] scratch: O(V) memory instead of O(P*V).
     ops::rmsnorm_forward(dev, x.f32() + (size_t)(P - 1) * d,
                          model_.final_norm().w.f32(), hlast_.f32(),
                          nullptr, 1, d, c.rms_eps);
@@ -364,10 +360,9 @@ void Generator::prefill(const std::vector<i32>& tokens) {
             truncated = true;
         }
         if (!truncated) {
-            // PRO-HARDEN: forward_prefill يخصص ~12 Tensor عابرة (~150MB عند
-            // P=4096) عبر cudaMalloc/Free لكل prefill فيفتت heap الـT4.
-            // نقطع أي prompt >1024 إلى: أول 1024 batched ثم الباقي decode
-            // متسلسل (نفس الأرقام، ذروة VRAM ثابتة).
+            // forward_prefill allocates ~12 transient Tensors per call; chunk
+            // any prompt >1024 into a batched head + sequential decode tail
+            // (same numerics, bounded peak VRAM).
             static constexpr size_t PREFILL_CHUNK = 1024;
             if (work.size() > PREFILL_CHUNK) {
                 std::vector<i32> head(work.begin(), work.begin() + PREFILL_CHUNK);
@@ -380,7 +375,7 @@ void Generator::prefill(const std::vector<i32>& tokens) {
                 }
             } else {
                 forward_prefill(work, 0);
-                // P0-03: update absolute position counter after batched prefill
+                // Track the absolute position past the batched prefill.
                 absolute_pos_ = static_cast<int64_t>(work.size());
             }
         } else {
@@ -402,8 +397,8 @@ void Generator::prefill(const std::vector<i32>& tokens) {
         }
     } else {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            // P0-03: pass absolute_pos_, not (start + i) which would also be
-            // wrong after eviction; absolute_pos_ is always monotonically increasing.
+            // Pass absolute_pos_ (always monotonically increasing, valid
+            // even after cache eviction).
             decode_step(tokens[i], static_cast<int>(absolute_pos_));
             ++absolute_pos_;
             push_history(tokens[i]);
@@ -428,7 +423,7 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
     Device dev = model_.device();
     const SamplingConfig& sc = sampler.config();
 
-    // AUDIT P1 fast path: GPU penalties + top-k/argmax, ~1KB D2H per token
+    // Fast path: GPU penalties + top-k/argmax, ~1KB D2H per token
     // instead of the full 32k row (128KB + CPU-side full sort). Exact whenever
     // it engages: penalties are demote-only mirrors computed over the full
     // row on device, top-K is post-penalty exact, and the host draw tail is
@@ -494,8 +489,8 @@ std::vector<i32> Generator::generate(const GenerationConfig& cfg, StreamFn on_to
         }
         if (hit) break;
 
-        // P0-03: pass absolute_pos_ (true monotonic coordinate) instead of
-        // cache_.length(), which stays capped after the ring wraps, corrupting RoPE.
+        // Pass absolute_pos_ (true monotonic coordinate) instead of
+        // cache_.length(), which stays capped after the ring wraps.
         // Fast path leaves logits on device (no full-vocab D2H); legacy keeps
         // the host copy the sampler reads next iteration.
         GAI_CHECK(absolute_pos_ >= 0 && absolute_pos_ <= (i64)std::numeric_limits<int>::max(),

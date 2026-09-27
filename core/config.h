@@ -22,10 +22,10 @@ public:
     double      get_f64 (const std::string& key, double def = 0.0) const;
     float       get_f32 (const std::string& key, float def = 0.0f) const;
     bool        get_bool(const std::string& key, bool def = false) const;
-    // Strict getters (audit §21): malformed KNOWN scalars fail fast instead
-    // of silently falling back to a default that corrupts the recipe
-    // (e.g. learning_rate: 3e-4x). Use these for required training
-    // hyperparameters; keep the lenient getters for optional metadata.
+    // Strict getters: malformed KNOWN scalars fail fast instead of silently
+    // falling back to a default that corrupts the recipe (e.g. learning_rate:
+    // 3e-4x). Use these for required training hyperparameters; keep the
+    // lenient getters for optional metadata.
     i64         get_int_strict (const std::string& key) const;
     double      get_f64_strict (const std::string& key) const;
     bool        get_bool_strict(const std::string& key) const;
@@ -33,7 +33,7 @@ public:
 
     void set(const std::string& key, const std::string& value);
 
-    // P2-5 typo/dead-key catcher: every stored key must either be in `exact`
+    // Typo/dead-key catcher: every stored key must either be in `exact`
     // or start with one of `prefixes` (e.g. "data.mix."). Structural parent
     // keys (empty value WITH children, like "data") are always skipped; empty
     // LEAF keys warn too (a valueless setting is almost certainly a mistake).

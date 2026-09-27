@@ -203,8 +203,8 @@ bool Shard::load_header(const std::string& path) {
     return true;
 }
 
-// Per-thread cached fd: avoids open/close per row (was 100s of opens/sec).
-// The cache reopens only when the path changes; seeks are cheap.
+// Per-thread cached fd: avoids open/close per row. The cache reopens only
+// when the path changes; seeks are cheap.
 namespace {
 struct ShardFdCache {
     std::ifstream f;
@@ -255,9 +255,9 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
     f.seekg(static_cast<std::streamoff>(tok_off), std::ios::beg);
     if (!f.good()) return false;
     if (header_.dtype == 0) {
-        // T4-P1-18: never malloc on the streaming hot path. Reuse a
-        // thread-local staging buffer (grows monotonically, like t_fd_cache
-        // above — reads already happen per-thread, so this is race-free).
+        // Never malloc on the streaming hot path. Reuse a thread-local
+        // staging buffer (grows monotonically; reads already happen
+        // per-thread, so this is race-free).
         thread_local std::vector<u16> t_u16_stage;
         if (t_u16_stage.size() < static_cast<size_t>(len))
             t_u16_stage.resize(static_cast<size_t>(len));
@@ -585,7 +585,7 @@ bool DataLoader::next(Batch& out) {
     out.tokens_supervised = 0;
 
     for (int b = 0; b < B; ++b) {
-        // P1-20: a failed window read must never become a silent padded row.
+        // A failed window read must never become a silent padded row.
         bool row_ok = false;
         std::string last_path;
         for (int attempt = 0; attempt < 8 && !row_ok; ++attempt) {

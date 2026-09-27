@@ -194,10 +194,8 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
 #pragma unroll
     for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o2));
-    // FIX P0-2 (SWA 32x overcount): every lane computes the SAME full sum
-    // (j loop is not strided, sAcc partition is over c not j), so a warp
-    // reduction would multiply sum by 32 and produce 1/32 outputs.
-    // All lanes already hold identical sum -> use directly, no reduction.
+    // Every lane computes the same full sum (j loop not strided, sAcc
+    // partitioned over c not j): use it directly, no warp reduction.
     float sum = 0.0f;
     for (int j = j0; j <= t; ++j) {
         i32 seg_j = segment_ids ? segment_ids[size_t(b) * T + j] : 0;
@@ -448,8 +446,7 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
 void attention_decode(const float* q, const float* kc, const float* vc,
                       float* out, int H, int KV, int hd, int cur_len, int max_len,
                       float scale, float* scratch) {
-    // FIX P2 (OOB read): cur_len was never checked against the KV allocation
-    // (max_len). An undersized cache silently read past K/V. Fail fast.
+    // cur_len must fit the KV allocation (max_len); fail fast otherwise.
     GAI_CHECK(cur_len <= max_len,
               "cuda attention_decode: cur_len exceeds KV cache max_len (increase max_context)");
     GAI_CHECK(cur_len >= 0 && max_len >= 0, "cuda attention_decode: negative length");

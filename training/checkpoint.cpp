@@ -30,7 +30,12 @@ static constexpr u32 CKPT_MAGIC   = 0x54504B47u;   // "GKPT"
 //     .gtok is refused: same vocab_size + different merges = different token
 //     ids = silently corrupted embeddings/softmax. Loader accepts v3..v11;
 //     v<=10 files get fingerprint 0 (unknown -> warn, training continues).
-static constexpr u32 CKPT_VERSION = 11u;
+// v12: TrainState carries the rank-0 validation loader state (val_loader).
+//     Eval consumes val batches continuously, so a resume without it restarts
+//     eval at batch 0: different val loss, different best.ckpt. Loader accepts
+//     v3..v12; v<=11 files get val batches = -1 (unknown -> keep the fresh
+//     loader, never a zeroed stream).
+static constexpr u32 CKPT_VERSION = 12u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
 static constexpr u8 OPT_MUON  = 2u;
@@ -89,6 +94,14 @@ static bool rd_state_prefix(std::istream& f, TrainState& state, u32 version) {
         state.sched_min_ratio = 0.1f; state.sched_decay_frac = 0.2f; state.sched_kind = 0;
     }
     if (!rd_tok_fp_v11(f, state, version)) return false;
+    if (version >= 12u) {
+        if (!rd_loader_v5(f, state.val_loader)) return false;
+    } else {
+        // Unknown, NOT zero: a zeroed stream would resume eval on the wrong
+        // RNG stream. The trainer keeps the freshly opened loader instead.
+        state.val_loader = DataLoader::State{};
+        state.val_loader.batches = -1;
+    }
     return true;
 }
 
@@ -218,9 +231,9 @@ static bool rd_loader_legacy(std::istream& i, DataLoader::State& s) {
     return true;
 }
 static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
-    // FIX (10/10): only SHAPE-affecting fields block resume (wrong numel).
-    // Loss/recipe fields (aux/z/rope/jitter/mscale/eps/init) only warn — old
-    // code failed resume when changing aux_scale, which is just a loss weight.
+    // Only SHAPE-affecting fields block resume (wrong numel).
+    // Loss/recipe fields (aux/z/rope/jitter/mscale/eps/init) only warn:
+    // changing a loss weight must not fail a resume.
     // qk_norm DOES change shapes (adds 2xHD params/layer) so it must match.
     // max_seq_len changes KV-cache only (no weights), so warn, don't fail.
     if (!(a.vocab_size == b.vocab_size && a.hidden_size == b.hidden_size &&
@@ -455,6 +468,7 @@ void Checkpoint::save(const CheckpointSnapshot& snapshot, const std::string& pat
         wr(f, state.tok_vocab);
         wr_sched_v8(f, state);
         wr(f, state.tok_fingerprint);
+        wr_loader_v5(f, state.val_loader);
 
         u64 bias_layers = snapshot.moe_bias.size();
         wr(f, bias_layers);
@@ -549,8 +563,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // PRO-HARDEN: ملف فاسد قد يحمل n=1e12 فيدور CPU في حلقة DoS قبل أول rd
-    // يفشل. النماذج هنا <10000 بارامتر؛ نفشل فورا فوقها.
+    // Implausible param counts (corrupt file) fail fast before the read loop.
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen;
     for (u64 i = 0; i < n; ++i) {
@@ -628,9 +641,8 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     // Accept v3..v9: weights + schedule always restore; moments restart fresh
     // with a warning when the optimizer kind differs, rather than restarting step 0.
-    // FIX P0-1 (T4 Lion resume): v9 optimizer blob layout is unchanged since v7,
-    // so only version < 5 is legacy. The old gate (version != 5..8) wrongly
-    // treated v9 (+v4) as legacy and silently dropped Lion/Muon moments.
+    // v9 optimizer blob layout is unchanged since v7, so only version < 5
+    // is legacy (v9 blobs restore Lion/Muon moments).
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
     bool is_legacy = (version < 5u);
 
@@ -660,8 +672,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // PRO-HARDEN: ملف فاسد قد يحمل n=1e12 فيدور CPU في حلقة DoS قبل أول rd
-    // يفشل. النماذج هنا <10000 بارامتر؛ نفشل فورا فوقها.
+    // Implausible param counts (corrupt file) fail fast before the read loop.
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen_lion;
     for (u64 i = 0; i < n; ++i) {
@@ -740,7 +751,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    // FIX P0-1 (Muon too): same v9 gate as Lion loader above.
+    // Same v9 gate as the Lion loader above.
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
@@ -769,8 +780,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // PRO-HARDEN: ملف فاسد قد يحمل n=1e12 فيدور CPU في حلقة DoS قبل أول rd
-    // يفشل. النماذج هنا <10000 بارامتر؛ نفشل فورا فوقها.
+    // Implausible param counts (corrupt file) fail fast before the read loop.
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen_muon;
     for (u64 i = 0; i < n; ++i) {

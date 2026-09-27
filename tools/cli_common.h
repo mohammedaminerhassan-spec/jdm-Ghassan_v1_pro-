@@ -19,8 +19,7 @@ public:
     u64         num_u64(const std::string& k, u64 def = 0) const;
     double      real(const std::string& k, double def = 0.0) const;
     bool        flag(const std::string& k, bool def = false) const;
-    // FIX P1-7 (silent GPU-hour burn): strict getters fail fast on malformed
-    // values instead of warn+default. Used when --strict-args is passed.
+    // Strict getters fail fast on malformed values (used with --strict-args).
     i64         num_strict(const std::string& k) const;
     int         num_int_strict(const std::string& k) const;
     double      real_strict(const std::string& k) const;

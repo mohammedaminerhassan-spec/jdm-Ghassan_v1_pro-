@@ -96,7 +96,7 @@ void* malloc_device(size_t nbytes) {
 }
 
 void free_device(void* ptr) {
-    if (ptr) CUDA_CHECK(cudaFree(ptr));  // PRO-HARDEN: كان يتجاهل الخطأ فيخفي double-free
+    if (ptr) CUDA_CHECK(cudaFree(ptr));  // surface double-free instead of hiding it
 }
 
 void memset_zero(void* ptr, size_t nbytes) {
@@ -147,8 +147,6 @@ void* cublas_handle() {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");
         // TF32 is a large free speedup on Ampere+ and is numerically fine for
         // this model size; explicitly opt in unless GAI_TF32=0 (bit-exact fp32).
-        // FIX (10/10): T4 is sm75 (no TF32 cores) — old code set TF32 math
-        // unconditionally, which is a no-op on T4 but misleads profiling.
         // Auto-detect: TF32 only on sm>=80, otherwise DEFAULT_MATH.
         const char* tf = std::getenv("GAI_TF32");
         bool want_tf32 = true;
@@ -173,9 +171,8 @@ void shutdown() {
     cuda_ops::free_workspace();
     cuda_ops::free_sampling_workspace();
     cuda_ops::moe_free_workspace();
-    // PRO-HARDEN: cudaDeviceReset كان يبطل كل Tensor حي (dangling UAF إن بقي
-    // Model/static بعده). نكتفي بـ synchronize ونترك Reset لمتغير بيئة صريح
-    // للاختبارات المعزولة فقط.
+    // No cudaDeviceReset here: it would invalidate every live Tensor.
+    // Synchronize only; full reset stays behind GAI_CUDA_RESET for tests.
     if (g_initialized) {
         cudaDeviceSynchronize();
         const char* r = std::getenv("GAI_CUDA_RESET");

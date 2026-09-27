@@ -96,8 +96,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- CLI overrides (FIX P1-7: --strict-args fails fast instead of
-        // warn+default so a typo like --batch-size 2x never burns GPU hours)
+        // ---- CLI overrides (--strict-args fails fast instead of warn+default).
         const bool strict_args = args.flag("strict-args", false);
         if (args.has("data"))            tcfg.data_dir = args.str("data");
         if (args.has("checkpoint-dir"))  tcfg.checkpoint_dir = args.str("checkpoint-dir");
@@ -207,9 +206,8 @@ print_device_report();
              tok_path = args.str("tokenizer");
          } else if (cfg.has("tokenizer.path")) {
              tok_path = cfg.get_str("tokenizer.path", "");
-             // PRO-HARDEN: مسار YAML النسبي artifacts/... كان يحل ضد CWD
-             // فيفشل على Kaggle عند التشغيل من /kaggle/working. نحله ضد
-             // مجلد ملف الconfig أولا (نفس سلوك data_pipeline).
+              // Resolve a relative YAML tokenizer path against the config file's
+              // directory first (same behavior as data_pipeline).
              if (!tok_path.empty() && !fs::path(tok_path).is_absolute()) {
                  fs::path cfg_dir = fs::path(cfg_path).parent_path();
                  fs::path cand = cfg_dir / tok_path;
@@ -243,10 +241,8 @@ print_device_report();
         } else if (tcfg.device == "auto") {
             dev = best_device();
         }
-        // FIX (DDP order): pin the correct GPU BEFORE any cudaMalloc (Model
-        // weights allocate on construction). Previously every rank allocated
-        // on GPU0 then called cudaSetDevice(local_rank) inside Trainer, piling
-        // 4 ranks onto one GPU briefly -> OOM / NCCL hang that looked like a leak.
+        // DDP order: pin the correct GPU BEFORE any cudaMalloc (model
+        // weights allocate on construction).
 #ifdef GAI_CUDA
         if (dev == Device::CUDA) {
             int want = 0;

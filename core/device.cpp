@@ -211,11 +211,9 @@ void* device_alloc(size_t nbytes, Device dev, DType /*dt*/) {
     if (nbytes == 0) return nullptr;
     if (dev == Device::CUDA) {
 #ifdef GAI_CUDA
-        // FIX P2-1: old guard compared against stale startup free_mem
-        // (device_info() is cached once). Query live VRAM so the guard
-        // stays correct after GBs of weights/workspaces.
-        // Guard allocs >16MB (was 64MB): dozens of <64MB activation tensors
-        // ([N,d] ~6MB at N=2048) could cumulatively OOM with no early message.
+        // Query live VRAM so the guard stays correct after GBs of
+        // weights/workspaces. Guard allocs >16MB: dozens of small activation
+        // tensors could cumulatively OOM with no early message.
         if (nbytes > (16ull << 20)) {
             size_t live_free = cuda::free_bytes_live();
             if (live_free > 0 && nbytes > live_free) {
@@ -245,7 +243,7 @@ void device_free(void* ptr, Device dev) {
 #ifdef GAI_CUDA
         cuda::free_device(ptr);
 #else
-        // PRO-HARDEN: الصمت هنا كان يخفي leak (مؤشر CUDA يضيع بلا تحرير).
+        // Fail loudly here: silently dropping the pointer would hide a leak.
         GAI_FAIL("device_free: CUDA pointer freed in a CPU-only build (leak hidden)");
 #endif
         return;
@@ -285,7 +283,7 @@ void device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, siz
 #ifdef GAI_CUDA
     if ((dst_dev == Device::CUDA || dst_dev == Device::CPU) &&
         (src_dev == Device::CUDA || src_dev == Device::CPU)) {
-        // PERF telemetry: direction-tagged transfer bytes for the P2-2 report.
+        // PERF telemetry: direction-tagged transfer bytes.
         if (dst_dev == Device::CUDA && src_dev == Device::CPU) ops::perf_note_h2d(nbytes);
         else if (dst_dev == Device::CPU && src_dev == Device::CUDA) ops::perf_note_d2h(nbytes);
         cuda::copy(dst, dst_dev == Device::CUDA, src, src_dev == Device::CUDA, nbytes);

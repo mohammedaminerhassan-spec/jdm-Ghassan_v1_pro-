@@ -373,8 +373,8 @@ struct ShardBuild {
                   "--val-ratio must be finite and in [0,1]");
         GAI_CHECK(shard_tokens > 0, "--shard-tokens must be > 0");
         seq_cap      = args.num_int("seq-len", 4096);
-        // FIX P2 (silent misconfig): --seq-len<=0 previously disabled
-        // splitting silently; empty --out wrote to a root path.
+        // --seq-len<=0 would silently disable splitting; fail fast.
+        // Empty --out is rejected before writing to a root path.
         GAI_CHECK(seq_cap > 0, "--seq-len must be > 0 (splitting is mandatory)");
         {
             std::string out0 = args.str("out", "artifacts/shards");
@@ -407,9 +407,7 @@ struct ShardBuild {
         outdir = args.str("out", "artifacts/shards");
         GAI_CHECK(!outdir.empty(), "--out must be non-empty");
         fs::create_directories(outdir);
-        // FIX P2 (empty shards): writers were opened before any input was
-        // validated, leaving empty train_*.gbin that passed later preflight.
-        // Now lazy: first emit opens the writer (see ensure_train/ensure_val).
+        // Lazy writers: first emit opens the writer (see ensure_train/ensure_val).
         train_w.reset(); val_w.reset();
         // DeepSeek eval-hygiene: every training-data path honors the eval
         // blocklist — otherwise eval prompts leak into train shards silently.
@@ -1519,7 +1517,7 @@ static int cmd_build(const Args& args) {
     };
     auto ensure_train = [&]() { if (!train_w) open_train(); };
     auto ensure_val = [&]() { if (!val_w) open_val(); };
-    // FIX P2: lazy writers (was: empty shards written before input validation).
+    // Lazy writers: no empty shards before input validation.
 
     // Deterministic split by CANONICAL hash: the same document always lands
     // on the same side, and near-dups (same canonical) stay together —

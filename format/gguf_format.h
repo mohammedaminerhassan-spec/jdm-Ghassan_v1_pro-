@@ -179,7 +179,7 @@ private:
     // Byte offset where tensor data starts (aligned past the tensor-info
     // block). Captured ONCE in open() from the checked parse, so every
     // tensor read seeks directly instead of re-walking the whole header
-    // (old code re-skipped metadata+infos per tensor: O(T^2) opens on 1B
+    // (data_start_ avoids re-skipping metadata+infos per tensor).
     // models AND re-parsed with unchecked reads — corrupt-file crash vector).
     uint64_t data_start_ = 0;
 

@@ -86,7 +86,7 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K);
 
-// ---- F-03 fused grouped helpers -------------------------------------------
+// ---- fused grouped helpers -------------------------------------------
 // These mirror the CUDA fused kernels in cuda/moe.cu one-to-one (same
 // indexing, same grouped-slot layout) so tests/test_moe_fused.cpp can prove
 // the fusion logic bit-exact against moe_forward() above. They are the CPU
@@ -120,9 +120,9 @@ void moe_save3_all(const float* G, const float* U, const float* A,
 // out[t] += w[t,k] * Y[s]  (weighted scatter-add over every slot at once)
 void moe_scatter_add_all(float* out, const float* Y, const i32* grouped,
                          const float* w, i64 NK, int d, int K);
-// F-02: acc[e] += 1 for every slot assigned to expert e. The CUDA backend runs
-// this as one atomic kernel into a persistent [L*ne] device buffer (zero D2H
-// per layer/micro); the loop below is the CPU reference for the same math.
+// acc[e] += 1 for every slot assigned to expert e. The CUDA backend runs
+// this as one atomic kernel into a persistent [L*ne] device buffer; the loop
+// below is the CPU reference for the same math.
 void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
 // Full fused forward (same contract as moe_forward): pack once, per-expert
 // GEMMs on packed blocks, one swiglu, one save, one scatter-add.
@@ -166,7 +166,7 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
-// F-10: host-side accumulate API (trivial: file-static doubles). The CUDA
+// Host-side accumulate API (trivial: file-static doubles). The CUDA
 // backend keeps the accumulators on device; see cuda/kernels.cu.
 void sce_acc_begin();
 void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
@@ -184,10 +184,8 @@ void lion_step(float* w, const float* g, float* m, i64 n,
                float grad_scale);
 
 double global_sq_norm(const float* g, i64 n);
-// FIX (10/10 DeepSeek-style): fused multi-tensor norm — 1 sync instead of
-// ~200 (was 200 cudaMemcpy D2H per optimizer step, the main GPU-starvation
-// bottleneck on T4). CPU reference loops; CUDA launches all tiles async then
-// a single D2H.
+// Fused multi-tensor norm: one sync instead of one per tensor. CPU reference
+// loops; CUDA launches all tiles async then a single D2H.
 double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& parts);
 
 // DeepSeek-V2 router jitter (CPU mirror; set via ops::set_moe_jitter).
@@ -201,7 +199,7 @@ float jitter_u_for_test(i64 token, int expert);
 // in-place softmax over a row (fp32 accumulators, max-subtracted)
 void softmax_row(float* x, int n);
 
-// ---- inference fast-sampling helpers (audit P1; CPU reference mirrors CUDA)
+// ---- inference fast-sampling helpers (CPU reference mirrors CUDA)
 // top-K selection, descending by value (ties: lowest id first, deterministic).
 // K is clamped to [1, V] by the caller contract (GAI_CHECK inside).
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids);

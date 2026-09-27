@@ -152,7 +152,7 @@ static LoadedModel load_model(const Args& args) {
         GGUFReader r;
         GAI_CHECK(r.open(path), "not a valid .gguf model file: " + path);
         lm.cfg = r.model_config();
-        // Profile label: current key first, legacy pre-fix key as fallback.
+        // Profile label: current key first, older key as fallback.
         lm.quant = r.get_string("ghassan.quantization.profile",
                      r.get_string("general.quantization_version", "fp16"));
         lm.file_bytes = r.file_size();
@@ -493,8 +493,7 @@ static int cmd_quantize(const Args& args) {
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             GAI_CHECK(r.load_tokenizer(tk), "GGUF tokenizer payload corrupt; pass --tokenizer");
-            // FIX P2 (temp collision): fixed name collided when two quantize
-            // processes ran concurrently. Unique per-process name instead.
+            // Unique per-process temp name (two concurrent quantize runs).
             static std::atomic<unsigned> quant_tmp_ctr{0};
             std::string uniq = "gguf_requant_" +
                 std::to_string((unsigned long long)::rand() ^ (unsigned long long)quant_tmp_ctr++) + ".gtok";
@@ -758,7 +757,7 @@ static int cmd_logits(const Args& args) {
     std::vector<i32> ids = lm.tokenizer.encode(prompt, true, false); // BOS, no EOS
     const int T = static_cast<int>(ids.size());
     GAI_CHECK(T > 0, "prompt encodes to zero tokens");
-    // FIX P2 (OOM): [T,V] f32 logits (T=4096,V=32k = 512MB) blew weak PCs.
+    // Cap single-shot logits ([T,V] f32 would OOM weak PCs).
     // Cap single-shot logits; score long prompts via generate/score_tokens.
     GAI_CHECK(T <= 512, "logits prompt too long (T>512 would materialize >64MB); "
                         "split the prompt or use score_tokens/bench instead");

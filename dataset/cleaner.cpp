@@ -533,9 +533,8 @@ ToxicityResult check_toxicity(const std::string& text) {
         {"انتحار", "self-harm"}, {"اقتل نفسك", "self-harm"},
     };
 
-    // FIX P2 (false positives): comment promised word-boundary matching but
-    // code was substring find ("rape" fired inside "grape", "tbon" inside
-    // innocent tokens). Match on ASCII alnum boundaries now.
+    // Match on ASCII alnum boundaries (substring find would fire inside
+    // innocent tokens: "rape" in "grape").
     auto is_word_char = [](char ch) {
         return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
     };

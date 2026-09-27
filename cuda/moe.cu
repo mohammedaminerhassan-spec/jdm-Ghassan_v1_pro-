@@ -53,15 +53,14 @@ static void* moe_workspace(size_t bytes) {
     return g_moe_ws;
 }
 
-// F-16: pre-size the MoE pool before the first step (see reserve_workspaces).
+// Pre-size the MoE pool before the first step (see reserve_workspaces).
 void moe_reserve_workspace(size_t bytes) {
     if (bytes == 0) return;
     moe_workspace(bytes);
 }
 
 // Persistent grouped-slot buffers: avoids cudaMalloc/cudaFree on every
-// layer in every micro-batch (was 1600+ allocs per optimizer step) and
-// avoids the old read_slots() host roundtrip of N*K ints per layer.
+// layer in every micro-batch and keeps slot data on the GPU.
 // Only ne counters cross the host (tiny sync); slot data stays on GPU.
 // All buffers grow monotonically and live for the process lifetime.
 static i32*   g_grp_grouped = nullptr;
@@ -111,9 +110,8 @@ size_t moe_pool_bytes() { return g_moe_ws_bytes; }
 // deterministic. Noise is hash-based (no RNG state, bit-reproducible per
 // token) and folds the per-step seed (step/rank/base) for temporal diversity.
 __device__ __forceinline__ float jitter_u(i64 t, int e, unsigned long long seed) {
-    // Improved hash: MurmurHash3 fmix32 finalizer for better distribution.
-    // Old hash had bias from modulo and weak mixing; this version uses
-    // proper 64-bit multiply + xor-shift finalizer for uniform output.
+    // Train-only router noise: MurmurHash3 fmix64 finalizer over (token,
+    // expert, step seed) for a uniform output mapped to [-0.5, 0.5).
     uint64_t h = (uint64_t)t * 0x9E3779B97F4A7C15ULL;
     h ^= (uint64_t)e * 0xC2B2AE3D27D4EB4FULL;
     h ^= (seed + 0x9E3779B97F4A7C15ULL);
@@ -123,14 +121,11 @@ __device__ __forceinline__ float jitter_u(i64 t, int e, unsigned long long seed)
     // Map to [-0.5, 0.5) with 24-bit precision (no modulo bias)
     return ((h >> 40) & 0xFFFFFF) / (float)(1 << 24) - 0.5f;
 }
-// Warp-per-token router (audit P0 #4): one TOKEN per block, blockDim.x
-// threads cooperating (launch with 32 = one warp). The old launch used
-// (N blocks x 1 thread): 31/32 warp slots idle per token, so the
-// expf-heavy softmax could not hide latency across 36 layers x grad_accum
-// micros. Math matches the old kernel: parallel max is exact (order-free);
-// the softmax denominator reduction may reorder fp adds (~1ulp vs serial);
-// top-k stays serial on lane 0 with the same strict-greater tie-break, so
-// picks/weights agree up to that 1ulp (parity tolerance is 5%).
+// Warp-per-token router: one TOKEN per block, blockDim.x threads cooperating
+// (launch with 32 = one warp) on the expf-heavy softmax. Parallel max is
+// exact (order-free); the softmax denominator reduction may reorder fp adds
+// (~1ulp vs serial); top-k stays serial on lane 0 with strict-greater
+// tie-break.
 __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
                         i64 N, int ne, int K, float jitter, unsigned long long seed) {
     const i64 t = (i64)blockIdx.x;
@@ -153,7 +148,7 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
     __syncthreads();
     float mx = sred[0];
     for (int i = 1; i < W; ++i) mx = fmaxf(mx, sred[i]);
-    // -- denominator (parallel partials; ~1ulp vs old serial order)
+    // -- denominator (parallel partials over cooperating threads)
     float lsum = 0.0f;
     for (int e = tid; e < ne; e += W) {
         float v = lg[e];
@@ -281,12 +276,8 @@ __global__ void k_route_bias(const float* logits, const float* bias,
     }
 }
 
-// FIX P1-4 (MoE memory storm): old kernels were slot-serial (one thread
-// loops rowlen=768..1280 with scalar loads/stores) and k_scatter_add issued
-// N*K*d atomicAdds. New versions vectorize via float4 when rowlen % 4 == 0
-// (all production shapes: 768/1024/1280) and keep an exact scalar tail.
-// Atomic count is unchanged semantically (K=2 shares a dst row) but each
-// transaction is now coalesced 128-bit where possible.
+// Slot-movement kernels vectorize via float4 when rowlen % 4 == 0
+// (all production shapes: 768/1024/1280) with an exact scalar tail.
 // dst[s] = src[t] for slot s = t*K+k (token-space gather)
 // dst[s] = src[t] for slot s = t*K+k (token-space gather)
 __global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
@@ -367,16 +358,13 @@ __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
     }
 }
 
-// ================================================================ F-03 fused grouped elementwise
+// ================================================================ fused grouped elementwise
 // Each kernel below runs ONCE per layer over all NK grouped slots instead of
-// once per expert. The math is identical to the per-expert sequence it
-// replaces (same indexing, same grouped-slot layout as moe_build_groups);
-// only the launch count changes (~72 -> ~31 launches/layer at ne=8, K=2).
-// The fusion LOGIC is proven bit-exact on CPU by tests/test_moe_fused.cpp
-// (cpu::moe_pack_all / moe_save3_all / moe_scatter_add_all), so these bodies
-// are mechanical translations of validated code. The GEMMs stay per-expert:
-// cuBLAS has no variable-m batched API, and padding every expert to max_ns
-// would waste compute exactly when the router is imbalanced.
+// once per expert (same indexing, same grouped-slot layout). The fusion logic
+// is proven bit-exact on CPU by tests/test_moe_fused.cpp, so these bodies
+// mirror that validated code. The GEMMs stay per-expert: cuBLAS has no
+// variable-m batched API, and padding every expert to max_ns would waste
+// compute exactly when the router is imbalanced.
 
 // Xpack[s] = x[grouped[s]/K] — pack every expert's input rows in one pass.
 __global__ void k_pack_all(const float* x, const i32* grouped, float* out,
@@ -511,10 +499,9 @@ __global__ void k_scale_all(const float* dout, const float* w, const i32* groupe
     }
 }
 
-// ================================================================ F-02 on-device slot counting
+// ================================================================ on-device slot counting
 // acc[e] += 1 for every routed slot. One atomic per slot into a persistent
-// [L*ne] device counter — this is what removes the per-layer/per-microbatch
-// N*K-int D2H from the aux-free bias path (3,328 copies/step at 26L/acc128).
+// [L*ne] device counter; the host reads the summary once per optimizer step.
 // ne <= 64 keeps every counter in L2; K <= 8 bounds the per-slot work.
 __global__ void k_count_slots(const i32* idx, float* acc, i64 NK, int ne) {
     i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -596,18 +583,10 @@ __global__ void k_dp_dot(const float* dout, const float* eout, const i32* slots,
 // One block per token: softmax backward over the router distribution plus the
 // aux load-balance term. Writes per-token DL[t,ne] rows (dL/dlogits) and
 // accumulates the dx part directly (dx[t] is exclusive to this token).
-// drouter is computed AFTERWARDS as DL^T @ x via cuBLAS (no atomics):
-// the old version did ne*d atomicAdds per token (12.5M/layer at N=2048),
-// all colliding on ne*d rows -- the hottest serialization point on T4.
-// Warp-per-token router backward (same audit P0 #4 fix as k_route).
-// Old kernel ran the whole token serially in one thread — including the
-// ne*d router-gradient accumulation (49k MACs at ne=64,d=768) in a single
-// thread. New layout: lane 0 runs the cheap scalar prologue (identical code
-// and summation order, so DL is bit-exact vs the old kernel), then all
-// threads cooperate: DL row writes are disjoint per expert, and dx rows are
-// j-partitioned (each thread owns strided j's, e ascending — the same final
-// summation order per element as before, so dx is bit-exact too, accumulated
-// into the pre-zeroed dx row with += as the caller requires).
+// drouter is computed AFTERWARDS as DL^T @ x via cuBLAS (no atomics).
+// Warp-per-token layout (same as k_route): lane 0 runs the scalar prologue,
+// then all threads cooperate — DL row writes are disjoint per expert, and dx
+// rows are j-partitioned (no atomics; dx[t] is exclusive to this block).
 __global__ void k_router_dl(const float* x, const float* router_w,
                             const float* probs, const float* dp_slots,
                             const i32* idx, const float* aux_frac,
@@ -651,10 +630,8 @@ __global__ void k_router_dl(const float* x, const float* router_w,
         for (int e = 0; e < ne; ++e) pdot += pt[e] * sdp[e];
         for (int e = 0; e < ne; ++e) {
             float dl = pt[e] * (sdp[e] - pdot);
-            // P0-06 FIX (unified): forward jitter z'=z*(1+j*2*u) needs
-            // chain-rule factor with the EXACT same fmix64 hash as k_route
-            // jitter_u(t,e,seed). Old code used a different %1000000 hash
-            // here -> drouter wrong whenever moe_jitter>0.
+            // Forward jitter z'=z*(1+j*2*u) needs its chain-rule factor here,
+            // computed with the same hash as k_route jitter_u(t,e,seed).
             if (jitter > 0.0f) {
                 uint64_t hh = (uint64_t)t * 0x9E3779B97F4A7C15ULL;
                 hh ^= (uint64_t)e * 0xC2B2AE3D27D4EB4FULL;
@@ -728,40 +705,44 @@ static void ensure_offsets_pinned(int ne) {
     g_h_offsets_cap = ne;
 }
 
-// Fills h_counts[ne], h_offsets[ne+1] on host; grouped slots on device.
-// h_counts/h_offsets must have room for ne / ne+1 ints. grouped_out receives
-// the device pointer (valid until the next call with larger NK).
-// PERF: pinned host buffer + async D2H + event sync instead of a blocking
-// cudaMemcpy (~10-20us per layer per microbatch). Offsets and fill cursors
-// live in SEPARATE device buffers, so k_group_fill is queued BEFORE the host
-// reads the offsets: the GPU never idles on the host round-trip, it only
-// costs the host-side wait for ne+1 ints needed by the GEMM loop below.
-static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
-                             i32** grouped_out, int* h_counts, int* h_offsets) {
+// Grouped-slot construction, split into launch + sync phases so the host-side
+// wait for the ne+1 offset ints overlaps GPU compute (shared-expert GEMMs in
+// forward, gather/pack/scale kernels in backward) instead of stalling the
+// training thread per layer per microbatch. All work runs on the default
+// stream, so stream ordering guarantees the async D2H observes complete data.
+// grouped_out receives the device pointer (valid until the next call with
+// larger NK). h_counts/h_offsets need room for ne / ne+1 ints.
+static void moe_build_groups_launch(const i32* d_idx, i64 N, int K, int ne,
+                                    i32** grouped_out) {
     const i64 NK = N * K;
     GAI_CHECK(ne > 0 && ne <= 64, "moe grouping: ne out of range");
     grp_ensure((size_t)(NK > 0 ? NK : 1), ne);
     ensure_offsets_pinned(ne);
     *grouped_out = g_grp_grouped;
-    for (int e = 0; e < ne; ++e) h_counts[e] = 0;
-    for (int e = 0; e <= ne; ++e) h_offsets[e] = 0;
     if (NK <= 0) return;
     CU_CHECK(cudaMemset(g_grp_cnt, 0, sizeof(int) * (size_t)ne));
     k_group_hist<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_cnt, NK, ne);
     // Offsets and fill cursors live in SEPARATE buffers (g_grp_off is never
     // mutated after this kernel, g_grp_cur is consumed by k_group_fill), so
-    // the fill below may run BEFORE the host reads the offsets: the GPU no
-    // longer idles waiting for the host round-trip.
+    // the fill below may run BEFORE the host reads the offsets.
     k_group_offsets<<<1, 1>>>(g_grp_cnt, g_grp_off, g_grp_cur, ne);
     CU_CHECK(cudaGetLastError());
     k_group_fill<<<grid_for(NK, 256), 256>>>(d_idx, g_grp_grouped, g_grp_cur, NK, ne);
     CU_CHECK(cudaGetLastError());
-    // Async D2H of the CLEAN offsets into pinned buffer — queued after the
+    // Async D2H of the CLEAN offsets into the pinned buffer — queued after the
     // fill on the same stream; disjoint memory, so no race either way.
     CU_CHECK(cudaMemcpyAsync(g_h_offsets_pinned, g_grp_off,
                              sizeof(int) * (size_t)(ne + 1),
                              cudaMemcpyDeviceToHost, 0));
     CU_CHECK(cudaEventRecord(g_offsets_event, 0));
+}
+
+// Completes a launch: waits for the offset copy, then derives counts.
+// NK <= 0 (empty microbatch) only zeroes the host arrays; no sync needed.
+static void moe_build_groups_sync(i64 NK, int ne, int* h_counts, int* h_offsets) {
+    for (int e = 0; e < ne; ++e) h_counts[e] = 0;
+    for (int e = 0; e <= ne; ++e) h_offsets[e] = 0;
+    if (NK <= 0) return;
     // Wait for the copy to complete before reading offsets on host.
     CU_CHECK(cudaEventSynchronize(g_offsets_event));
     for (int e = 0; e <= ne; ++e) h_offsets[e] = g_h_offsets_pinned[e];
@@ -769,7 +750,6 @@ static void moe_build_groups(const i32* d_idx, i64 N, int K, int ne,
         int c = h_offsets[e + 1] - h_offsets[e];
         h_counts[e] = c < 0 ? 0 : c;
     }
-    if (h_offsets[ne] <= 0) return;
 }
 
 // ================================================================ forward
@@ -779,8 +759,13 @@ void moe_forward(const float* x, const float* router_w,
                  float* out,
                  float* probs_cache, i32* idx_cache, float* w_cache,
                  float* s_gate, float* s_up, float* s_act,
-                 i64 N, int d, int E, int ne, int K) {
+                  i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
+    // Router kernels use fixed-size on-chip state (picked[8], ne-wide shared
+    // rows), so K/ne/N are range-checked here to match the CPU reference path.
+    GAI_CHECK(N <= 2147483647LL, "moe forward: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe forward: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe forward: num_experts out of kernel range [1,64]");
     const i64 NK = N * K;
 
     uint8_t* ws = (uint8_t*)moe_workspace(
@@ -800,13 +785,20 @@ void moe_forward(const float* x, const float* router_w,
     // 1. router logits
     linear_forward(x, router_w, rlogits, (int)N, d, ne);
 
-    // 2. route (one warp per token: 32 threads cooperate on each token's
-    // ne-expert row instead of 1 thread doing it serially — audit P0 #4)
+    // 2. route: one warp (32 threads) cooperates on each token's ne-expert
+    // row for the softmax; top-k selection stays serial on lane 0.
     i32* idx_use = idx_cache ? idx_cache : tmp_idx;
     float* w_use = w_cache ? w_cache : tmp_w;
     // (range checks done at function entry)
     k_route<<<(unsigned)N, 32>>>(rlogits, probs_cache, idx_use, w_use, N, ne, K, g_moe_jitter, g_moe_jitter_seed);
     CU_CHECK(cudaGetLastError());
+
+    // Grouped-slot construction starts here (async): its host-side wait is
+    // deferred until the routed GEMM loop below, so it overlaps the
+    // shared-expert compute that follows.
+    i32* grouped = nullptr;
+    int h_cnt[64], h_off[65];
+    moe_build_groups_launch(idx_use, N, K, ne, &grouped);
 
     // 3. shared expert: out = down(swiglu(g(x), u(x)))
     // Runs on N tokens (not NK slots): only first N*E rows valid.
@@ -820,15 +812,12 @@ void moe_forward(const float* x, const float* router_w,
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
 
-    // 4. routed experts, grouped on the GPU (tiny ne-only host sync for the
-    // GEMM pointer arithmetic below; every elementwise op is a single launch).
-    // F-03: one pack over all NK slots, per-expert GEMMs on packed blocks, one
-    // swiglu, one save, one scatter-add. Xblk doubles as the down-GEMM output
-    // (Ypack): the gate/up loop is fully complete before the down loop starts,
-    // and each expert owns a disjoint block, so the reuse is safe on one stream.
-    i32* grouped = nullptr;
-    int h_cnt[64], h_off[65];
-    moe_build_groups(idx_use, N, K, ne, &grouped, h_cnt, h_off);
+    // 4. routed experts, grouped on the GPU. One pack over all NK slots,
+    // per-expert GEMMs on packed blocks, one swiglu, one save, one
+    // scatter-add. Xblk doubles as the down-GEMM output (Ypack): the gate/up
+    // loop is fully complete before the down loop starts, and each expert owns
+    // a disjoint block, so the reuse is safe on one stream.
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
     if (h_off[ne] <= 0) return;
 
     k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
@@ -888,11 +877,18 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
 
     i32* idx_use = idx_cache ? idx_cache : tmp_idx;
     float* w_use = w_cache ? w_cache : tmp_w;
-    GAI_CHECK(K >= 1 && K <= 8, "moe routing bias: top_k out of range [1,8]");
-    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing bias: ne out of range [1,64]");
+    GAI_CHECK(N <= 2147483647LL, "moe forward bias: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe routing bias: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing bias: ne out of kernel range [1,64]");
     k_route_bias<<<(unsigned)N, 32>>>(rlogits, router_bias, probs_cache, idx_use, w_use,
                                      N, ne, K, g_moe_jitter, g_moe_jitter_seed);
     CU_CHECK(cudaGetLastError());
+
+    // Grouped-slot construction starts here (async); the host-side wait is
+    // deferred until the routed GEMM loop below, overlapping shared-expert work.
+    i32* grouped = nullptr;
+    int h_cnt[64], h_off[65];
+    moe_build_groups_launch(idx_use, N, K, ne, &grouped);
 
     if (sh_g && sh_u && sh_d) {
         linear_forward(x, sh_g, Gblk, (int)N, d, E);
@@ -904,12 +900,10 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
         CU_CHECK(cudaMemset(out, 0, sizeof(float) * (size_t)N * d));
     }
 
-    i32* grouped = nullptr;
-    int h_cnt[64], h_off[65];
-    moe_build_groups(idx_use, N, K, ne, &grouped, h_cnt, h_off);
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
     if (h_off[ne] <= 0) return;
 
-    // F-03 fused form (see moe_forward): identical math, ~60% fewer launches.
+    // Fused grouped form (see moe_forward): identical math, fewer launches.
     k_pack_all<<<grid_for(NK, 256), 256>>>(x, grouped, Xblk, NK, d, K);
     CU_CHECK(cudaGetLastError());
     for (int e = 0; e < ne; ++e) {
@@ -948,9 +942,9 @@ void moe_backward(const float* x, const float* router_w,
                   float* s_dact,
                   i64 N, int d, int E, int ne, int K) {
     if (N <= 0) return;
-    GAI_CHECK(N <= 2147483647LL, "moe_forward: N exceeds INT_MAX (B*T too large)");
-    GAI_CHECK(K >= 1 && K <= 8, "moe routing: top_k out of kernel range [1,8]");
-    GAI_CHECK(ne >= 1 && ne <= 64, "moe routing: num_experts out of kernel range [1,64]");
+    GAI_CHECK(N <= 2147483647LL, "moe backward: N exceeds INT_MAX (B*T too large)");
+    GAI_CHECK(K >= 1 && K <= 8, "moe backward: top_k out of kernel range [1,8]");
+    GAI_CHECK(ne >= 1 && ne <= 64, "moe backward: num_experts out of kernel range [1,64]");
     const i64 NK = N * K;
     const float aux_coef = (aux_frac && aux_scale != 0.0f)
         ? aux_scale * (float)ne / (float)N : 0.0f;
@@ -996,15 +990,16 @@ void moe_backward(const float* x, const float* router_w,
         linear_backward(x, sh_u, shdu, dx, dsh_u, (int)N, d, E);
     }
 
-    // ---- routed experts, grouped on the GPU (tiny ne-only host sync for the
-    // GEMM pointer arithmetic; every elementwise op is a single launch).
-    // F-03: one gather3 + one pack + one scale over all NK slots, per-expert
-    // GEMMs on packed blocks, one swiglu_bwd, then the per-expert weight-grad
-    // GEMMs and dx scatter-adds (which have true per-expert dependencies).
+    // ---- routed experts, grouped on the GPU. One gather3 + one pack + one
+    // scale over all NK slots, per-expert GEMMs on packed blocks, one
+    // swiglu_bwd, then the per-expert weight-grad GEMMs and dx scatter-adds
+    // (which have true per-expert dependencies).
     CU_CHECK(cudaMemset(dpfull, 0, sizeof(float) * (size_t)NK));
+    // Grouped-slot construction starts here (async); the host-side wait is
+    // deferred until the dact GEMM loop below, overlapping gather/pack/scale.
     i32* grouped = nullptr;
     int h_cnt[64], h_off[65];
-    moe_build_groups(idx, N, K, ne, &grouped, h_cnt, h_off);
+    moe_build_groups_launch(idx, N, K, ne, &grouped);
 
     k_gather3_all<<<grid_for(NK, 256), 256>>>(s_gate, s_up, s_act, grouped, Gblk, Ublk, Ablk, NK, E);
     CU_CHECK(cudaGetLastError());
@@ -1015,6 +1010,7 @@ void moe_backward(const float* x, const float* router_w,
 
     // dact for every slot: one GEMM per expert on packed blocks, then a single
     // swiglu_bwd over the whole block (Dblk is fully populated at that point).
+    moe_build_groups_sync(NK, ne, h_cnt, h_off);
     for (int e = 0; e < ne; ++e) {
         i64 ns = (i64)h_cnt[e];
         if (ns == 0) continue;
@@ -1072,10 +1068,10 @@ void moe_backward(const float* x, const float* router_w,
 
     // ---- router backward: per-token DL rows (no atomics), then
     // drouter[ne,d] += DL[N,ne]^T @ x[N,d] via cuBLAS (beta=1 accumulates
-    // across micro-batches, same as the old atomic version).
-    // NOTE: aux_coef here already includes the P0-02 pre-scale
+    // across micro-batches).
+    // aux_coef already includes the trainer's pre-scale
     // (aux_orig*eff_scale*N) from Model::forward_backward, so both paths
-    // share one scaled+sum space. P0-06 jitter factor inside the kernel.
+    // share one scaled+sum space; jitter factor applied inside the kernel.
     GAI_CHECK(K >= 1 && K <= 8, "moe routing backward: top_k out of kernel range [1,8]");
     GAI_CHECK(ne >= 1 && ne <= 64, "moe routing backward: num_experts out of kernel range [1,64]");
     k_router_dl<<<(unsigned)N, 32>>>(x, router_w, probs, dpfull, idx, aux_frac,
@@ -1085,10 +1081,9 @@ void moe_backward(const float* x, const float* router_w,
 }
 
 // ================================================================ aux fractions (GPU)
-// Computes DeepSeek load-balance fractions WITHOUT any N*ne / N*K host
-// roundtrip. Old path copied probs[N,ne]+idx[N,K] to CPU per layer
-// (832 large syncs per step). New path keeps everything on GPU; the
-// caller copies back only frac[ne] (8 floats) for the loss scalar + stats.
+// Computes DeepSeek load-balance fractions on device: frac[ne] stays on
+// device for moe_backward; the caller copies back only frac[ne] for the loss
+// scalar + stats.
 __global__ void k_aux_accum(const float* probs, const i32* idx,
                             int* cnt, float* psum,
                             i64 N, int K, int ne) {
@@ -1125,8 +1120,7 @@ static void aux_ensure(int ne) {
 
 // Device-side aux-raw accumulator: per-layer raw scalars (needed for the
 // returned training loss) add up ON DEVICE across the layer loop, so the
-// host reads ONE float per microbatch instead of 2x ne-float D2H per layer
-// (72 syncs/microbatch at 36 layers). moe_aux_begin() at microbatch start,
+// host reads ONE float per microbatch. moe_aux_begin() at microbatch start,
 // moe_aux_end() once at the end.
 static double* g_aux_raw = nullptr;
 

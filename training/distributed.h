@@ -75,9 +75,9 @@ public:
 private:
 #ifdef GAI_NCCL
     // NCCL only accepts device pointers, but callers legitimately broadcast
-    // small host flags (the F-01 save decision, capture status). Returns a
-    // device pointer of at least nbytes for NCCL to use, copying the caller's
-    // data in; *copy_back tells the caller to read the result out again.
+    // small host flags (the save decision, capture status). Returns a device
+    // pointer of at least nbytes for NCCL to use, copying the caller's data
+    // in; *copy_back tells the caller to read the result out again.
     void* collective_staging(void* p, size_t nbytes, bool* copy_back);
     // Compute->NCCL ordering without a full device sync: records default-
     // stream progress and makes the NCCL stream wait for it. Replaces

@@ -82,9 +82,8 @@ void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& 
                   ? std::min(hist.size(), static_cast<size_t>(cfg_.repetition_window))
                   : hist.size();
 
-    // PRO-HARDEN: النسخة القديمة كانت تبني unordered_map + reserve لكل توكن
-    // (hash لكل توكن يبطئ decode). ننسخ النافذة إلى buffer خيطي، نفرز، ثم
-    // نطبق العقوبة على كل run — نفس الرياضيات CTRL-style بلا أي hash.
+    // Copy the window into a thread-local buffer, sort, then apply the
+    // penalty per run — same CTRL-style math with no hashing.
     thread_local std::vector<i32> win_buf;
     win_buf.clear();
     win_buf.reserve(window);
@@ -215,8 +214,7 @@ i32 Sampler::draw_from_scratch() {
     // softmax over the candidate set (temperature applied here)
     float mx = scratch_[0].first;
     double sum = 0.0;
-    // PRO-HARDEN: إعادة استعمال probs_buf_ العضو بدل vector<double>(size)
-    // جديد لكل توكن (256KB malloc عند V=32k × آلاف التوكنات = تهش RAM).
+    // Reuse the member probs_buf_ instead of allocating per token.
     probs_buf_.resize(scratch_.size());
     double* probs = probs_buf_.data();
     for (size_t i = 0; i < scratch_.size(); ++i) {

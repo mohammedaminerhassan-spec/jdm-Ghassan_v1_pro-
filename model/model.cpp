@@ -25,8 +25,8 @@ double Model::moe_layer_aux(Device dev, const float* probs, const i32* idx,
                              float* auxfrac_dev, int layer, i64 N, int K, int ne,
                              bool want_stats, double* d_raw_accum) {
     // Fast GPU path: frac stays on device, raw folds into the device
-    // accumulator (audit P1: read once per microbatch, not 2x ne-float D2H
-    // per layer). Host copies happen ONLY when want_stats (log cadence).
+    // accumulator (read once per microbatch, not per layer). Host copies
+    // happen only when want_stats (log cadence).
     if (dev == Device::CUDA) {
         std::vector<float> h_frac, h_psum;
         float* hf = nullptr;
@@ -202,7 +202,7 @@ void Model::accumulate_moe_bias_fracs(Activations& act, int B, int T) {
         return;  // no MoE activations (e.g. dense or inference path)
     }
     if (device_ == Device::CUDA) {
-        // F-02: count on device into the persistent [L*ne] counter. First
+        // Count on device into the persistent [L*ne] counter. First
         // microbatch of the step (re)sizes and zeroes it; later micros add.
         // Zero D2H here — the only host traffic is the single summary read
         // per optimizer step in Trainer::sync_moe_bias().
@@ -259,7 +259,7 @@ void Model::apply_moe_bias_step(const float* global_count_sum, bool apply) {
     std::vector<float> frac(static_cast<size_t>(ne));
     for (int l = 0; l < L; ++l) {
         const size_t base = static_cast<size_t>(l) * static_cast<size_t>(ne);
-        // F-12: the denominator comes from the SAME population as the
+        // The denominator comes from the SAME population as the
         // numerator. Every routed token contributes exactly top_k slots, so
         // row_sum == (routed tokens in this layer) * K, and the load fraction
         // is simply counts[e] / row_sum. No external ntok is involved, so a
@@ -373,9 +373,8 @@ void ModelConfig::validate() const {
 ModelConfig ModelConfig::from_config(const Config& c, const std::string& p) {
     ModelConfig m;
     auto key = [&](const char* k) { return p.empty() ? std::string(k) : p + "." + k; };
-    // FIX: YAML ints are i64; blind static_cast<int> wraps huge values to
-    // negative/small -> validate() passes on truncated value -> OOB/OOM in
-    // training (compilation-clean, runtime-corrupt). Range-check first.
+    // YAML ints are i64: range-check before narrowing to int (a wrapped
+    // value would pass validate() and corrupt shapes downstream).
     auto get_int_checked = [&](const char* k, int def) {
         i64 v = c.get_int(key(k), static_cast<i64>(def));
         GAI_CHECK(v > 0 && v <= static_cast<i64>(std::numeric_limits<int>::max()),
@@ -924,9 +923,8 @@ void Model::mark_weights_dirty() {
 size_t Model::fp16_weight_cache_bytes() const {
     size_t bytes = 0;
     for (const Parameter* p : params_) bytes += p->fp16_cache.nbytes();
-    // F-14: the per-layer FUSED qkv fp16 cache is persistent VRAM too and was
-    // missing from this accounting, under-reporting the guard by
-    // L*(qd + 2*kvd)*d*2 bytes (tens of MB at production depth).
+    // The per-layer fused qkv fp16 cache is persistent VRAM too:
+    // L*(qd + 2*kvd)*d*2 bytes.
     for (const LayerParams& layer : layers_) bytes += layer.wqkv_fp16.nbytes();
     return bytes;
 }
@@ -1045,8 +1043,8 @@ Activations Model::make_activations(int B, int T, bool with_grad, int ce_chunks)
         }
         // Single transient probs buffer, recomputed per layer in backward
         // (saves (L-1)*B*H*T*T floats, e.g. 2.5GB at B=2,T=1024,L=26).
-        // PRO-HARDEN: حارس T² داخل make_activations نفسها (كان في Trainer فقط)
-        // فيحمي أي استدعاء مباشر/اختبار من OOM صامت على T4.
+        // The T² guard lives inside make_activations itself, so any direct
+        // caller or test is protected from silent OOM as well.
         {
             const size_t need_tmp =
                 static_cast<size_t>(B) * static_cast<size_t>(cfg_.num_heads) *
@@ -1142,13 +1140,9 @@ size_t Model::estimate_activation_bytes(int B, int T, bool with_grad, int ce_chu
 // a one-line forward, which is what keeps the two from drifting.
 size_t Model::estimate_activation_bytes_for(const ModelConfig& cfg, bool fp16_on,
                                             int B, int T, bool with_grad, int ce_chunks) {
-    // FIX: i64 signed overflow on adversarial B*T*V*L wrapped negative ->
-    // "fits" estimate then real OOM on T4 (training killer). Use u64 with
-    // saturation (cap at 1TiB elements) so the guard always over-estimates.
-    // FIX (P0-1): explicit -> u64 return type. Without it, `return 0ull`
-    // (unsigned long long) and `return cap` (u64 == unsigned long on LP64
-    // Linux) deduce different types -> hard compile error on GCC/Clang.
-    // MSVC hid the bug because uint64_t IS unsigned long long on Windows.
+    // Saturating u64 arithmetic (cap at 1TiB elements) so the estimate can
+    // never wrap negative and the guard always over-estimates. The explicit
+    // -> u64 return type keeps GCC/Clang (LP64) and MSVC deduction identical.
     auto sat_add = [](u64 a, u64 b) -> u64 {
         const u64 cap = (1ull << 40);
         if (a > cap || b > cap) return cap;
@@ -1242,7 +1236,7 @@ u64 Model::count_parameters(const ModelConfig& cfg) {
     return n;
 }
 
-// F-14: every persistent fp16 cache tensor: one per 2-D parameter PLUS the
+// Every persistent fp16 cache tensor: one per 2-D parameter PLUS the
 // per-layer fused QKV cache. The runtime fp16_weight_cache_bytes() missed the
 // fused cache entirely.
 size_t Model::count_fp16_cache_bytes(const ModelConfig& cfg) {
@@ -1338,9 +1332,8 @@ static void check_act_device(Device dev, const char* name, const Tensor& t) {
 
 void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                          const i32* segment_ids) {
-    // FIX: fail-fast guards (training/inference crash + T4/low-PC OOM safety).
-    // Old code accepted B/T<=0 -> N<=0 cast to size_t = huge alloc -> OOM,
-    // and N>INT_MAX truncated to int M in linear_forward -> silent zero math.
+    // Fail-fast shape guards: B/T must be positive and N must fit int
+    // (GEMM dimensions), before any allocation happens.
     GAI_CHECK(ids != nullptr, "forward: null ids");
     GAI_CHECK(B > 0 && T > 0, "forward: B and T must be > 0");
     const int d   = cfg_.hidden_size;
@@ -1412,19 +1405,15 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         check_act_device(dev, "act.dx", act.dx);
     }
 
-    // position ids (repeated per batch element)
-    // FIX (T4 perf/fragmentation): old code allocated a std::vector + a CPU
-    // Tensor on EVERY forward (128x per optimizer step with grad_accum=128).
-    // Allocator churn + fragmentation looked like a CPU leak and stalled the
-    // GPU. Now: monotonic thread-local staging, zero per-call mallocs after
-    // the first, direct H2D into the persistent act.pos buffer.
-    // PERF (audit #10): positions are a pure function of (B,T), and training
-    // reuses one (B,T) across all 128 micros. Skip the rebuild + H2D entirely
-    // when the buffer already holds this (B,T) — 127/128 forwards do no work.
+    // position ids (repeated per batch element), built with monotonic
+    // thread-local staging and a direct H2D into the persistent act.pos
+    // buffer: zero per-call mallocs after the first.
+    // PERF: positions are a pure function of (B,T), and training reuses one
+    // (B,T) across all micros. Skip the rebuild + H2D entirely when the
+    // buffer already holds this (B,T).
     if (!act.pos.defined() || act.pos.numel() < N) {
-        // FIX: subtract the old buffer before replacing it; the old Tensor
-        // frees via refcount but act.bytes (used in the OOM log) drifted up
-        // on every shape change.
+        // Subtract the old buffer before replacing it (act.bytes feeds the
+        // OOM log and must not drift on shape changes).
         if (act.pos.defined()) act.bytes -= act.pos.nbytes();
         act.pos = Tensor::empty({N}, DType::I32, device_);
         act.bytes += act.pos.nbytes();
@@ -1487,8 +1476,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
         // QK-Norm (optional): per-head RMSNorm on Q/K before RoPE stabilizes
         // MoE training at 1B (prevents attention logit explosion). Layout
         // [N,H,hd] is contiguous as [N*H,hd], so rmsnorm applies directly.
-        // FIX: old guard checked only qk_qnorm, then deref'd qk_knorm ->
-        // segfault on partial alloc / stale ckpt. Require both gains.
+        // Require both gains (a partial alloc would segfault below).
         if (cfg_.use_qk_norm && L.qk_qnorm.w.defined() && L.qk_knorm.w.defined()) {
             if (train) {
                 ops::copy(dev, act.saved_qk_raw_q[sl].f32(), qp, N * qd);
@@ -1622,29 +1610,25 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     // — the biggest single block in the T4 budget. Instead the head runs in
     // row-blocks over compact [Cc,V] scratch (Cc = ceil(N/chunks)):
     //   GEMM block -> SCE block -> scale -> backward block (accumulates).
-    // EXACTNESS: per chunk c, SCE emits SUM grads directly (audit P1: no
-    // host count roundtrip); scaling by eff_scale yields raw×eff_scale —
-    // identical, element for element, to the old full-matrix path (mean
-    // ÷ntok, then ×eff_scale×ntok), up to 1-ulp fp associativity. Loss sums
-    // and ntok add across chunks; dw/dx accumulate through linear_backward's
-    // += contract. Only the fp addition ORDER of the loss scalar differs
-    // (negligible, ~1e-9 relative).
+    // EXACTNESS: per chunk c, SCE emits SUM grads directly; scaling by
+    // eff_scale yields raw×eff_scale — identical, element for element, to the
+    // full-matrix path (mean ÷ntok, then ×eff_scale×ntok), up to 1-ulp fp
+    // associativity. Loss sums and ntok add across chunks; dw/dx accumulate
+    // through linear_backward's += contract. Only the fp addition ORDER of
+    // the loss scalar differs (negligible, ~1e-9 relative).
     float eff_scale = dout_scale;
-    // (Range safety for the scale lives in the Trainer (kLossScaleMax): it
-    // must own the limit because it also owns the unscaling divisor. See the
-    // P0-2a note that used to live here: clamping inside the model while the
-    // trainer unscales with the passed-in value is a silent LR cut.)
+    // Range safety for the scale lives in the Trainer (kLossScaleMax): it
+    // must own the limit because it also owns the unscaling divisor.
     const i64 Cc = act.ce_rows > 0 ? act.ce_rows : N;
     const float* hnorm_full = act.saved_hnorm.f32();
     float* logits_c = act.logits.f32();
     float* dlogits_c = act.dlogits.f32();
     ops::zero(dev, act.dxb.f32(), N * d);
-    // F-10: loss+count accumulate on device across all chunks with ZERO host
-    // traffic; the single synchronized reduction happens in sce_acc_end().
+    // Loss+count accumulate on device across all chunks with no host traffic;
+    // the single synchronized reduction happens in sce_acc_end().
     // Fully-masked blocks are skipped on the HOST (no GEMMs, no kernels) using
-    // the host target mirror when the caller supplied one — this preserves the
-    // old `if (cn == 0) continue` fast path without the per-chunk D2H that
-    // used to provide `cn`. A null mirror means "always compute" (eval/tests).
+    // the host target mirror when the caller supplied one. A null mirror
+    // means "always compute" (eval/tests).
     ops::sce_acc_begin(dev);
     for (i64 r0 = 0; r0 < N; r0 += Cc) {
         const i64 Cr = std::min(Cc, N - r0);
@@ -1660,8 +1644,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                             logits_c, Ci, d, V);
         ops::sce_accumulate(dev, logits_c, targets + r0, dlogits_c,
                             Cr, V, cfg_.z_loss_scale);
-        // P0-05 (sums, not means) + P0-2b (fused single pass), per chunk.
-        // SCE already emits eff_scale-ready SUM grads, so no ×cn rescale.
+        // SCE already emits eff_scale-ready SUM grads, so no rescale.
         if (eff_scale != 1.0f) ops::scale_inplace(dev, dlogits_c, eff_scale, Cr * V);
         ops::linear_backward(dev, hnorm_full + r0 * d, lm_head().w.f32(), dlogits_c,
                              act.dxb.f32() + r0 * d, lm_head().g.f32(), Ci, d, V);
@@ -1675,9 +1658,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     // ---- MoE load-balance aux loss: measured per layer inside the backward
     // loop below (each layer refills the shared [ne] fractions buffer right
     // before its own moe_backward call), then added to the returned loss.
-    // AUDIT P1: on CUDA the per-layer raw folds into ONE device accumulator
-    // (zero syncs per layer); the host reads it once below. want_aux_stats
-    // additionally refreshes the balance-report stats (log cadence only).
+    // On CUDA the per-layer raw folds into one device accumulator (no syncs
+    // per layer); the host reads it once below. want_aux_stats additionally
+    // refreshes the balance-report stats (log cadence only).
     double aux_total = 0.0;
     const bool use_dev_aux = (dev == Device::CUDA) && cfg_.use_moe &&
                              cfg_.moe_aux_scale > 0.0f;
@@ -1704,12 +1687,10 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
             const int K  = cfg_.moe_top_k;
             // load-balance term: measure this layer's aux loss and upload
             // its expert fractions into the shared [ne] device buffer.
-            // P0-02 FIX + DeepSeek SFT rule: aux grads must live in the SAME
-            // scaled+sum space as CE grads AND share the trainer's 1/ntok
-            // divisor. Old code used dense N (B*T): pretrain N≈ntok hides it,
-            // but SFT masks (ntok<<N) made aux 2-5x too strong vs reported
-            // loss. Now ×eff_scale ×ntok (supervised, not dense N) ÷L so the
-            // optimized weight == reported weight (aux_scale/L) exactly.
+            // DeepSeek SFT rule: aux grads must live in the SAME scaled+sum
+            // space as CE grads AND share the trainer's 1/ntok divisor:
+            // ×eff_scale ×ntok (supervised, not dense N) ÷L so the optimized
+            // weight == reported weight (aux_scale/L) exactly.
             const float* aux_frac = nullptr;
             float aux_scale_grad = 0.0f;
             if (cfg_.moe_aux_scale > 0.0f) {
@@ -1829,9 +1810,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
     // sync read here replaces 2x ne-float copies per layer (72/microbatch).
     if (use_dev_aux) aux_total = ops::moe_aux_end(dev);
     if (cfg_.moe_aux_free) moe_aux_loss(act, B, T);
-    // FIX (10/10): old code SUMMED over layers, so a 36L model got stronger
-    // aux than a 26L model with the same scale. Average over layers so
-    // moe_aux_scale means the same at any depth.
+    // Average over layers so moe_aux_scale means the same at any depth.
     if (cfg_.use_moe && cfg_.moe_aux_scale > 0.0f && cfg_.num_layers > 0)
         loss += cfg_.moe_aux_scale * aux_total / static_cast<double>(cfg_.num_layers);
     return loss;
@@ -1850,8 +1829,8 @@ double Model::moe_aux_loss(Activations& act, int B, int T) {
         accumulate_moe_bias_fracs(act, B, T);
         return 0.0;
     }
-    // FIX: calling after inference forward (with_grad=false) indexed empty
-    // saved_moe_* -> UB/segfault. Require training activations explicitly.
+    // Requires training activations (with_grad): inference activations carry
+    // no saved_moe_* buffers.
     GAI_CHECK(act.with_grad, "moe_aux_loss needs training Activations (with_grad)");
     GAI_CHECK(static_cast<int>(act.saved_moe_probs.size()) == cfg_.num_layers,
               "moe_aux_loss: stale Activations");
@@ -1898,9 +1877,8 @@ bool Model::load_raw(const std::string& path) {
     if (!f.read(reinterpret_cast<char*>(&magic), 4)) return false;
     if (magic != RAW_MAGIC) return false;
     if (!f.read(reinterpret_cast<char*>(&n), 4)) return false;
-    // FIX: old code accepted dense->MoE / tied->untied files (extra model
-    // params stayed zero, returned true -> silent corrupt training) and
-    // ignored truncated reads. Enforce exact param-count + shape match.
+    // Enforce exact param-count + shape match (dense->MoE / tied->untied
+    // files, truncated reads all fail here).
     if (n != static_cast<u32>(params_.size())) return false;
     for (u32 i = 0; i < n; ++i) {
         u32 len = 0;

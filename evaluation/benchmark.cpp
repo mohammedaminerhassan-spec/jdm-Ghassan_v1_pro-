@@ -685,8 +685,8 @@ std::vector<EvalItem> Benchmark::load_suite(const std::string& dir) {
     std::vector<EvalItem> items;
     std::vector<std::string> jsonl_files;
 
-    // FIX: directory_iterator(dir) THROWS on missing dir, defeating the
-    // builtin_suite fallback below (--suite <missing> crash). Use error_code.
+    // directory_iterator(dir) THROWS on missing dir: use error_code so the
+    // builtin_suite fallback below keeps working.
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) break;
@@ -764,9 +764,8 @@ void Benchmark::write_suite(const std::string& path, const std::vector<EvalItem>
         log_warn("benchmark: cannot write suite to " + path);
         return;
     }
-    // DeepSeek eval rule: suite round-trip must be lossless. Old code dropped
-    // expect_any/forbid/lang/max_words/context so a re-exported suite scored
-    // weaker silently. Persist the full EvalItem.
+    // Eval rule: suite round-trip must be lossless — persist the full
+    // EvalItem (expect_any/forbid/lang/max_words/context).
     for (auto& it : items) {
         f << "{\"id\":\"" << json_escape(it.id) << "\","
           << "\"category\":\"" << category_name(it.category) << "\","
@@ -878,10 +877,9 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
         r.discipline_ok = english_logic::check_english_reply(item.prompt, response).disciplined;
     }
 
-    // FIX P2 (score ignored its own core metrics): lang/discipline were
-    // computed but excluded, so a wrong-language disciplined-fail could still
-    // score 1.0. New weights keep backward-compat scale (max 1.0) while
-    // making discipline_rate/lang move the reported score.
+    // Score includes its core metrics (lang/discipline); weights keep
+    // backward-compat scale (max 1.0) while making discipline_rate/lang
+    // move the reported score.
     // Score
     double s = 0.0;
     if (r.matched)       s += 0.40;
@@ -896,7 +894,7 @@ ItemResult Benchmark::evaluate_item(const EvalItem& item) {
         s += 0.05;  // non-EN items have no discipline gate; keep scale at 1.0
     }
     r.score = s;
-    // FIX P2: tokens_per_sec was declared but never filled. Estimate from
+    // Estimate tokens_per_sec from word count (words*1.3 ~ tokens).
     // word count (words*1.3 ≈ tokens) so bench tooling stops showing 0.
     r.tokens_per_sec = r.seconds > 0.0 ? (double)r.words * 1.3 / r.seconds : 0.0;
 

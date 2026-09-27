@@ -173,7 +173,7 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
         if (nodes[static_cast<size_t>(i)].alive) ids.push_back(nodes[static_cast<size_t>(i)].id);
     }
 
-    // FIX P2 (cache thrash): wholesale clear on overflow caused a latency
+    // On overflow evict a random 1/8 instead of a wholesale clear (avoids a
     // spike every 200k unique chunks (EN lake). Evict a random 1/8 instead
     // so hot entries survive; amortized O(1) instead of cliff.
     if (cache_.size() >= cache_limit_) {
@@ -260,9 +260,8 @@ std::string Tokenizer::Stream::push(i32 id) {
     size_t safe = 0, i = 0;
     while (i < buf_.size()) {
         int len = utf8_seq_len(static_cast<u8>(buf_[i]));
-        // FIX: lone continuation (len==0) is NOT complete — old code emitted
-        // it immediately, splitting codepoints (inference mojibake on split
-        // boundaries). Buffer it until the head byte arrives.
+        // A lone continuation (len==0) is NOT complete: buffer it until the
+        // head byte arrives (else split codepoints / mojibake).
         if (len == 0) break;
         if (i + static_cast<size_t>(len) > buf_.size()) break;
         // Validate continuations: E2 28 A1 must not count as complete.
@@ -283,7 +282,7 @@ std::string Tokenizer::Stream::push(i32 id) {
 }
 
 std::string Tokenizer::Stream::flush() {
-    // FIX: never emit raw incomplete tail (old code returned partial bytes).
+    // Never emit a raw incomplete tail.
     // Complete tail passes through; truncated tail becomes U+FFFD.
     if (buf_.empty()) return {};
     std::string s;
@@ -355,7 +354,7 @@ bool Tokenizer::load(const std::string& path) {
         if (len && !f.read(t.data(), static_cast<std::streamsize>(len))) return false;
         vocab_.push_back(std::move(t));
     }
-    // FIX: bpe_chunk assumes byte fallback vocab[16+i] == single byte i
+    // bpe_chunk assumes byte fallback vocab[16+i] == single byte i
     // (id = 16+byte). A custom/truncated/reordered .gtok silently produced
     // wrong ids + token_text "" -> data loss. Enforce the invariant on load.
     if (vocab_.size() < static_cast<size_t>(special::COUNT) + 256) return false;

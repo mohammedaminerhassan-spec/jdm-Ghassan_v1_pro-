@@ -77,7 +77,7 @@ AdamW::AdamW(Model& model, AdamWConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "AdamW requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
     v_.reserve(model_.parameters().size());
-    // P2-3: frozen parameters never receive updates, so they get no moments
+    // Frozen parameters never receive updates, so they get no moments
     // (undefined placeholder keeps indices aligned with model_.parameters()).
     // With freeze_embeddings this saves the full embedding m+v (196MB at
     // V=32000,d=768). Requires freeze flags set BEFORE construction.
@@ -176,7 +176,7 @@ OptimizerStateSnapshot AdamW::snapshot_state() const {
     return s;
 }
 
-// P2-4: v1 layout is [count][t][u8 fmt=1][6 field-wise f32]
+// v1 layout is [count][t][u8 fmt=1][6 field-wise f32]
 // [per param: u8 has, then ne + m + v iff has]. Field-wise (never a raw
 // struct) is padding- and compiler-independent; the presence flag lets frozen
 // parameters store nothing while staying stream-aligned.
@@ -299,7 +299,7 @@ void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     const i64 rc = static_cast<i64>(rows) * cols;
     Timer ns_t;
     int iters_done = 0;
-    // F-04 telemetry reports even the degenerate early return, so "NS cost 0"
+    // Telemetry reports even the degenerate early return, so "NS cost 0"
     // is distinguishable from "NS never ran".
     auto note = [&]() { ops::perf_note_muon_ns(iters_done, ns_t.elapsed_us()); };
     // Layout [O|T|A]: O is caller-owned output (step() passes the scratch O
@@ -348,7 +348,7 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
     i64 max_rc = 0, max_cc = 0;
     i64 ns_matrices = 0;
     for (Parameter* p : model_.parameters()) {
-        // P2-3: frozen params carry no moments (placeholders keep indices).
+        // Frozen params carry no moments (placeholders keep indices).
         if (p->frozen) {
             m_.emplace_back();
             v_.emplace_back();
@@ -433,7 +433,7 @@ double Muon::step(float lr, float grad_scale) {
         Parameter* p = params[i];
         if (!p->g.defined()) continue;
         if (p->frozen) continue;
-        // F-04: the NS gate lives in uses_ns() (shared with the ctor), so a
+        // The NS gate lives in uses_ns() (shared with the ctor), so a
         // matrix excluded here also has no scratch sized for it — and a matrix
         // below min_ns_dim takes the cheap Lion branch instead of 5 NS GEMM
         // passes. Shape routing is what keeps this compatible with the
@@ -592,7 +592,7 @@ Lion::Lion(Model& model, LionConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "Lion requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
     for (Parameter* p : model_.parameters()) {
-        // P2-3: see AdamW ctor (frozen params carry no moments).
+        // See AdamW ctor (frozen params carry no moments).
         if (p->frozen) {
             m_.emplace_back();
             continue;

@@ -222,7 +222,7 @@ void GGUFWriter::set_tokenizer_token_types(const std::vector<int32_t>& types) {
     metadata_["tokenizer.ggml.token_type"] = std::move(v);
 }
 void GGUFWriter::set_tokenizer_bos_id(uint32_t id) {
-    // Spec: token IDs are UINT32 (old code wrote UINT64 -> llama.cpp parse fail).
+    // Spec: token IDs are UINT32 (llama.cpp parses UINT32).
     set_u32("tokenizer.ggml.bos_token_id", id);
 }
 void GGUFWriter::set_tokenizer_eos_id(uint32_t id) {
@@ -307,7 +307,7 @@ void GGUFWriter::set_quantization_profile(const std::string& profile) {
     add_custom_metadata("ghassan.quantization.profile", profile);
 }
 void GGUFWriter::set_file_type(uint32_t type) {
-    // Spec: general.file_type is UINT32 (old code wrote UINT64).
+    // Spec: general.file_type is UINT32.
     set_u32("general.file_type", type);
 }
 
@@ -486,9 +486,8 @@ void GGUFWriter::write() {
         // then write tensor info with correct offsets.
 
         // First pass: tensor descriptors only (NO payload buffering).
-        // T4-P2-34: the old code quantized every tensor into RAM up front,
-        // so a 1B fp16 export held ~2GB of serialized payloads before
-        // writing a byte. Sizes are exactly computable (ggml_nbytes), so
+        // Quantize streaming (no payload buffering): sizes are exactly
+        // computable (ggml_nbytes).
         // offsets are assigned first and each payload is quantized+written
         // streaming below — peak extra RAM is one tensor, not the model.
         struct TensorData {
@@ -1311,9 +1310,8 @@ void export_model_gguf(const std::string& path, Model& model,
     GGUFWriter w(path);
 
     // ---- general metadata (standard keys: parsed by llama.cpp/ollama/LM Studio)
-    // P2-1 (audit #21): the name used to be hard-coded "Ghassan v1 Flash" for
-    // EVERY config, so 1B-Ultra artifacts were mislabeled. Derive it from the
-    // live config + parameter count; extra_meta["model_name"] still overrides.
+    // Derive the model name from the live config + parameter count;
+    // extra_meta["model_name"] still overrides.
     w.set_arch(arch);
     {
         std::string name = "Ghassan";
@@ -1495,11 +1493,9 @@ void export_model_gguf(const std::string& path, Model& model,
         size_t est = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
         total_bytes += static_cast<u64>(est);
         w.add_tensor(wname, cpu, dt);
-        // FIX P2 (tied embeddings): parameters() holds ONE tensor when tied,
-        // so llama compat exported no output.weight and external llama.cpp
-        // failed to find it despite tie_word_embeddings metadata. Duplicate
-        // the embedding bytes as output.weight for compat exports (same
-        // values, shared content) instead of failing downstream.
+        // parameters() holds ONE tensor when tied: duplicate the embedding
+        // bytes as output.weight for compat exports (same values, shared
+        // content) instead of failing downstream.
         if ((want_llama || want_moe) && p->name == "tok_embeddings" && cfg.tie_embeddings) {
             size_t est2 = ggml_nbytes(dt, static_cast<size_t>(p->numel()));
             total_bytes += static_cast<u64>(est2);

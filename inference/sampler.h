@@ -21,9 +21,8 @@ struct SamplingConfig {
     u64   seed              = 0;       // 0 = random
 
     static SamplingConfig from_config(const class Config& c, const std::string& prefix = "sampling");
-    // PRO-HARDEN: يصلح القيم الشاذة القادمة من YAML/CLI قبل أن تسمم التوليد:
-    // temp=NaN/Inf، top_p=0 (كان يعطل nucleus خطأ)، top_k>V، penalties سالبة،
-    // seed=0 تعني عشوائي. يستدعى من Sampler ctor + generate().
+    // validate() clamps sampling knobs to sane ranges (temp/top_p/top_k/penalties/seed).
+    // Invalid values fail fast instead of sampling garbage.
     void validate();
 };
 
@@ -58,8 +57,7 @@ private:
     SamplingConfig cfg_;
     Rng rng_;
     std::vector<std::pair<float, i32>> scratch_;
-    // PRO-HARDEN: إعادة استعمال buffer الاحتمالات بدل malloc لكل توكن
-    // (كان vector<double> probs(size) ~256KB عند V=32k لكل توكن).
+    // Persistent scratch buffers (no per-token malloc).
     std::vector<double> probs_buf_;
 };
 

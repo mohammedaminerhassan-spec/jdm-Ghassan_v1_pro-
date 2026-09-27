@@ -61,10 +61,9 @@ bool DistributedContext::init(const Config& cfg) {
     ncclUniqueId nccl_id;
     std::memset(&nccl_id, 0, sizeof(nccl_id));
     if (global_rank_ == 0) {
-        // FIX: a stale ID file from a crashed 4xT4 run has the correct size,
-        // so ranks 1..3 could read the OLD id before rank 0 rewrites it ->
-        // ncclCommInitRank mismatch / hang. Unlink first so followers only
-        // ever see a fresh, complete ID (train_4xt4.sh also removes it).
+        // A stale ID file from a crashed run would have the correct size, so
+        // followers could read an old id before rank 0 rewrites it. Unlink
+        // first so followers only ever see a fresh, complete ID.
         // ATOMIC PUBLISH: write to a tmp name + fsync + rename, so followers
         // can never observe a half-written ID even if the size check races.
         {
@@ -352,7 +351,7 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     else if (dtype_size == 8) nccl_dtype = ncclFloat64;
     else if (dtype_size == 1) nccl_dtype = ncclInt8;
 
-    // Host buffers (e.g. the F-01 "is_best" i64 pair) MUST be staged on the
+    // Host buffers (e.g. the "is_best" i64 pair) MUST be staged on the
     // device: ncclBroadcast on a host pointer aborts with an illegal memory
     // access and kills every rank at the first new-best step.
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);

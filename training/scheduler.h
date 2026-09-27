@@ -20,8 +20,7 @@ public:
 
     float lr_at(i64 step) const {
         if (total_ <= 0) return peak_;
-        // PRO-HARDEN: step<0 كان يستكمل خارج النطاق (warmup formula تعطي
-        // قيم شاذة) وstep>total كان يعتمد على clamp جزئي. نثبت المجال.
+        // Clamp the domain: the warmup formula is only valid in [0, total].
         if (step < 0) step = 0;
         if (step > total_) step = total_;
         if (warmup_ > 0 && step < warmup_) {

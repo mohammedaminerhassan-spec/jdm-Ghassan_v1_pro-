@@ -22,6 +22,12 @@ struct TrainState {
     // different ids, so a multi-session resume would silently train on
     // different tokens. 0 = unknown (pre-v11 file) -> warn, never block.
     u64    tok_fingerprint = 0;
+    // v12: validation loader state. Eval consumes val batches CONTINUOUSLY, so
+    // without this a resume restarts eval at batch 0 while an uninterrupted
+    // run would be at batch N: different val loss, different best.ckpt. Only
+    // rank 0 evaluates, so only its stream is stored. batches < 0 = unknown
+    // (pre-v12 file) -> keep the freshly opened loader, never a zero stream.
+    DataLoader::State val_loader{};
     // v8 additions: scheduler snapshot so resume with a different
     // max_steps/epochs/warmup/lr cannot silently reshape PAST lr_at(N).
     i64    sched_total = 0;
@@ -83,7 +89,7 @@ public:
     // weights-only (opt==null). Callers MUST reset bias-correction t_=0 when
     // false, else resumed steps are ~10x too small (m≈(1-b)*g, bc≈1).
     //
-    // F-08 `resume_mode`: strict=true implements `resume_mode: exact`. It turns
+    // `resume_mode`: strict=true implements `resume_mode: exact`. It turns
     // every "warn and continue" recovery path into a hard failure (parameter
     // missing from the file, optimizer kind mismatch, unreadable moments,
     // moments present but no optimizer supplied), so an exact resume can never

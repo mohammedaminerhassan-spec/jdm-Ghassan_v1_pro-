@@ -9,10 +9,8 @@
 //
 // This header keeps the MINIMAL chat-document types + the single
 // messages_json parser used by the parquet chat route. File-based JSON
-// ingestion (read_json_docs / read_json_dir / load_json_texts /
-// inspect_json) was DELETED on purpose: a second ingestion path silently
-// diverges (the old "conversations" plural key dropped 100% of Hermes
-// docs) and wastes T4 hours. Use the Parquet lake, never JSON files.
+// ingestion is intentionally absent: a second ingestion path silently
+// diverges and wastes T4 hours. Use the Parquet lake, never JSON files.
 
 #include "core/common.h"
 #include "tokenizer/chat_template.h"
@@ -42,8 +40,7 @@ struct JsonReaderOptions {
 
 using JsonDocCallback = std::function<void(const JsonDoc&)>;
 
-// PARQUET-ONLY: file-based JSON ingestion is REMOVED (was read_json_docs /
-// read_json_dir / load_json_texts / inspect_json). Any call is a recipe bug:
+// PARQUET-ONLY: file-based JSON ingestion does not exist. Any call is a
 // The prebuilt lake is consumed with
 //   data_pipeline parquet --mode chat --lake english_parquet ...
 // Keeping the old path would re-introduce the silent-drop divergence.

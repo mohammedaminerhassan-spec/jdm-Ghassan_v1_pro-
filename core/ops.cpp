@@ -30,11 +30,9 @@ namespace gai {
 namespace ops {
 
 static std::atomic<bool> g_gemm_fp16{true};
-// P3-5: bf16 path defaults OFF (was true). The CUDA kernel checks fp16 first,
-// so this changes nothing while fp16 is on; but with fp16 off the old default
-// silently routed large GEMMs into cublasGemmEx BF16 — fatal on T4/sm_75
-// (no BF16 cores). BF16 is now strictly opt-in (the Trainer enables it only
-// after probing sm_80+). Mirrors cuda/kernels.cu g_bf16_gemm below.
+// BF16 path defaults OFF (T4/sm_75 has no BF16 cores). The CUDA kernel checks
+// fp16 first; BF16 is strictly opt-in (the Trainer enables it only after
+// probing sm_80+). Mirrors cuda/kernels.cu g_bf16_gemm below.
 static std::atomic<bool> g_gemm_bf16{false};
 static std::atomic<float> g_moe_jitter{0.0f};
 static std::atomic<u64> g_jitter_seed{0};
@@ -89,7 +87,7 @@ void set_gemm_fp16_mnk_threshold(i64 mnk) {
 }
 i64 gemm_fp16_mnk_threshold() { return g_mnk_threshold.load(std::memory_order_relaxed); }
 
-// PERF telemetry (audit P2-2): relaxed atomics, negligible overhead (~ns).
+// PERF telemetry: relaxed atomics, negligible overhead (~ns).
 static std::atomic<u64> g_perf_gemm{0};
 static std::atomic<u64> g_perf_fp16{0};
 static std::atomic<u64> g_perf_h2d{0};
@@ -594,7 +592,7 @@ void softmax_cross_entropy(Device dev, const float* logits, const i32* targets,
     perf_note_sce(static_cast<u64>(t.elapsed_us()));
 }
 
-// F-10: device-side accumulate API. The timer note fires per accumulate call
+// Device-side accumulate API. The timer note fires per accumulate call
 // (it measures dispatch+kernel time, not the deferred reduction).
 void sce_acc_begin(Device dev) {
 #ifdef GAI_CUDA
@@ -634,7 +632,7 @@ void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count) {
     cpu::sce_acc_end(out_loss_sum, out_count);
 }
 
-// F-02: on-device slot counting for the aux-free bias (zero D2H per layer).
+// On-device slot counting for the aux-free bias (zero D2H per layer).
 void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {

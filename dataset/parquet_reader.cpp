@@ -99,9 +99,8 @@ ParquetTableInfo inspect_parquet(const std::string& path) {
     auto maybe_file = arrow::io::ReadableFile::Open(path);
     if (!maybe_file.ok()) return info;
     std::shared_ptr<arrow::io::RandomAccessFile> file = maybe_file.ValueOrDie();
-    // Result-based OpenFile: the Status out-param overload was REMOVED in
-    // Arrow 25 (and the old num_rows()/ReadRowGroup-out-param went with it).
-    // The Result spelling below compiles on old AND new Arrow alike.
+// Result-based OpenFile (the Status out-param overload is gone in Arrow 25).
+// The Result spelling below compiles on old AND new Arrow alike.
     // Arrow 25: OpenFile needs the pool passed explicitly (no default arg),
     // and row counts come from the file metadata (FileReader::num_rows and
     // ParquetFileReader::num_rows/num_row_groups are all gone).

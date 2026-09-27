@@ -47,6 +47,17 @@ static void test_legacy_datadir_warn() {
     log_warn("[cfg ] data.data_dir duplicates training.data_dir (legacy; ignored)");
 }
 
+static void test_unknown_precision_fails() {
+    Config c = Config::from_string(
+        "training:\n"
+        "  max_steps: 1\n"
+        "  precision: f16_typo\n");
+    bool threw = false;
+    try { (void)TrainerConfig::from_config(c); }
+    catch (...) { threw = true; }
+    CHECK(threw, "unknown training.precision is rejected instead of silently falling back to fp32");
+}
+
 static void test_strict_getters() {
     Config c = Config::from_string("training:\n  count: 8\n");
     CHECK(c.get_int_strict("training.count") == 8, "strict int ok");
@@ -162,6 +173,7 @@ int main() {
     test_legacy_datadir_warn();
     test_shard_globs_honored();
     test_strict_getters();
+    test_unknown_precision_fails();
     test_ckpt_version_gate();
     test_check_known();
     test_arch_parity();

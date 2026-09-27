@@ -68,11 +68,11 @@ private:
     float* decode_step_logits(i32 token, int position);
     void   forward_prefill(const std::vector<i32>& tokens, int start_pos);
 
-    // fast-sampling scratch (audit P1: ~1KB D2H/token instead of 128KB)
+    // fast-sampling scratch (~1KB D2H/token instead of 128KB)
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
-    // PRO-HARDEN: history_ كان ينمو بلا حدود في المحادثات الطويلة (leak منطقي
-    // يرفع RAM ويبطئ penalties). السقف 4096 يحفظ نافذة repetition كاملة.
+    // history_ is capped: unbounded growth would raise RAM and slow penalties.
+    // 4096 keeps the full repetition window.
     static constexpr size_t HIST_MAX = 4096;
     void push_history(i32 tok) {
         if (history_.size() >= HIST_MAX)
@@ -87,7 +87,7 @@ private:
     int              max_context_;
     Device           expected_device_ = Device::CPU;
 
-    // P0-03 FIX: Absolute token position counter. After the KV ring wraps,
+    // Absolute token position counter. After the KV ring wraps,
     // cache_.length() stays capped, but the true RoPE coordinate of the next
     // token must keep increasing monotonically. Using cache_.length() as
     // position after eviction corrupts the relative positional distances
@@ -100,7 +100,7 @@ private:
     // token id, position, and final logits row consumed by the sampler.
     Tensor x_, xb_, q_, k_, v_, qkv_, attn_, proj_, gate_, up_, act_, logits_dev_, scores_;
     Tensor tok_dev_, pos_dev_;
-    Tensor hlast_;   // [d] last-row norm scratch for prefill head (audit P1: no [P,V])
+    Tensor hlast_;   // [d] last-row norm scratch for the prefill head
     Tensor topk_vals_dev_, topk_ids_dev_;   // [FAST_TOPK_MAX] device candidates
     std::vector<float> topk_vals_host_;     // [FAST_TOPK_MAX] copied per token
     std::vector<i32>   topk_ids_host_;

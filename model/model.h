@@ -250,7 +250,7 @@ public:
                               Activations& act, i64* out_ntok = nullptr,
                               float dout_scale = 1.0f, bool want_aux_stats = false,
                               const i32* segment_ids = nullptr,
-                              // F-10: optional HOST mirror of `targets` (the
+                               // Optional HOST mirror of `targets` (the
                               // trainer's batch.targets). Used ONLY to skip
                               // fully-masked CE blocks on the host without a
                               // device sync; never dereferenced on device and
@@ -276,15 +276,14 @@ public:
         u64    params_no_embedding = 0;
         size_t weights = 0;            // fp32 master weights
         size_t grads = 0;              // fp32 gradients (training only)
-        size_t fp16_cache = 0;         // persistent fp16 weight cache (F-14)
+        size_t fp16_cache = 0;         // persistent fp16 weight cache
         size_t activations = 0;        // peak activation arena for (B,T)
         size_t static_total = 0;       // weights + grads + fp16_cache
         size_t total = 0;              // static_total + activations
     };
     static u64    count_parameters(const ModelConfig& cfg);
-    // F-14: the per-layer FUSED qkv fp16 cache (wqkv_fp16) was missing from
-    // the runtime accounting, under-reporting persistent VRAM by
-    // L*(qd+2*kvd)*d*2 bytes.
+    // The per-layer fused qkv fp16 cache (wqkv_fp16) is persistent VRAM too:
+    // L*(qd+2*kvd)*d*2 bytes, counted here.
     static size_t count_fp16_cache_bytes(const ModelConfig& cfg);
     static MemoryPlan plan_memory(const ModelConfig& cfg, int B, int T,
                                   bool with_grad, int ce_chunks,
@@ -293,7 +292,7 @@ public:
                                                 bool fp16_weight_cache_on,
                                                 int B, int T, bool with_grad,
                                                 int ce_chunks);
-    // F-16: worst-case CUDA workspace sizes for (B,T), pure arithmetic. The
+    // Worst-case CUDA workspace sizes for (B,T), pure arithmetic. The
     // trainer pre-sizes both pools from this before the first step so the run
     // never pays a cudaFree+cudaMalloc resize stall mid-training. Values mirror
     // the moe_workspace()/workspace() call sites (forward + backward) with
@@ -331,7 +330,7 @@ public:
     // apply_moe_bias_step() converts the globally summed counts to per-layer
     // fractions and runs the EMA update exactly once.
     //
-    // F-12 (population contract): the denominator is DERIVED from the same
+    // Population contract: the denominator is DERIVED from the same
     // counts (row_sum == routed tokens * K) instead of an externally supplied
     // token count, so the load fraction is counts[e] / row_sum. Every routed
     // token contributes exactly top_k slots, so numerator and denominator can
@@ -341,13 +340,13 @@ public:
     void accumulate_moe_bias_fracs(Activations& act, int B, int T);
     // `global_count_sum`: DDP-summed [L*ne] slot counts for this step.
     // `apply=false` discards the accumulator WITHOUT applying the EMA update
-    // (F-11: the optimizer skipped this step on a non-finite grad norm, so no
+    // (the optimizer skipped this step on a non-finite grad norm, so no
     // optimizer-step-coupled control state may move). The accumulator is always
     // cleared so counts can never leak into a later step.
     void apply_moe_bias_step(const float* global_count_sum, bool apply);
     // Raw [L * ne] slot-count accumulator for Trainer to all-reduce.
     std::vector<float>& moe_bias_acc_host() { return moe_bias_acc_; }
-    // F-02: device-side twin of the accumulator. On CUDA the per-microbatch
+    // Device-side twin of the accumulator. On CUDA the per-microbatch
     // counts stay on device (moe_count_slots, zero D2H) and only the [L*ne]
     // summary crosses the host once per optimizer step. Null/undefined on CPU.
     Tensor& moe_bias_acc_dev() { return moe_bias_acc_dev_; }
@@ -396,7 +395,7 @@ private:
     // Per-step accumulator for DDP-safe two-phase aux-free bias update:
     // [L * ne] flat; zeroed at start of each optimizer step.
     std::vector<float>              moe_bias_acc_;
-    // F-02: device-side twin, [L * ne] f32 on the model device. Undefined
+    // Device-side twin, [L * ne] f32 on the model device. Undefined
     // unless the CUDA counting path populated it this step.
     Tensor                          moe_bias_acc_dev_;
     Device      device_ = Device::CPU;
