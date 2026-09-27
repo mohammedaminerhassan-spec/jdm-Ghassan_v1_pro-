@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 #endif
