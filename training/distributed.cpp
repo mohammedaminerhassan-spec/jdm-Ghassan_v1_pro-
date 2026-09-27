@@ -187,17 +187,6 @@ void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_
 }
 #endif // GAI_NCCL
 
-#ifdef GAI_NCCL
-// f32 <-> f16 conversion kernels for gradient compression
-__global__ void k_f32_to_f16(const float* src, uint16_t* dst, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half_rn(src[i]);
-}
-__global__ void k_f16_to_f32(const uint16_t* src, float* dst, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __half2float(reinterpret_cast<const __half&>(src[i]));
-}
-#endif
 
 void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
     all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
@@ -239,32 +228,6 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
         GAI_FAIL("ddp_grad_compression=true is unsupported with loss scaling: scaled "
                  "grads overflow fp16 and corrupt training. Set "
                  "training.ddp_grad_compression=false (exact fp32 all-reduce).");
-        size_t nbytes_f32 = numel * sizeof(float);
-        size_t nbytes_f16 = numel * sizeof(uint16_t);
-        bool back = false;
-        void* dev_f32 = collective_staging(buffer, nbytes_f32, &back);
-
-        if (!f16_stage_ || f16_stage_bytes_ < nbytes_f16) {
-            if (f16_stage_) CU_RT_CHECK(cudaFree(f16_stage_));
-            CU_RT_CHECK(cudaMalloc(&f16_stage_, nbytes_f16));
-            f16_stage_bytes_ = nbytes_f16;
-        }
-
-        int threads = 256;
-        int blocks = (int)((numel + threads - 1) / threads);
-        k_f32_to_f16<<<blocks, threads>>>(static_cast<float*>(dev_f32),
-                                          static_cast<uint16_t*>(f16_stage_), numel);
-        // FENCE after the conversion kernels (not before): the NCCL stream
-        // must wait for THESE launches, which are also on the default stream.
-        wait_for_compute();
-        NCCL_CHECK(ncclAllReduce(f16_stage_, f16_stage_, numel, ncclFloat16, ncclSum, comm_, stream_));
-        CU_RT_CHECK(cudaStreamSynchronize(stream_));
-        k_f16_to_f32<<<blocks, threads>>>(static_cast<uint16_t*>(f16_stage_),
-                                          static_cast<float*>(dev_f32), numel);
-        CU_RT_CHECK(cudaStreamSynchronize(stream_));
-        if (back) CU_RT_CHECK(cudaMemcpy(buffer, dev_f32, nbytes_f32, cudaMemcpyDeviceToHost));
-        ops::perf_note_sync();
-        return;
     }
 
     ncclDataType_t nccl_dtype = ncclFloat32;
