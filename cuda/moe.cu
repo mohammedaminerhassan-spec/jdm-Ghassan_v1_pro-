@@ -29,6 +29,36 @@ static inline int grid_for(i64 n, int block) {
     return static_cast<int>(g);
 }
 
+// ---- 16-byte block alignment --------------------------------------------
+// Every workspace sub-block is carved out of one cudaMalloc at FLOAT
+// granularity, so a block whose float count is not a multiple of 4 starts
+// 8-byte aligned. The slot-movement kernels then take their float4 fast path
+// (they only checked `rowlen % 4 == 0`, never the address) and the vector
+// store faults on sm_75:
+//   "Invalid __global__ write of size 16 bytes ... is misaligned"
+// Observed in moe_backward, where Gblk sits at float offset 6*N*E + NK
+// (= 666 floats = byte 2664 for N=9, E=12, NK=18), 8 mod 16.
+// Carve every block rounded up to 16 bytes so the vector path stays live, and
+// budget the padding in the request via ws_pad_for().
+static constexpr size_t kWsAlign = 16;
+static inline uint8_t* carve16(uint8_t*& ws, size_t bytes) {
+    uint8_t* p = ws;
+    ws += (bytes + kWsAlign - 1) / kWsAlign * kWsAlign;
+    return p;
+}
+// Padding budget for a layout that carves `blocks` sub-buffers.
+static inline size_t ws_pad_for(int blocks) {
+    return static_cast<size_t>(blocks) * kWsAlign;
+}
+
+// A float4 access requires a 16-byte aligned address. `rowlen % 4 == 0` alone
+// does not imply that, so every vectorised path checks the actual pointers and
+// falls back to the scalar loop when they are not aligned. Cheap (one AND per
+// block) and it turns a hard "misaligned" fault into a slow-but-correct store.
+__device__ __forceinline__ bool f4_ok(const void* p) {
+    return (reinterpret_cast<uintptr_t>(p) & (uintptr_t)(kWsAlign - 1)) == 0;
+}
+
 // NOTE: GEMMs go through cuda_ops::linear_forward / linear_backward / gemm
 // (kernels.cu), so the MoE automatically uses the FP16 tensor-core fast path
 // for large matrices. No local BLAS wrappers here (keeps one code path).
@@ -288,7 +318,7 @@ __global__ void k_gather_tok(const float* src, const i32* slots, float* dst,
         const float* r = src + (i64)t * rowlen;
         float* o = dst + s * rowlen;
         int j = 0;
-        if ((rowlen & 3) == 0) {
+        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (; j < rowlen / 4; ++j) o4[j] = r4[j];
@@ -305,7 +335,7 @@ __global__ void k_gather(const float* src, const i32* slots, float* dst,
     for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
         const float* r = src + (i64)slots[s] * rowlen;
         float* o = dst + s * rowlen;
-        if ((rowlen & 3) == 0) {
+        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
@@ -322,7 +352,7 @@ __global__ void k_scatter_copy(const float* src, const i32* slots, float* dst,
     for (i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x; s < nslots; s += stride) {
         const float* r = src + s * rowlen;
         float* o = dst + (i64)slots[s] * rowlen;
-        if ((rowlen & 3) == 0) {
+        if ((rowlen & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (int j = 0; j < rowlen / 4; ++j) o4[j] = r4[j];
@@ -343,7 +373,7 @@ __global__ void k_scatter_add(float* dst, const float* src, const i32* slots,
         float wv = w ? w[(i64)t * K + k] : 1.0f;
         float* o = dst + (i64)t * d;
         const float* r = src + s * d;
-        if ((d & 3) == 0) {
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             for (int j = 0; j < d / 4; ++j) {
                 float4 v = r4[j];
@@ -375,7 +405,7 @@ __global__ void k_pack_all(const float* x, const i32* grouped, float* out,
         const float* r = x + (i64)t * d;
         float* o = out + s * d;
         int j = 0;
-        if ((d & 3) == 0) {
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (; j < d / 4; ++j) o4[j] = r4[j];
@@ -402,7 +432,7 @@ __global__ void k_save3_all(const float* G, const float* U, const float* A,
         float* ou = s_up + slot * E;
         float* oa = s_act + slot * E;
         int j = 0;
-        if ((E & 3) == 0) {
+        if ((E & 3) == 0 && f4_ok(g) && f4_ok(u) && f4_ok(a) && f4_ok(og) && f4_ok(ou) && f4_ok(oa)) {
             const float4* g4 = reinterpret_cast<const float4*>(g);
             const float4* u4 = reinterpret_cast<const float4*>(u);
             const float4* a4 = reinterpret_cast<const float4*>(a);
@@ -429,7 +459,7 @@ __global__ void k_scatter_add_all(float* out, const float* Y, const i32* grouped
         float wv = w ? w[(i64)t * K + k] : 1.0f;
         float* o = out + (i64)t * d;
         const float* r = Y + s * d;
-        if ((d & 3) == 0) {
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             for (int j = 0; j < d / 4; ++j) {
                 float4 v = r4[j];
@@ -459,7 +489,7 @@ __global__ void k_gather3_all(const float* s_gate, const float* s_up, const floa
         float* ou = U + s * E;
         float* oa = A + s * E;
         int j = 0;
-        if ((E & 3) == 0) {
+        if ((E & 3) == 0 && f4_ok(g) && f4_ok(u) && f4_ok(a) && f4_ok(og) && f4_ok(ou) && f4_ok(oa)) {
             const float4* g4 = reinterpret_cast<const float4*>(g);
             const float4* u4 = reinterpret_cast<const float4*>(u);
             const float4* a4 = reinterpret_cast<const float4*>(a);
@@ -485,7 +515,7 @@ __global__ void k_scale_all(const float* dout, const float* w, const i32* groupe
         const float* r = dout + t * d;
         float* o = S + s * d;
         int j = 0;
-        if ((d & 3) == 0) {
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (; j < d / 4; ++j) {
@@ -530,7 +560,7 @@ __global__ void k_scale_rows(const float* src, const float* w, const i32* slots,
         float wv = w[(i64)t * K + k];
         const float* r = src + (i64)t * d;
         float* o = dst + s * d;
-        if ((d & 3) == 0) {
+        if ((d & 3) == 0 && f4_ok(r) && f4_ok(o)) {
             const float4* r4 = reinterpret_cast<const float4*>(r);
             float4* o4 = reinterpret_cast<float4*>(o);
             for (int j = 0; j < d / 4; ++j) {
@@ -773,14 +803,15 @@ void moe_forward(const float* x, const float* router_w,
         sizeof(i32) * (size_t)NK +            // tmp idx (inference only)
         sizeof(float) * (size_t)NK +          // tmp w   (inference only)
         sizeof(float) * (size_t)NK * E * 3 +  // expert block G/U/A
-        sizeof(float) * (size_t)NK * d);      // expert block X/Eg
-    float* rlogits = (float*)ws; ws += sizeof(float) * (size_t)N * ne;
-    i32*   tmp_idx = (i32*)ws;   ws += sizeof(i32) * (size_t)NK;
-    float* tmp_w   = (float*)ws; ws += sizeof(float) * (size_t)NK;
-    float* Gblk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ublk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ablk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Xblk = (float*)ws; ws += sizeof(float) * (size_t)NK * d;
+        sizeof(float) * (size_t)NK * d +      // expert block X/Eg
+        ws_pad_for(7));
+    float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
+    i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
+    float* tmp_w   = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
 
     // 1. router logits
     linear_forward(x, router_w, rlogits, (int)N, d, ne);
@@ -864,14 +895,15 @@ void moe_forward_bias(const float* x, const float* router_w, const float* router
         sizeof(i32) * (size_t)NK +
         sizeof(float) * (size_t)NK +
         sizeof(float) * (size_t)NK * E * 3 +
-        sizeof(float) * (size_t)NK * d);
-    float* rlogits = (float*)ws; ws += sizeof(float) * (size_t)N * ne;
-    i32*   tmp_idx = (i32*)ws;   ws += sizeof(i32) * (size_t)NK;
-    float* tmp_w   = (float*)ws; ws += sizeof(float) * (size_t)NK;
-    float* Gblk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ublk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ablk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Xblk = (float*)ws; ws += sizeof(float) * (size_t)NK * d;
+        sizeof(float) * (size_t)NK * d +
+        ws_pad_for(7));
+    float* rlogits = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
+    i32*   tmp_idx = (i32*)carve16(ws, sizeof(i32) * (size_t)NK);
+    float* tmp_w   = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
 
     linear_forward(x, router_w, rlogits, (int)N, d, ne);
 
@@ -957,22 +989,26 @@ void moe_backward(const float* x, const float* router_w,
         sizeof(float) * (size_t)NK * E * 4 +  // expert G/U/A/Dact
         sizeof(float) * (size_t)NK * d * 2 +  // expert Xgather/Sscaled
         sizeof(float) * (size_t)NK +          // expert dp piece
-        sizeof(float) * (size_t)N * ne);      // router DL [N,ne]
-    float* shg = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* shu = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* sha = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* shdg = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* shdu = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* shda = (float*)ws; ws += sizeof(float) * (size_t)N * E;
-    float* dpfull = (float*)ws; ws += sizeof(float) * (size_t)NK;
-    float* Gblk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ublk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Ablk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Dblk = (float*)ws; ws += sizeof(float) * (size_t)NK * E;
-    float* Xblk = (float*)ws; ws += sizeof(float) * (size_t)NK * d;
-    float* Sblk = (float*)ws; ws += sizeof(float) * (size_t)NK * d;
-    float* Pblk = (float*)ws; ws += sizeof(float) * (size_t)NK;
-    float* DLblk = (float*)ws; ws += sizeof(float) * (size_t)N * ne;
+        sizeof(float) * (size_t)N * ne +      // router DL [N,ne]
+        ws_pad_for(15));
+    // carve16: Gblk used to start at float offset 6*N*E + NK, which is 8 mod 16
+    // whenever NK is not a multiple of 4 — that is the exact layout that made
+    // k_gather3_all's float4 store fault with "is misaligned".
+    float* shg = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* shu = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* sha = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* shdg = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* shdu = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* shda = (float*)carve16(ws, sizeof(float) * (size_t)N * E);
+    float* dpfull = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* Gblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ublk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Ablk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Dblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * E);
+    float* Xblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Sblk = (float*)carve16(ws, sizeof(float) * (size_t)NK * d);
+    float* Pblk = (float*)carve16(ws, sizeof(float) * (size_t)NK);
+    float* DLblk = (float*)carve16(ws, sizeof(float) * (size_t)N * ne);
 
     // ---- shared expert: recompute, then fully batched backward
     if (sh_g && sh_u && sh_d && dsh_g && dsh_u && dsh_d) {
