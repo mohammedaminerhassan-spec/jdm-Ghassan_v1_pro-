@@ -321,7 +321,6 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
                         cuda::cublas_device(), cur_dev));
     }
 }
-}
 
 void linear_forward(const float* x, const float* w, float* y, int M, int K, int N) {
     gemm(false, true, M, N, K, 1.0f, x, K, w, K, 0.0f, y, N);
