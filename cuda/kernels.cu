@@ -36,6 +36,11 @@ static inline int grid_for(i64 n, int block) {
 static void*  g_ws = nullptr;
 static size_t g_ws_bytes = 0;
 
+// Forward declaration for SceAcc so free_workspace() can release it.
+// The full definition is near the CE-accumulation kernels below.
+struct SceAcc;
+static SceAcc* g_sce_acc = nullptr;
+
 static size_t round_ws(size_t bytes) {
     const size_t chunk = (64ull << 20);
     return ((bytes + chunk - 1) / chunk) * chunk;
@@ -46,7 +51,7 @@ static void* workspace(size_t bytes) {
     size_t want = round_ws(bytes);
     if (want <= g_ws_bytes) return g_ws;
     if (g_ws) CU_CHECK(cudaFree(g_ws));
-    check_free_vram(want, "GEMM workspace");
+    gai::cuda::check_free_vram(want, "GEMM workspace");
     CU_CHECK(cudaMalloc(&g_ws, want));
     g_ws_bytes = want;
     return g_ws;
@@ -840,8 +845,11 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
 // them immediately).
 
 // Packed so loss+count cross the host in ONE 16-byte memcpy.
+// NOTE: SceAcc and g_sce_acc are forward-declared at the top of this file
+// (near the workspace section) so free_workspace() can release them before
+// the full definition here. The definition must match the forward decl exactly.
 struct SceAcc { double loss; long long count; };
-static SceAcc* g_sce_acc = nullptr;   // device, persistent, monotonic by design
+// g_sce_acc is already declared above (forward decl); do not redeclare.
 static void sce_acc_ensure() {
     if (!g_sce_acc) CU_CHECK(cudaMalloc(&g_sce_acc, sizeof(SceAcc)));
 }

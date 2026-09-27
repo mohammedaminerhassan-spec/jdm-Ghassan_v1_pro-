@@ -47,7 +47,7 @@ static void* moe_workspace(size_t bytes) {
     size_t want = moe_round(bytes);
     if (want <= g_moe_ws_bytes) return g_moe_ws;
     if (g_moe_ws) CU_CHECK(cudaFree(g_moe_ws));
-    check_free_vram(want, "MoE workspace");
+    gai::cuda::check_free_vram(want, "MoE workspace");
     CU_CHECK(cudaMalloc(&g_moe_ws, want));
     g_moe_ws_bytes = want;
     return g_moe_ws;
@@ -84,7 +84,7 @@ static void grp_ensure(size_t nk, int ne) {
         // this covers slot variance. Pools never shrink by design.
         size_t want = nk + nk / 8 + 1024;
         if (g_grp_grouped) CU_CHECK(cudaFree(g_grp_grouped));
-        check_free_vram(sizeof(i32) * want, "MoE grouped slots");
+        gai::cuda::check_free_vram(sizeof(i32) * want, "MoE grouped slots");
         CU_CHECK(cudaMalloc(&g_grp_grouped, sizeof(i32) * (want > 0 ? want : 1)));
         g_grp_grouped_cap = want;
     }
@@ -92,7 +92,7 @@ static void grp_ensure(size_t nk, int ne) {
         if (g_grp_cnt) CU_CHECK(cudaFree(g_grp_cnt));
         if (g_grp_cur) CU_CHECK(cudaFree(g_grp_cur));
         if (g_grp_off) CU_CHECK(cudaFree(g_grp_off));
-        check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
+        gai::cuda::check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
         CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
         CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));
         CU_CHECK(cudaMalloc(&g_grp_off, sizeof(int) * (size_t)(ne + 1)));
