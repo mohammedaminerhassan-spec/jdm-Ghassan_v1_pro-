@@ -243,6 +243,22 @@ __device__ __forceinline__ float block_max(float v, float* smem) {
     return smem[0];
 }
 
+// Human-readable cuBLAS status (enum values are stable across toolkits).
+static const char* cublas_status_name(cublasStatus_t s) {
+    switch (s) {
+        case CUBLAS_STATUS_SUCCESS:          return "SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED:  return "NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED:     return "ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE:    return "INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH:    return "ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR:    return "MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR:   return "INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED:    return "NOT_SUPPORTED";
+        default:                             return "UNKNOWN";
+    }
+}
+
 // ================================================================ GEMM (cuBLAS)
 // We store everything row-major; cuBLAS is column-major. A row-major
 // C[MxN] = A[MxK] * B[KxN] equals, in column-major terms,
@@ -286,7 +302,25 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasStatus_t s = cublasSgemm(h, opA, opB, N, M, K,
                                    &alpha, B, ldb, A, lda, &beta, C, ldc);
-    if (s != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasSgemm failed");
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        // Name the failure precisely: a bare "cublasSgemm failed" cannot tell
+        // a handle/device mismatch from a wedged GPU or a host shape bug.
+        // The handle is bound to its creation device (see cublas_handle), so
+        // report both ids: on multi-GPU runners a slip between them is the
+        // usual suspect for NOT_INITIALIZED on an otherwise valid call.
+        int cur_dev = -1;
+        cudaGetDevice(&cur_dev);
+        GAI_FAIL(strfmt("cublasSgemm failed: status=%d (%s) | M=%d N=%d K=%d "
+                        "lda=%d ldb=%d ldc=%d | handle-device=%d current-device=%d | "
+                        "hint: EXECUTION_FAILED with sane dims points at a wedged GPU "
+                        "(nvidia-smi -r or session restart) or a prior async fault; "
+                        "NOT_INITIALIZED with mismatched devices points at a device slip; "
+                        "INVALID_VALUE points at a host-side shape bug",
+                        static_cast<int>(s), cublas_status_name(s),
+                        M, N, K, lda, ldb, ldc,
+                        cuda::cublas_device(), cur_dev));
+    }
+}
 }
 
 void linear_forward(const float* x, const float* w, float* y, int M, int K, int N) {

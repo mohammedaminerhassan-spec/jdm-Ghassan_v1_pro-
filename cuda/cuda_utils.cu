@@ -13,6 +13,7 @@ namespace cuda {
 
 static std::string  g_last_error;
 static cublasHandle_t g_cublas = nullptr;
+static int          g_cublas_dev = -1;
 static bool         g_initialized = false;
 
 const char* last_error() { return g_last_error.c_str(); }
@@ -145,6 +146,10 @@ void check_free_vram(size_t need, const char* what) {
 void* cublas_handle() {
     if (!g_cublas) {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");
+        // Pin the creation device: every later GEMM verifies it is still
+        // current, so a 2-GPU device slip becomes a named error, not a bare
+        // CUBLAS_STATUS_NOT_INITIALIZED deep inside training.
+        if (cudaGetDevice(&g_cublas_dev) != cudaSuccess) g_cublas_dev = -1;
         // TF32 is a large free speedup on Ampere+ and is numerically fine for
         // this model size; explicitly opt in unless GAI_TF32=0 (bit-exact fp32).
         // Auto-detect: TF32 only on sm>=80, otherwise DEFAULT_MATH.
@@ -155,13 +160,16 @@ void* cublas_handle() {
         cudaDeviceProp prop{};
         if (cudaGetDevice(&dev) == cudaSuccess &&
             cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-            if (prop.major < 8) want_tf32 = false; // Turing/Pascal: no TF32
+        if (prop.major < 8) want_tf32 = false; // Turing/Pascal: no TF32
         }
-        cublasSetMathMode(g_cublas, want_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH
-                                              : CUBLAS_DEFAULT_MATH);
+        check_blas(cublasSetMathMode(g_cublas, want_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH
+                                                        : CUBLAS_DEFAULT_MATH),
+                   "cublasSetMathMode");
     }
     return reinterpret_cast<void*>(g_cublas);
 }
+
+int cublas_device() { return g_cublas_dev; }
 
 void shutdown() {
     if (g_cublas) {

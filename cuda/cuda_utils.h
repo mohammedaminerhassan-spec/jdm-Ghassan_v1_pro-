@@ -32,6 +32,10 @@ void  synchronize();
 
 // cuBLAS handle, created lazily on first use.
 void* cublas_handle();
+// Device the cuBLAS handle was created on (-1 if not created yet). GEMM
+// entry points compare it against the current device so a handle/device
+// mismatch fails loudly with both ids instead of a bare cuBLAS error.
+int   cublas_device();
 void  shutdown();
 
 const char* last_error();
