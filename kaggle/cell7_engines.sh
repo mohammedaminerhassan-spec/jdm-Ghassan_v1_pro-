@@ -57,8 +57,13 @@ step "[2/8] data quality on the REAL corpus (parquet -> text -> corpus_stats)"
 # and the gate below then SILENTLY skips, which is worse than failing.
 # EN_LAKE still wins if the caller sets it.
 if [[ -z "${EN_LAKE:-}" ]]; then
-    EN_LAKE="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null \
-               | head -n 1 | xargs -r dirname)"
+    # Strip the filename with parameter expansion, NOT `xargs dirname`: an
+    # attached dataset nests under a path that can contain a space (e.g.
+    # ".../Users/Ghassan PC/Desktop/english_parquet"), and xargs would split
+    # that into two arguments and emit two dirname lines.
+    _hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
+    [[ -n "${_hit}" ]] && EN_LAKE="${_hit%/*}"
+    unset _hit
 fi
 if [[ -n "${EN_LAKE}" && -d "${EN_LAKE}" ]]; then
     echo "  lake: ${EN_LAKE}"
