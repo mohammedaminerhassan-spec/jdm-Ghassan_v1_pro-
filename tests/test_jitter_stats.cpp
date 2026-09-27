@@ -37,7 +37,8 @@ int main() {
             if (u < min_u) min_u = u;
             if (u > max_u) max_u = u;
             int b = static_cast<int>((u + 0.5f) * NBINS);
-            if (b < 0) b = 0; if (b >= NBINS) b = NBINS - 1;
+            if (b < 0) b = 0;
+            if (b >= NBINS) b = NBINS - 1;
             ++bins[b];
         }
     }
