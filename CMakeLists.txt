@@ -140,14 +140,14 @@ endif()
 
 # ---------------------------------------------------------------- NCCL (multi-GPU)
 # No Findnccl module ships with CMake, so detect header + library directly.
-set(GAI_HAVE_NCCL OFF)
+set(GAI_HAVE_NCCL OFF CACHE BOOL "NCCL multi-GPU support detected" FORCE)
 if(GAI_HAVE_CUDA AND GAI_ENABLE_NCCL)
     find_path(NCCL_INCLUDE_DIR nccl.h
         HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/include)
     find_library(NCCL_LIBRARY nccl
         HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
     if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
-        set(GAI_HAVE_NCCL ON)
+        set(GAI_HAVE_NCCL ON CACHE BOOL "NCCL multi-GPU support detected" FORCE)
         target_include_directories(gai_core PUBLIC ${NCCL_INCLUDE_DIR})
         target_link_libraries(gai_core PUBLIC ${NCCL_LIBRARY})
         target_compile_definitions(gai_core PUBLIC GAI_NCCL=1)
