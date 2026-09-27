@@ -818,8 +818,11 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 
         // ---- output-quota projection (NOT the same limit as free space) ----
         // Kaggle caps what /kaggle/working SAVES at ~20 GB while the filesystem
-        // itself has ~57 GB. Everything the run produces lands in that quota:
-        // the clone, the build tree, the shards, the checkpoints and the GGUF.
+        // itself has ~57 GB. What the RUN produces is the checkpoints and the
+        // GGUF; the source clone and the CMake build/ tree beside them are
+        // inputs the session regenerates, so they are excluded from the
+        // measurement (a 1B recipe leaves only ~630 MB of budget for them
+        // otherwise, and a healthy run dies here before step 1).
         // Counting checkpoint NAMES twice (best.ckpt + last.ckpt are one
         // inode when the writer published them from the same step) invents a
         // phantom copy, so the projection counts real inodes.
@@ -831,8 +834,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                             root.filename().string() != "working"; ++i)
                 root = root.parent_path();
             if (root.filename().string() != "working") root = fs::absolute(".");
+            // Regenerable / non-payload trees: build outputs and the ccache
+            // store never belong in a budget sized for checkpoints+GGUF.
+            const std::vector<std::string> skip_dirs = {
+                "build", "build_test", "build_cpu", "out", ".git", ".cache", "ccache"
+            };
             size_t unique_files = 0;
-            const size_t used = tree_size_bytes(root.string(), &unique_files);
+            const size_t used = tree_size_bytes_excluding(root.string(), skip_dirs, &unique_files);
             size_t ckpt_files = 0;
             const size_t ckpt_now = tree_size_bytes(cfg_.checkpoint_dir, &ckpt_files);
             // One snapshot (published under 1-2 names) + the .tmp being written.
@@ -849,11 +857,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                             human_bytes(transient).c_str(), human_bytes(gguf).c_str()));
             if (projected > budget) {
                 GAI_FAIL(strfmt("output quota guard: this run projects %s of saved output but "
-                                "the budget is %s (over by %s). The quota bites at "
-                                "Save Version, long after training. Free space under %s, "
+                                "the budget is %s (over by %s, %s of it already-published "
+                                "checkpoints/data). The quota bites at Save Version, long "
+                                "after training. Delete stale checkpoints or shards under %s, "
                                 "or lower --output-budget-mb knowingly, or shrink the model.",
                                 human_bytes(projected).c_str(), human_bytes(budget).c_str(),
-                                human_bytes(projected - budget).c_str(), root.string().c_str()));
+                                human_bytes(projected - budget).c_str(), human_bytes(used).c_str(),
+                                root.string().c_str()));
             }
         }
     }

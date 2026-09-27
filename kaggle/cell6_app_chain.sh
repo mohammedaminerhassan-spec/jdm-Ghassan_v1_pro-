@@ -25,6 +25,7 @@ ok()   { echo "  [ok] $1"; }
 step "[0/12] build from the pulled commit (never test a stale binary)"
 echo "  commit: $(git log --oneline -1)"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON \
+  -DGAI_ENABLE_PARQUET=ON -DCMAKE_CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')" \
   > /tmp/cell6_cmake.log 2>&1 || { echo "  [FAIL] cmake configure"; tail -25 /tmp/cell6_cmake.log; exit 1; }
 cmake --build build -j2 > /tmp/cell6_build.log 2>&1 \
   || { echo "  [FAIL] CUDA build -Werror"; tail -25 /tmp/cell6_build.log; exit 1; }

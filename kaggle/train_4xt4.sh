@@ -26,7 +26,12 @@ if [[ "${GPU_N}" -lt 4 ]]; then
     echo "[ERROR] Single-T4: bash kaggle/train_1b.sh  (flagship recipe)"
     exit 1
 fi
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# cd into the repo: the ranks are spawned with only --config, so every
+# repo-relative path inside the yaml (tokenizer.path, checkpoint_dir,
+# data_dir, data.train_glob) resolves against the CALLER's cwd. Launched from
+# anywhere else, the ranks train on the wrong (or a missing) data dir.
+cd "${REPO_DIR}" || exit 1
 BIN="${REPO_DIR}/build/bin/gai_train"
 [[ -x "${BIN}" ]] || { echo "[ERROR] ${BIN} missing. Run kaggle/setup.sh first."; exit 1; }
 
@@ -56,19 +61,34 @@ cleanup_ranks() {
 # so WORLD_SIZE=2 still spawned 4 ranks -> OOM. Honor WORLD_SIZE.
 trap cleanup_ranks INT TERM
 for i in $(seq 0 $((WORLD_SIZE - 1))); do
-    LOCAL_RANK=$i RANK=$i "${BIN}" --config "$CONFIG" &
+    LOCAL_RANK=$i RANK=$i "${BIN}" --config "$CONFIG" --device cuda &
     PIDS[$i]=$!
     echo "Started rank $i/$WORLD_SIZE (pid ${PIDS[$i]})"
 done
 
+# Poll instead of a sequential `wait pid0; wait pid1; ...`: a rank that dies
+# inside a NCCL collective wedges its siblings forever (there is no NCCL
+# timeout in training/distributed.cpp), and a sequential wait would block on
+# that wedged rank and never reach the kill below. Once ANY rank is gone the
+# rest cannot make progress, so they are killed and the run reports failure.
 FAIL=0
-for pid in "${PIDS[@]}"; do
-    if ! wait "$pid"; then FAIL=1; fi
+ALIVE=${WORLD_SIZE}
+while [[ "${ALIVE}" -gt 0 ]]; do
+    for pid in "${PIDS[@]}"; do
+        kill -0 "${pid}" 2>/dev/null || continue
+        # A non-child zombie also answers kill -0, so cross-check /proc state
+        # when available and only count genuinely running ranks as alive.
+        state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || echo R)"
+        [[ "${state}" == "Z" ]] && continue
+        if wait "${pid}" 2>/dev/null; then :; else FAIL=1; fi
+        ALIVE=$(( ALIVE - 1 ))
+    done
+    [[ "${ALIVE}" -gt 0 ]] && sleep 5
 done
 
 if [ "$FAIL" -ne 0 ]; then
     echo "!!! a training rank failed, killing the rest"
-    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
     exit 1
 fi
 

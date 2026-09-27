@@ -106,6 +106,13 @@ fi
 
 # ---- 4. Compiler check
 echo "[compiler] GCC  : $(g++ --version | head -1)"
+# cmake drives the whole build; without it every later line dies with a bare
+# "command not found" and no hint about which tool is missing.
+command -v cmake >/dev/null 2>&1 || {
+    echo "[ERROR] cmake not found. Install it first:"
+    echo "        sudo apt-get update && sudo apt-get install -y cmake"
+    exit 1
+}
 echo "[compiler] CMake: $(cmake --version | head -1)"
 
 # ---- 5b. Apache Arrow C++ (REQUIRED native parquet lake input).
@@ -268,7 +275,13 @@ TOK_EN="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
 # ---- 9a. locate the English lake (same search as build_english_data.sh)
 find_english_lake() {
     local cand=""
-    for cand in "${EN_PARQUET_DIR:-}" "${REPO_DIR}/english_parquet" \
+    # Order matters only for speed. dataset/english_parquet is where the lake
+    # actually ships in this checkout, so it must be searched here too —
+    # build_english_data.sh:53 already looks there, and the two scripts
+    # disagreeing meant setup.sh aborted with "No English lake found" on a
+    # machine whose data was sitting right there.
+    for cand in "${EN_PARQUET_DIR:-}" "${REPO_DIR}/dataset/english_parquet" \
+                "${REPO_DIR}/english_parquet" \
                 "${REPO_DIR}/kaggle_upload/english_parquet"; do
         [[ -n "${cand}" && -d "${cand}" ]] || continue
         if [[ -n "$(find "${cand}" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then

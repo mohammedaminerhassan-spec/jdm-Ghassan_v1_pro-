@@ -3,6 +3,9 @@
 #include "core/common.h"
 #include "core/tensor.h"
 
+#include <string>
+#include <vector>
+
 namespace gai {
 
 const char* device_name(Device d);
@@ -42,6 +45,15 @@ size_t free_disk_bytes(const std::string& path);
 // for ONE inode, and a quota projection that counts names twice invents a
 // phantom second copy. unique_files (optional) receives the inode count.
 size_t tree_size_bytes(const std::string& path, size_t* unique_files = nullptr);
+// Same, but any directory whose NAME is in `skip_dir_names` is not descended
+// into (its whole subtree is exempt). Used by the output-quota guard: a Kaggle
+// working tree holds the CMake build/ tree and the source clone next to the
+// checkpoints, and counting the regenerable build objects against a budget
+// sized for checkpoints+GGUF invents a phantom overflow that kills a healthy
+// run before step 1.
+size_t tree_size_bytes_excluding(const std::string& path,
+                                 const std::vector<std::string>& skip_dir_names,
+                                 size_t* unique_files = nullptr);
 
 void* device_alloc(size_t nbytes, Device dev, DType dt = DType::F32);
 void  device_free(void* ptr, Device dev);

@@ -37,7 +37,15 @@ fail_log() {
 }
 
 echo "=== [1/5] build + CPU tests ==="
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON > /tmp/verify_cmake.log 2>&1 \
+# -DGAI_ENABLE_PARQUET=ON is REQUIRED here, not cosmetic: the parquet lake is
+# the only training input, and this cell rebuilds build/ from scratch. Without
+# the flag, CMake falls back to GAI_ENABLE_PARQUET=OFF (the default) and every
+# later cell that calls `data_pipeline parquet` dies on a binary that was
+# compiled without Arrow.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON \
+  -DGAI_ENABLE_PARQUET=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')" \
+  > /tmp/verify_cmake.log 2>&1 \
   || fail_log "cmake configure" /tmp/verify_cmake.log
 cmake --build build -j2 > /tmp/verify_build.log 2>&1 \
   || fail_log "CUDA build -Werror" /tmp/verify_build.log
@@ -50,12 +58,23 @@ echo "=== [2/5] GPU parity (F-02/F-03/F-10) ==="
 pass "fused MoE + slot counters + CE accumulate match CPU"
 
 echo "=== [3/5] VRAM pre-flight (all shipped recipes) ==="
-for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 en_2xt4 sft_en_2xt4 sft_en_4xt4; do
+# Includes the 2xT4 1B pair, which is the DEFAULT recipe of kaggle/train_2xt4.sh.
+# Pricing those here means a recipe change is caught before the session burns
+# hours of GPU on a config that cannot fit.
+for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 \
+           en_2xt4 sft_en_2xt4 sft_en_4xt4 pro_1b_2xt4 sft_pro_1b_2xt4; do
   "${BIN}/gai_train" --config "configs/${cfg}.yaml" --dry-run --device cuda \
     > /tmp/verify_dry_${cfg}.log 2>&1 || fail "dry-run ${cfg}"
   grep -q "TOTAL" /tmp/verify_dry_${cfg}.log || fail "dry-run ${cfg} printed no TOTAL"
   pass "dry-run ${cfg}: $(grep 'TOTAL' /tmp/verify_dry_${cfg}.log | head -1)"
 done
+# The 1B pair is priced against the REAL per-GPU budget, not the 480M one:
+# the 2xT4 launcher uses the full-16 GB gate for 1B recipes.
+"${BIN}/gai_train" --config configs/pro_1b_2xt4.yaml --dry-run --device cuda \
+  --max-vram-mb 16384 > /tmp/verify_gate_1b.log 2>&1 || fail "VRAM gate (pro_1b_2xt4 must fit 16 GiB)"
+"${BIN}/gai_train" --config configs/sft_pro_1b_2xt4.yaml --dry-run --device cuda \
+  --max-vram-mb 16384 > /tmp/verify_gate_1b_sft.log 2>&1 || fail "VRAM gate (sft_pro_1b_2xt4 must fit 16 GiB)"
+pass "1B 2xT4 pair fits a 16 GB T4 with headroom"
 "${BIN}/gai_train" --config configs/en_pro.yaml --dry-run --device cuda \
   --max-vram-mb 15360 > /tmp/verify_gate.log 2>&1 || fail "VRAM gate (en_pro must fit 15 GiB)"
 pass "flagship fits 16 GB T4 with headroom"

@@ -55,19 +55,43 @@ grep -E "OOM guard|disk guard|host RAM guard|host RAM cannot|output quota guard"
 
 echo ""
 echo "----- [5/5] measured throughput -> honest plans -----"
-TOK_PER_STEP=$(( $(grep -m1 'batch_size:' "${CFG}" | tr -dc '0-9') * $(grep -m1 'seq_len:' "${CFG}" | tr -dc '0-9') * $(grep -m1 'grad_accum:' "${CFG}" | tr -dc '0-9') ))
+# ANCHORED greps. An unanchored 'seq_len:' also matches 'max_seq_len:' in the
+# model block ABOVE training.seq_len, so the pilot counted 4096 instead of
+# 1024 and promised 4x fewer steps than the session can actually run.
+# yget() below is the same anchored read the trainers use.
+yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+B=$(yget batch_size "${CFG}"); T=$(yget seq_len "${CFG}"); A=$(yget grad_accum "${CFG}")
+TOK_PER_STEP=$(( B * T * A ))
 TPS=$(( TOK_PER_STEP * 20 / ELAPSED ))
 echo "  pilot     : 20 steps in ${ELAPSED}s (includes model load + arena + first CUDA init)"
 LAST_TPS=$(grep -oE "[0-9.]+[KM]? tok/s" /tmp/cell8_pilot.log | tail -1)
 echo "  steady    : ${LAST_TPS} (from the last step line, excludes startup)"
-echo "  budget    : ${TOK_PER_STEP} tokens/step"
+echo "  budget    : ${TOK_PER_STEP} tokens/step (B=${B} T=${T} accum=${A})"
+# Corpus size is read from the shards themselves when possible, so the epoch
+# column cannot go stale the way a hardcoded 323.65M did.
+CORPUS_TOKENS=$(build/bin/data_pipeline inspect --shards "${SHARDS}" 2>/dev/null \
+    | awk '/^  total: /{v=$2;
+           if (v ~ /K$/) m=1000; else if (v ~ /M$/) m=1000000;
+           else if (v ~ /B$/) m=1000000000; else if (v ~ /T$/) m=1000000000000;
+           gsub(/[^0-9.]/,"",v); t+=v*m} END{printf "%.0f", t+0}')
+[[ "${CORPUS_TOKENS}" -gt 0 ]] || CORPUS_TOKENS=0
+if [[ "${CORPUS_TOKENS}" -gt 0 ]]; then
+    echo "  corpus    : ${CORPUS_TOKENS} tokens (from data_pipeline inspect)"
+else
+    echo "  corpus    : unknown (inspect failed) — the epoch column is blank"
+fi
 echo ""
-printf "  %-12s %10s %12s %14s\n" "budget" "steps" "tokens" "epochs(323.65M)"
+printf "  %-12s %10s %12s %14s\n" "budget" "steps" "tokens" "epochs"
 for H in 2 4 6 8 10; do
     STEPS=$(( H * 3600 * TPS / TOK_PER_STEP ))
+    if [[ "${CORPUS_TOKENS}" -gt 0 ]]; then
+        EP=$(awk -v s="${STEPS}" -v t="${TOK_PER_STEP}" -v c="${CORPUS_TOKENS}" \
+             'BEGIN{printf "%.2f", s*t/c}')
+    else
+        EP="-"
+    fi
     printf "  %-12s %10s %12s %14s\n" "${H}h" "${STEPS}" \
-        "$(( STEPS * TOK_PER_STEP / 1000000 ))M" \
-        "$(awk -v s="${STEPS}" -v t="${TOK_PER_STEP}" 'BEGIN{printf "%.2f", s*t/323650000}')"
+        "$(( STEPS * TOK_PER_STEP / 1000000 ))M" "${EP}"
 done
 echo ""
 echo "  NOTE: the step count above is a FIRST session. The trainer now keeps a"

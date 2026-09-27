@@ -383,16 +383,23 @@ print_device_report();
             // exactly 12B/param = 4 + 8). best+last are 2 files when they are
             // different steps (hardlink-shared when same step), so project
             // the 2-snapshot worst case + GGUF Q4 ~0.6GB.
+            // The floor MUST match the live guard (trainer.cpp:839-842)
+            // exactly, or a green preflight turns into a constructor failure
+            // after the whole setup has run.
             {
                 const i64 out_mb = args.has("output-budget-mb")
                     ? args.num_int("output-budget-mb", 0) : tcfg.output_budget_mb;
                 if (out_mb > 0) {
                     const size_t per_snap = static_cast<size_t>(params) * 4 + opt_b;
-                    // Conservative: 2 snapshots (best+last different steps) + GGUF Q4 ~0.6GB.
-                    const size_t proj = per_snap * 2 + (600ull << 20);
+                    // Identical to the live guard: 2 snapshots (best+last
+                    // different steps) + GGUF (params bytes + 1/8 snapshot).
+                    const size_t gguf = static_cast<size_t>(params) + per_snap / 8;
+                    const size_t proj = per_snap * 2 + gguf;
                     const size_t budget = static_cast<size_t>(out_mb) * 1024u * 1024u;
-                    log_info(strfmt("  output budget       : %s (proj snapshots+gguf %s)",
-                                    human_bytes(budget).c_str(), human_bytes(proj).c_str()));
+                    const size_t headroom = (budget > proj) ? budget - proj : 0;
+                    log_info(strfmt("  output budget       : %s (proj snapshots+gguf %s, %s left for existing data)",
+                                    human_bytes(budget).c_str(), human_bytes(proj).c_str(),
+                                    human_bytes(headroom).c_str()));
                     if (proj > budget)
                         GAI_FAIL(strfmt("projected output %s exceeds budget %s "
                                         "(2 snapshots %.1fGB + GGUF). Raise --output-budget-mb "

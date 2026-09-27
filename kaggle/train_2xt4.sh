@@ -168,6 +168,60 @@ echo "[nccl] WORLD_SIZE=2 MASTER=${MASTER_ADDR}:${MASTER_PORT} (all GPUs visible
 
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
+# ---------------- 2-RANK WATCHDOG ------------------------------------------
+# A dead rank leaves its sibling blocked FOREVER: training/distributed.cpp has
+# no NCCL timeout, so the survivor spins in cudaStreamSynchronize until Kaggle
+# kills the whole 12h session. A sequential `wait pid0; wait pid1` cannot save
+# it — wait(pid1) never returns, so the kill-orphans loop after it is
+# unreachable dead code. Instead reap the FIRST rank to exit, then give the
+# survivor a bounded grace window and SIGKILL it if it outlives the window.
+#
+# wait_ddp_ranks <label> <pid0> <pid1> [grace_seconds]
+#   0 = both ranks exited 0.  1 = a rank failed, or one had to be killed.
+# Uses `wait -n -p PID` (bash >= 5.1, which is what Kaggle ships) so we learn
+# WHICH rank finished. Without -p we cannot tell, so we conservatively treat
+# the first exit as a failure and kill the survivor immediately.
+wait_ddp_ranks() {
+    local label="$1" pid0="$2" pid1="$3" grace="${4:-180}"
+    local poll=5
+    local first="" fst=0
+    if wait -n -p first 2>/dev/null; then fst=0; else fst=$?; fi
+    if [[ -z "${first}" ]]; then
+        # No `wait -n -p` support: we cannot identify the rank. Fail fast
+        # rather than risk waiting on a wedged sibling.
+        echo "[${label}] a rank exited (status ${fst}) but this bash cannot report"
+        echo "[${label}] which one — killing the survivor rather than risk a hang."
+        kill -9 "${pid0}" "${pid1}" 2>/dev/null || true
+        return 1
+    fi
+    local other
+    if [[ "${first}" == "${pid0}" ]]; then other="${pid1}"; else other="${pid0}"; fi
+    if [[ "${fst}" -ne 0 ]]; then
+        echo "[${label}] rank pid ${first} exited ${fst} — killing sibling ${other}"
+        kill -9 "${other}" 2>/dev/null || true
+        wait "${other}" 2>/dev/null || true
+        return 1
+    fi
+    # The first rank exited cleanly. Its sibling runs the same collectives and
+    # should follow within seconds; if it does not, it is wedged in NCCL.
+    local waited=0
+    while kill -0 "${other}" 2>/dev/null && [[ "${waited}" -lt "${grace}" ]]; do
+        sleep "${poll}"; waited=$(( waited + poll ))
+    done
+    if kill -0 "${other}" 2>/dev/null; then
+        echo "[${label}] rank pid ${first} exited but ${other} survived ${grace}s"
+        echo "[${label}] — collective desync (NCCL hang). Killing it."
+        kill -9 "${other}" 2>/dev/null || true
+        wait "${other}" 2>/dev/null || true
+        return 1
+    fi
+    if ! wait "${other}" 2>/dev/null; then
+        echo "[${label}] the surviving rank ${other} exited non-zero"
+        return 1
+    fi
+    return 0
+}
+
 run_preflight() {
     echo ""
     echo "==================== preflight ===================="
@@ -290,11 +344,12 @@ for i in 0 1; do
     echo "  started rank $i (pid ${PIDS[$i]})"
 done
 FAIL=0
-for pid in "${PIDS[@]}"; do if ! wait "$pid"; then FAIL=1; fi; done
+# The pilot is small and symmetric, so the survivor gets only a short grace:
+# if it has not exited shortly after its sibling, it is wedged in NCCL.
+if ! wait_ddp_ranks "pilot" "${PIDS[0]}" "${PIDS[1]}" 120; then
+    FAIL=1
+fi
 [[ "${FAIL}" -eq 0 ]] || { echo "[pilot FAIL] a rank failed:"; tail -30 /tmp/pilot_2xt4_rank*.log; exit 1; }
-# Kill orphans (collective desync signature: sibling still alive).
-for pid in "${PIDS[@]}"; do if kill -0 "$pid" 2>/dev/null; then echo "[pilot FAIL] orphan rank ${pid} (collective hang)"; kill -9 "$pid" 2>/dev/null || true; FAIL=1; fi; done
-[[ "${FAIL}" -eq 0 ]] || exit 1
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START )); [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
 # Global tokens/step INCLUDES world_size (DDP contract, tested in code).
@@ -389,10 +444,16 @@ launch_ddp() {
         pids[$i]=$!
         echo "  rank $i pid ${pids[$i]}"
     done
-    local fail=0
-    for pid in "${pids[@]}"; do if ! wait "$pid"; then fail=1; fi; done
-    for pid in "${pids[@]}"; do if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fail=1; fi; done
-    [[ "$fail" -eq 0 ]] || { echo "[ERROR] a training rank failed, siblings killed"; return 1; }
+    # Rank 0 also writes the GGUF AFTER the last collective, so it legitimately
+    # outlives rank 1 by the export time. The survivor grace must cover that,
+    # or the watchdog kills a healthy rank 0 mid-export and the run "fails"
+    # after the checkpoint is already on disk.
+    local grace=$(( EXPORT_MARGIN_SEC + 300 ))
+    [[ "${EXPORT_GGUF}" -eq 0 ]] && grace=300
+    if ! wait_ddp_ranks "train" "${pids[0]}" "${pids[1]}" "${grace}"; then
+        echo "[ERROR] a training rank failed or hung; siblings killed"
+        return 1
+    fi
     return 0
 }
 

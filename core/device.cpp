@@ -7,6 +7,8 @@
 #include <new>
 #include <string>
 #include <set>
+#include <vector>
+#include <algorithm>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -75,6 +77,12 @@ size_t physical_ram_bytes() {
 }
 
 size_t tree_size_bytes(const std::string& path, size_t* unique_files) {
+    return tree_size_bytes_excluding(path, {}, unique_files);
+}
+
+size_t tree_size_bytes_excluding(const std::string& path,
+                                 const std::vector<std::string>& skip_dir_names,
+                                 size_t* unique_files) {
     std::error_code ec;
     if (!fs::exists(path, ec)) {
         if (unique_files) *unique_files = 0;
@@ -90,6 +98,16 @@ size_t tree_size_bytes(const std::string& path, size_t* unique_files) {
     for (fs::recursive_directory_iterator it(path, fs::directory_options::skip_permission_denied, ec), end;
          it != end; it.increment(ec)) {
         if (ec) break;
+        // A skipped directory is pruned whole (no descent), but its own size
+        // is not even attributed: the point of the exclusion is that the
+        // subtree is outside the measured budget entirely.
+        if (!skip_dir_names.empty() && it->is_directory(ec)) {
+            const std::string name = it->path().filename().string();
+            if (std::find(skip_dir_names.begin(), skip_dir_names.end(), name) != skip_dir_names.end()) {
+                it.disable_recursion_pending();
+                continue;
+            }
+        }
         if (!it->is_regular_file(ec)) continue;
         const FileId id = file_id_of(it->path().string());
         if (id.hi || id.lo) {

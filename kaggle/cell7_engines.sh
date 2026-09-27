@@ -31,6 +31,7 @@ bad()  { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
 step "[0/8] build from the pulled commit"
 echo "  commit: $(git log --oneline -1)"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGAI_ENABLE_CUDA=ON -DGAI_BUILD_TESTS=ON \
+  -DGAI_ENABLE_PARQUET=ON -DCMAKE_CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')" \
   > /tmp/cell7_cmake.log 2>&1 || { tail -25 /tmp/cell7_cmake.log; exit 1; }
 cmake --build build -j2 > /tmp/cell7_build.log 2>&1 \
   || { echo "  [FAIL] CUDA build -Werror"; tail -25 /tmp/cell7_build.log; exit 1; }
@@ -50,7 +51,23 @@ for t in ${TESTS}; do
 done
 
 step "[2/8] data quality on the REAL corpus (parquet -> text -> corpus_stats)"
-EN_LAKE="${EN_LAKE:-/kaggle/input/datasets/mohammedaminerhassan/ghassan-v1-pro-datasets/Users/Ghassan PC/Desktop/english_parquet}"
+# DISCOVER the lake instead of hardcoding a Kaggle slug: an attached dataset
+# nests arbitrarily deep (.../<slug>/Users/<name>/Desktop/english_parquet),
+# so a literal path breaks the moment the dataset is re-uploaded or renamed —
+# and the gate below then SILENTLY skips, which is worse than failing.
+# EN_LAKE still wins if the caller sets it.
+if [[ -z "${EN_LAKE:-}" ]]; then
+    EN_LAKE="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null \
+               | head -n 1 | xargs -r dirname)"
+fi
+if [[ -n "${EN_LAKE}" && -d "${EN_LAKE}" ]]; then
+    echo "  lake: ${EN_LAKE}"
+else
+    echo "  [FAIL] English parquet lake not found under /kaggle/input."
+    echo "         Attach the dataset, or export EN_LAKE=<dir> before running."
+    bad "lake discovery"
+    EN_LAKE=""
+fi
 if [[ -d "${EN_LAKE}" ]]; then
     for dom in english_chat english_instruction; do
         "${BIN}/data_pipeline" parquet-corpus --lake "${EN_LAKE}" --match "${dom}" \
