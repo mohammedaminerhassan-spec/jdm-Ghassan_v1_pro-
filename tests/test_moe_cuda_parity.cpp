@@ -73,7 +73,8 @@ static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
             return false;
         }
     }
-    std::cout << "  ok  " << what << "  max_abs " << max_abs << "  max_rel " << max_rel
+    std::cout << "  ok  " << what << "  max_abs " << max_abs << " (at ref " << worst
+              << ")  max_rel " << max_rel
               << "  (atol " << atol << ", rtol " << rtol << ", scale " << scale << ")\n";
     return true;
 }

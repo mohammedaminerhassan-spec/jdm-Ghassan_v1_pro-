@@ -46,7 +46,15 @@ function(gai_apply_cxx_flags target)
         # off: dispatch wrappers intentionally name all params for symmetry.
         # NOTE: -ffast-math is removed because -ffinite-math-only breaks std::isfinite/isnan
         # which is required for dynamic loss scaling to detect FP16 overflow.
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers)
+        # The two -Wunused-* are named EXPLICITLY: they are the ones that differ
+        # between the toolchains this project is built with. A newer local GCC
+        # accepted a variable that was set and never read, while the Kaggle
+        # image's GCC 11 failed the same file under -Werror, so the bug only
+        # surfaced on the machine that actually runs the build. Naming them
+        # makes the check portable instead of compiler-version-dependent.
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Werror
+            -Wno-unused-parameter -Wno-missing-field-initializers
+            -Wunused-but-set-variable -Wunused-variable)
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
         if(GAI_NATIVE_ARCH)
             target_compile_options(${target} PRIVATE -march=native)
