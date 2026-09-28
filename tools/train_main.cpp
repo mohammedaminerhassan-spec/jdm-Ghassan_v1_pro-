@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
+#include <string>
 #ifdef GAI_CUDA
 #include <cuda_runtime.h>
 #include "cuda/cuda_ops.h"
@@ -265,79 +266,47 @@ print_device_report();
             // F-23: ARITHMETIC ONLY. The old dry-run constructed the Model
             // first, so a 1B CPU dry-run exhausted host RAM (exit 137) before
             // printing the estimate it exists to print. Nothing is allocated
-            // here; Model::count_parameters() mirrors the constructor and
-            // tests/test_memory_plan.cpp keeps the two honest.
+            // here. price_recipe() (training/trainer.cpp) is the single source
+            // of truth and is shared with tests/test_recipe_gates.cpp, so the
+            // preflight gate and the unit test can never disagree about a
+            // recipe's cost.
             const Model::MemoryPlan plan = Model::plan_memory(
                 mcfg, tcfg.batch_size, tcfg.seq_len, /*with_grad=*/true, tcfg.ce_chunks,
                 tcfg.fp16_weight_cache);
-            size_t act = plan.activations;
-            if (tcfg.activation_checkpointing && tcfg.batch_size > 1) {
-                int seg = tcfg.ckpt_segments > 1 ? tcfg.ckpt_segments : 2;
-                if (seg > tcfg.batch_size) seg = tcfg.batch_size;
-                act = (act + static_cast<size_t>(seg) - 1) / static_cast<size_t>(seg);
-            }
-            const u64 params = plan.params;
-            const bool lion = (tcfg.optimizer == "lion");
-            const bool muon = (tcfg.optimizer == "muon");
-            // muon moments ~= lion (m everywhere + v on tiny norms) + NS scratch
-            size_t opt_b = (lion || muon) ? params * 4 : params * 8;
-            // P2-3: frozen embeddings carry no moments; don't overestimate.
-            if (tcfg.freeze_embeddings) {
-                const size_t frozen = static_cast<size_t>(mcfg.vocab_size) *
-                                      static_cast<size_t>(mcfg.hidden_size) *
-                                      ((lion || muon) ? 4 : 8);
-                opt_b = (opt_b >= frozen) ? opt_b - frozen : 0;
-            }
-            // Muon NS scratch [O|T|A]: max_rc*2+max_cc floats (was omitted ->
-            // dry-run under-reported Muon VRAM). Conservative: largest 2D
-            // matrix is [d,d] or [E,d]; use max(d*d, E*d)*2 + E*E.
-            size_t muon_scratch = 0;
-            if (muon) {
-                const size_t d = static_cast<size_t>(mcfg.hidden_size);
-                const size_t E = static_cast<size_t>(mcfg.moe_expert_dim);
-                const size_t rc = std::max(d * d, E * d);
-                const size_t cc = std::max(d * d, E * E);
-                muon_scratch = (rc * 2 + cc) * sizeof(float);
-            }
-            // Eval arena + workspaces + NCCL were omitted ( ~0.9GB under-report).
-            // Add them so the preflight gate matches the live guard.
-            const Model::WorkspacePlan wsp =
-                Model::workspace_plan(mcfg, tcfg.batch_size, tcfg.seq_len);
-            size_t eval_extra = 0;
-            {
-                // eval arena is roughly train arena without grads; approximate
-                // as 30% of train activations (rank0 work, resident on all).
-                eval_extra = act / 3;
-            }
-            size_t nccl_extra = tcfg.ddp ? (384ull << 20) : 0; // 320MB NCCL + 64MB staging
-            const size_t total = plan.static_total + opt_b + muon_scratch + act
-                               + eval_extra + wsp.gemm_bytes + wsp.moe_bytes + nccl_extra;
+            const RecipeCost cost = price_recipe(mcfg, tcfg);
+            const u64   params    = cost.params;
+            const size_t act      = cost.activations;
+            const size_t opt_b    = cost.opt_state;
+            const size_t total    = cost.total;
+            const bool   lion     = (tcfg.optimizer == "lion");
+            const bool   muon     = (tcfg.optimizer == "muon");
+            const size_t muon_scratch = cost.muon_scratch;
 
             log_info("---------------- dry run: memory estimate ----------------");
             log_info(strfmt("  parameters          : %s (%s without embeddings)",
                             human_count(params).c_str(),
                             human_count(plan.params_no_embedding).c_str()));
-            log_info(strfmt("  weights (fp32)      : %s", human_bytes(plan.weights).c_str()));
-            log_info(strfmt("  gradients (fp32)    : %s", human_bytes(plan.grads).c_str()));
+            log_info(strfmt("  weights (fp32)      : %s", human_bytes(cost.weights).c_str()));
+            log_info(strfmt("  gradients (fp32)    : %s", human_bytes(cost.grads).c_str()));
             log_info(strfmt("  %s (fp32)    : %s",
                             muon ? "muon m+v+NS " : lion ? "lion m      " : "adamw m+v   ",
                             human_bytes(opt_b).c_str()));
             log_info(strfmt("  fp16 weight cache  : %s%s",
-                            human_bytes(plan.fp16_cache).c_str(),
+                            human_bytes(cost.fp16_cache).c_str(),
                             tcfg.fp16_weight_cache ? "" : " (disabled)"));
             log_info(strfmt("  activations b=%d t=%d%s%s : %s",
                             tcfg.batch_size, tcfg.seq_len,
                             tcfg.activation_checkpointing ? " [ckpt]" : "",
-                            tcfg.ce_chunks > 1 ? strfmt(" [ce-x%d]", tcfg.ce_chunks).c_str() : "",
+                            tcfg.ce_chunks > 1 ? strfmt(" [ce-x%d]", tcfg.ce_chunks) : "",
                             human_bytes(act).c_str()));
             if (muon)
                 log_info(strfmt("  muon NS scratch     : %s", human_bytes(muon_scratch).c_str()));
-            log_info(strfmt("  eval arena (est)    : %s", human_bytes(eval_extra).c_str()));
+            log_info(strfmt("  eval arena (est)    : %s", human_bytes(cost.eval_extra).c_str()));
             log_info(strfmt("  workspaces gemm/moe : %s + %s",
-                            human_bytes(wsp.gemm_bytes).c_str(),
-                            human_bytes(wsp.moe_bytes).c_str()));
+                            human_bytes(cost.gemm_ws).c_str(),
+                            human_bytes(cost.moe_ws).c_str()));
             if (tcfg.ddp)
-                log_info(strfmt("  nccl/ddp extra      : %s", human_bytes(nccl_extra).c_str()));
+                log_info(strfmt("  nccl/ddp extra      : %s", human_bytes(cost.nccl).c_str()));
             log_info(strfmt("  sched %s | opt %s",
                             tcfg.scheduler.c_str(), tcfg.optimizer.c_str()));
             log_info(strfmt("  TOTAL               : %s", human_bytes(total).c_str()));
@@ -390,11 +359,13 @@ print_device_report();
                 const i64 out_mb = args.has("output-budget-mb")
                     ? args.num_int("output-budget-mb", 0) : tcfg.output_budget_mb;
                 if (out_mb > 0) {
-                    const size_t per_snap = static_cast<size_t>(params) * 4 + opt_b;
-                    // Identical to the live guard: 2 snapshots (best+last
-                    // different steps) + GGUF (params bytes + 1/8 snapshot).
-                    const size_t gguf = static_cast<size_t>(params) + per_snap / 8;
-                    const size_t proj = per_snap * 2 + gguf;
+                    const size_t per_snap = cost.snapshot;
+                    // Identical to the live guard (trainer.cpp quota block):
+                    // 2 snapshots (best+last published at different steps) +
+                    // GGUF (params bytes + 1/8 snapshot). All three figures
+                    // come from price_recipe so the preflight and the runtime
+                    // guard cannot drift apart.
+                    const size_t proj = cost.output_projection;
                     const size_t budget = static_cast<size_t>(out_mb) * 1024u * 1024u;
                     const size_t headroom = (budget > proj) ? budget - proj : 0;
                     log_info(strfmt("  output budget       : %s (proj snapshots+gguf %s, %s left for existing data)",
@@ -432,17 +403,36 @@ print_device_report();
         // optional export after training — produces a self-contained .gguf file
         // (tokenizer embedded; no sidecar needed). --compat llama gives a
         // dense-only file loadable by llama.cpp / ollama / LM Studio.
+        //
+        // DDP GUARD: only rank 0 writes. The export opens the target path with
+        // truncate and streams every tensor into it, so two ranks exporting to
+        // the SAME path interleave their writes and leave a truncated/corrupt
+        // file. kaggle/train_2xt4.sh only passes --export to rank 0, but that
+        // is an external convention; the guard belongs here so a direct
+        // `RANK=1 gai_train --export ...` cannot corrupt the artifact.
+        // Safe to return early: trainer.run() has returned, so every collective
+        // this rank was going to enter has already been entered.
         if (args.has("export")) {
-            std::string prof = args.str("export-profile", "fp16");
-            // P2-5: tokenizer.path from the yaml backs --tokenizer (CLI wins).
-            std::string tok_path = args.str("tokenizer", cfg.get_str("tokenizer.path", ""));
-            if (!args.has("tokenizer") && !tok_path.empty())
-                log_info("[cfg ] using tokenizer.path from yaml: " + tok_path);
-            export_model_gguf(args.str("export"), model, tok_path,
-                             gguf_profile_for(prof),
-                             {{"stage", cfg.get_str("training.stage", "pretrain")},
-                              {"steps", std::to_string(trainer.state().step)}},
-                             args.str("compat", "native"));
+            int my_rank = 0;
+            if (const char* rank_env = std::getenv("RANK")) {
+                const int r = std::atoi(rank_env);
+                if (r > 0) my_rank = r;
+            }
+            if (my_rank != 0) {
+                log_info("[export] rank " + std::to_string(my_rank) +
+                         ": skipping GGUF export (rank 0 owns the artifact)");
+            } else {
+                std::string prof = args.str("export-profile", "fp16");
+                // P2-5: tokenizer.path from the yaml backs --tokenizer (CLI wins).
+                std::string tok_path = args.str("tokenizer", cfg.get_str("tokenizer.path", ""));
+                if (!args.has("tokenizer") && !tok_path.empty())
+                    log_info("[cfg ] using tokenizer.path from yaml: " + tok_path);
+                export_model_gguf(args.str("export"), model, tok_path,
+                                  gguf_profile_for(prof),
+                                  {{"stage", cfg.get_str("training.stage", "pretrain")},
+                                   {"steps", std::to_string(trainer.state().step)}},
+                                  args.str("compat", "native"));
+            }
         }
         // GPU LEAK GUARANTEE: release monotonic CUDA workspaces (kernels/moe
         // pools grow to max-needed then reuse by design, not a leak) + cuBLAS

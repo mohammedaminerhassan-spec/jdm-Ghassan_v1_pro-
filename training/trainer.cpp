@@ -45,6 +45,74 @@ static bool split_shard_glob(const std::string& glob, std::string& dir, std::str
     return true;
 }
 
+// The one place a recipe is priced. `gai_train --dry-run` prints these numbers
+// and gates on them (--max-vram-mb / --output-budget-mb);
+// tests/test_recipe_gates.cpp asserts the same numbers for every shipped
+// config. Keep them in ONE function: a second copy of this arithmetic is how a
+// recipe ships in a state the preflight would have rejected.
+RecipeCost price_recipe(const ModelConfig& m, const TrainerConfig& t) {
+    RecipeCost c;
+    const Model::MemoryPlan plan = Model::plan_memory(
+        m, t.batch_size, t.seq_len, /*with_grad=*/true, t.ce_chunks,
+        t.fp16_weight_cache);
+    c.params     = plan.params;
+    c.weights    = plan.weights;
+    c.grads      = plan.grads;
+    c.fp16_cache = plan.fp16_cache;
+
+    size_t act = plan.activations;
+    if (t.activation_checkpointing && t.batch_size > 1) {
+        int seg = t.ckpt_segments > 1 ? t.ckpt_segments : 2;
+        if (seg > t.batch_size) seg = t.batch_size;
+        act = (act + static_cast<size_t>(seg) - 1) / static_cast<size_t>(seg);
+    }
+    c.activations = act;
+
+    const bool lion  = (t.optimizer == "lion");
+    const bool muon  = (t.optimizer == "muon");
+    size_t opt_b = (lion || muon) ? static_cast<size_t>(plan.params) * 4
+                                   : static_cast<size_t>(plan.params) * 8;
+    if (t.freeze_embeddings) {
+        const size_t per = static_cast<size_t>(m.vocab_size) *
+                           static_cast<size_t>(m.hidden_size) *
+                           static_cast<size_t>((lion || muon) ? 4 : 8);
+        opt_b = (opt_b >= per) ? opt_b - per : 0;
+    }
+    if (muon) {
+        // Newton-Schulz scratch [O|T|A] for the largest 2-D matrix. Kept as its
+        // own field (not derived by subtraction) so freeze_embeddings cannot
+        // make the printed "muon NS scratch" line wrong.
+        const size_t d  = static_cast<size_t>(m.hidden_size);
+        const size_t E  = static_cast<size_t>(m.moe_expert_dim);
+        const size_t rc = std::max(d * d, E * d);
+        const size_t cc = std::max(d * d, E * E);
+        c.muon_scratch = (rc * 2 + cc) * sizeof(float);
+        opt_b += c.muon_scratch;
+    }
+    c.opt_state = opt_b;
+
+    // Eval arena is roughly the train arena without grads and is resident only
+    // on rank 0; a third of it is the conservative estimate the gate uses.
+    c.eval_extra = act / 3;
+
+    const Model::WorkspacePlan wsp =
+        Model::workspace_plan(m, t.batch_size, t.seq_len);
+    c.gemm_ws = wsp.gemm_bytes;
+    c.moe_ws  = wsp.moe_bytes;
+    c.nccl    = t.ddp ? (384ull << 20) : 0;  // 320 MB comms + 64 MB staging
+
+    c.total = c.weights + c.grads + c.fp16_cache + c.opt_state + c.activations +
+              c.eval_extra + c.gemm_ws + c.moe_ws + c.nccl;
+
+    // A snapshot is weights + optimizer moments. NEVER grads: capture_common()
+    // clones p->w only, and counting grads invented a phantom +4 GB/1B that
+    // could falsely fail the RAM/disk/quota guards.
+    c.snapshot = static_cast<size_t>(plan.params) * 4 + opt_b;
+    c.gguf     = static_cast<size_t>(plan.params) + c.snapshot / 8;
+    c.output_projection = c.snapshot * 2 + c.gguf;
+    return c;
+}
+
 TrainerConfig TrainerConfig::from_config(const Config& c, bool strict) {
     TrainerConfig t;
     t.data_dir       = c.get_str ("training.data_dir", t.data_dir);
@@ -1221,6 +1289,18 @@ double Trainer::evaluate(i64 max_batches) {
     double total = 0.0;
     i64    ntok_total = 0;
     Batch batch;
+    // Router jitter is TRAIN-ONLY exploration noise (ops.h). Both routers
+    // already gate it on the training path (cuda/moe.cu k_route: `train =
+    // probs != nullptr`; core/ops_moe.cpp: `jj > 0 && probs_cache`), and eval
+    // forwards pass no probs cache, so this is defence in depth rather than a
+    // live bug: it makes "eval is never routed noisily" an explicit property of
+    // this function instead of an invariant spread across two kernels, and it
+    // keeps a future eval path that allocates a cache from silently inheriting
+    // jitter. The RESTORE is the part that matters — zeroing without putting
+    // the training value back would leave every step after the first eval
+    // training with a dead router.
+    const float jit_saved = ops::moe_jitter();
+    if (jit_saved != 0.0f) ops::set_moe_jitter(0.0f);
     for (i64 i = 0; i < max_batches; ++i) {
         if (!val_loader_.next(batch)) break;
 
@@ -1242,6 +1322,7 @@ double Trainer::evaluate(i64 max_batches) {
         total += sum;
         ntok_total += n;
     }
+    if (jit_saved != 0.0f) ops::set_moe_jitter(jit_saved);
     return ntok_total > 0 ? total / static_cast<double>(ntok_total) : 0.0;
 }
 
@@ -1636,8 +1717,14 @@ void Trainer::run_pretrain() {
                 std::string bal = model_.moe_balance_report();
                 if (!bal.empty()) log_info("  >> " + bal);
                 model_.moe_balance_reset();
-                log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %.4f]",
-                                vl, std::exp(std::min(20.0, vl)), state_.best_val));
+                // best_val starts at the 1e30 "no best yet" sentinel, and
+                // "%.4f" on that prints 1000000000000000019884624838656.0000 —
+                // the first validation of every run logs a garbage number. Show
+                // a dash until a real best exists.
+                log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %s]",
+                                vl, std::exp(std::min(20.0, vl)),
+                                state_.best_val < 1e29 ? strfmt("%.4f", state_.best_val).c_str()
+                                                       : "-"));
                 is_best = (vl < state_.best_val);
                 if (is_best) state_.best_val = vl;
             } else {
@@ -1794,8 +1881,14 @@ void Trainer::run_sft() {
                 std::string bal = model_.moe_balance_report();
                 if (!bal.empty()) log_info("  >> " + bal);
                 model_.moe_balance_reset();
-                log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %.4f]",
-                                vl, std::exp(std::min(20.0, vl)), state_.best_val));
+                // best_val starts at the 1e30 "no best yet" sentinel, and
+                // "%.4f" on that prints 1000000000000000019884624838656.0000 —
+                // the first validation of every run logs a garbage number. Show
+                // a dash until a real best exists.
+                log_info(strfmt("  >> val loss %.4f  (ppl %.2f)  [best %s]",
+                                vl, std::exp(std::min(20.0, vl)),
+                                state_.best_val < 1e29 ? strfmt("%.4f", state_.best_val).c_str()
+                                                       : "-"));
                 is_best = (vl < state_.best_val);
                 if (is_best) state_.best_val = vl;
             } else {

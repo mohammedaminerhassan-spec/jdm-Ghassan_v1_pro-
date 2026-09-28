@@ -155,6 +155,12 @@ fi
 export NCCL_DEBUG=WARN
 export NCCL_SOCKET_IFNAME=^docker0,lo
 export NCCL_IB_DISABLE=1
+# Belt-and-braces on top of wait_ddp_ranks(): if a rank ever wedges INSIDE a
+# collective, NCCL's own watchdog aborts the job instead of parking the
+# survivor in cudaStreamSynchronize until Kaggle kills the whole session.
+# NCCL_COMM_WATCHDOG_TIMEOUT is the real variable (seconds); there is no
+# NCCL_TIMEOUT / NCCL_ASYNC_ERROR_HANDLING in modern NCCL.
+export NCCL_COMM_WATCHDOG_TIMEOUT=${NCCL_COMM_WATCHDOG_TIMEOUT:-600}
 export MASTER_ADDR=${MASTER_ADDR:-localhost}
 export MASTER_PORT=${MASTER_PORT:-29500}
 # Concurrent sessions on one host: override MASTER_PORT per run
@@ -378,13 +384,22 @@ cleanup_pilot() {
 # as orphans, burning the GPU for the rest of the session with nobody waiting
 # for them. Trap every path and make the handler idempotent.
 trap 'cleanup_pilot; persist_output' EXIT INT TERM
+# The pilot writes to a THROWAWAY checkpoint dir, never ${CKPT_PT}. The trainer
+# always publishes an unconditional last.ckpt when it finishes (trainer.cpp
+# run_pretrain tail), so pointing the pilot at the real dir left a step-N
+# last.ckpt behind; stage A then started with `--resume auto`, inherited those
+# N steps (trained at --warmup 0, i.e. full peak LR on a random init) and
+# logged a bogus "[sched] RESUME MISMATCH". It also spent real output quota on
+# a throwaway snapshot. /tmp is outside the /kaggle/working quota root.
+PILOT_CKPT="${PILOT_CKPT:-/tmp/gai_pilot_2xt4}"
+rm -rf "${PILOT_CKPT}"; mkdir -p "${PILOT_CKPT}"
 for i in 0 1; do
     RANK=$i LOCAL_RANK=$i "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
         --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
-        --checkpoint-dir "${CKPT_PT}" --output-budget-mb "${OUTPUT_BUDGET_MB}" \
+        --checkpoint-dir "${PILOT_CKPT}" --output-budget-mb "${OUTPUT_BUDGET_MB}" \
         > "/tmp/pilot_2xt4_rank${i}.log" 2>&1 &
     PIDS[$i]=$!
-    echo "  started rank $i (pid ${PIDS[$i]})"
+    echo "  started rank $i (pid ${PIDS[$i]}, ckpt -> ${PILOT_CKPT})"
 done
 FAIL=0
 # The pilot is small and symmetric, so the survivor gets only a short grace:

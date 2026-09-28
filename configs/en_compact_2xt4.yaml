@@ -116,7 +116,17 @@ training:
 data:
   train_glob: artifacts/shards_en/train_*.gbin
   val_glob: artifacts/shards_en/val_*.gbin
+  # Stage-1 (broad) curriculum. english_behavior is deliberately 0.00 HERE:
+  # it is only ~2M tokens of ~325 authored templates, so any non-trivial
+  # share of a ~100M-token stage-1 budget re-reads every authored line
+  # 5-10 times and the model memorises persona phrasings instead of style.
+  # Persona is taught in stage 2 (sft_en_compact_2xt4.yaml) where the budget
+  # is small enough for the repetition to be the point.
+  # NOTE: these shards carry assistant-span loss masks (data_pipeline
+  # `parquet --mode chat`), and Trainer applies masks in EVERY stage
+  # (trainer.cpp:133). So stage 1 is masked-assistant SFT on a chat-heavy
+  # mix, not classical full-text pretraining. Only assistant tokens
+  # (~40-50% of the corpus) contribute to the loss and to the real D/N.
   mix:
-    english_chat: 0.55
+    english_chat: 0.70
     english_instruction: 0.30
-    english_behavior: 0.15

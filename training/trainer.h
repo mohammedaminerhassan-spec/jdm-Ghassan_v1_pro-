@@ -180,6 +180,33 @@ struct TrainerConfig {
     }
 };
 
+// Single source of truth for "what does this recipe cost?".
+//
+// `gai_train --dry-run` (the Kaggle preflight gate) and
+// tests/test_recipe_gates.cpp BOTH call this. The duplication that used to
+// exist between them is exactly the rot that lets a config ship a change the
+// preflight would have rejected: the gate and the unit test must price a
+// recipe the same way or the test proves nothing. Pure arithmetic — nothing is
+// allocated, so a 1B recipe can be priced on any machine.
+struct RecipeCost {
+    u64    params           = 0;  // parameter elements
+    size_t weights          = 0;  // fp32 masters
+    size_t grads            = 0;  // fp32 gradients
+    size_t opt_state        = 0;  // adamw m+v / lion m / muon m+v+NS scratch
+    size_t muon_scratch     = 0;  // the NS part of opt_state (0 unless muon)
+    size_t fp16_cache       = 0;  // persistent fp16 weight cache (0 when off)
+    size_t activations      = 0;  // peak training arena at (B,T)
+    size_t eval_extra       = 0;  // rank-0 eval arena estimate
+    size_t gemm_ws          = 0;  // CUDA GEMM/SCE pool
+    size_t moe_ws           = 0;  // CUDA MoE pool
+    size_t nccl             = 0;  // NCCL comms + staging
+    size_t total            = 0;  // predicted per-GPU peak VRAM
+    size_t snapshot         = 0;  // one checkpoint (weights + moments, NO grads)
+    size_t gguf             = 0;  // rough final GGUF (q4-ish) size
+    size_t output_projection = 0; // 2 snapshots + gguf (the quota projection)
+};
+RecipeCost price_recipe(const ModelConfig& m, const TrainerConfig& t);
+
 class Trainer {
 public:
     Trainer(Model& model, TrainerConfig cfg);
