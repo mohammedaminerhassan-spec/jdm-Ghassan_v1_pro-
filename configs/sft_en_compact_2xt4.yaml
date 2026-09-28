@@ -46,12 +46,12 @@ training:
   gemm_fp16: true
   fp16_weight_cache: true
   ce_chunks: 4
-  loss_scale_init: 8192
-  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  loss_scale_init: 1024     # MEASURED on T4 (this model): 8192 overflows on every step
+  loss_scale_max: 2048      # the window is 2000 clean steps and this stage runs fewer
   loss_scale_window: 2000
   batch_size: 1
-  seq_len: 4096
-  grad_accum: 4             # 1*4096*4*2GPUs = 32,768 global (== sft_en_2xt4)
+  seq_len: 2048
+  grad_accum: 8             # 1*2048*8*2GPUs = 32,768 global (== sft_en_2xt4)
   max_steps: 0
   epochs: 3
   learning_rate: 2.4e-4
