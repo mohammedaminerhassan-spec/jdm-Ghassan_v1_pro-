@@ -840,7 +840,24 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                 "build", "build_test", "build_cpu", "out", ".git", ".cache", "ccache"
             };
             size_t unique_files = 0;
-            const size_t used = tree_size_bytes_excluding(root.string(), skip_dirs, &unique_files);
+            size_t used = tree_size_bytes_excluding(root.string(), skip_dirs, &unique_files);
+            // The SFT stage loads its pretrain checkpoint into memory at
+            // construction and never reads the file again, and the launcher
+            // deletes the pretrain stage's directory once SFT is under way.
+            // Counting those bytes here made the two-stage flow impossible in
+            // one session: stage A's last.ckpt (5.8 GB at 480M) plus stage B's
+            // own transient (2 x 5.8 GB) blew the budget on their own, so
+            // stage B was refused in the constructor after the whole pretrain
+            // had run. Excluding the file measures what this run actually keeps.
+            size_t freed_pretrained = 0;
+            if (cfg_.is_sft() && !cfg_.pretrained_checkpoint.empty()) {
+                std::error_code fec;
+                const auto psize = fs::file_size(fs::path(cfg_.pretrained_checkpoint), fec);
+                if (!fec && psize > 0 && psize <= used) {
+                    freed_pretrained = static_cast<size_t>(psize);
+                    used -= freed_pretrained;
+                }
+            }
             size_t ckpt_files = 0;
             const size_t ckpt_now = tree_size_bytes(cfg_.checkpoint_dir, &ckpt_files);
             // One snapshot (published under 1-2 names) + the .tmp being written.
@@ -852,6 +869,11 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
                             human_bytes(budget).c_str(), human_bytes(used).c_str(),
                             root.string().c_str(), unique_files,
                             human_bytes(ckpt_now).c_str()));
+            if (freed_pretrained > 0) {
+                log_info(strfmt("[quota] excluding %s of pretrain checkpoint (loaded into "
+                                "memory at construction, not kept by this run)",
+                                human_bytes(freed_pretrained).c_str()));
+            }
             log_info(strfmt("[quota] projected peak = %s (current %s + save transient %s + gguf %s)",
                             human_bytes(projected).c_str(), human_bytes(used).c_str(),
                             human_bytes(transient).c_str(), human_bytes(gguf).c_str()));

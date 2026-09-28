@@ -78,6 +78,10 @@ if [[ -z "${EXPORT_MARGIN_SEC}" ]]; then
 fi
 PT_FRACTION=60
 SKIP_PREFLIGHT=0
+# Keep the pretrain stage's checkpoints after SFT. Default 0: SFT already holds
+# the trained weights and the GGUF is the deliverable, and a 480M AdamW snapshot
+# is 5.8 GB that Kaggle's 20 GB saved-output cap cannot afford to keep twice.
+KEEP_PT_CKPTS="${KEEP_PT_CKPTS:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -463,11 +467,29 @@ T0=$(date +%s)
 launch_ddp "${CONFIG_PT}" "${CKPT_PT}" "${PT_DIR}" "${PT_STEPS}" "${PT_WARM}"
 echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 
+# Drop the pretrain stage's best.ckpt before SFT starts. SFT only ever reads
+# last.ckpt (training.pretrained_checkpoint), and keeping a second full
+# snapshot doubled the bytes on disk for nothing — enough on its own to push
+# stage B past the output quota on a single session.
+if [[ -f "${CKPT_PT}/best.ckpt" && "${KEEP_PT_CKPTS}" -eq 0 ]]; then
+    PT_BEST_SZ=$(du -m "${CKPT_PT}/best.ckpt" 2>/dev/null | cut -f1)
+    rm -f "${CKPT_PT}/best.ckpt" && echo "[clean] removed ${CKPT_PT}/best.ckpt (${PT_BEST_SZ} MB)"
+fi
+
 echo ""
 echo "[stage-B] SFT 2xT4 (${SFT_STEPS} steps)..."
 T0=$(date +%s)
 launch_ddp "${CONFIG_SFT}" "${CKPT_SFT}" "${SFT_DIR}" "${SFT_STEPS}" "${SFT_WARM}"
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
+
+# The SFT ranks have loaded the pretrain weights into GPU memory by now, so
+# the whole pretrain checkpoint directory is dead weight for the rest of the
+# session. Freeing it here is what lets the final saved output hold the SFT
+# checkpoints AND the GGUF inside Kaggle's cap.
+if [[ -d "${CKPT_PT}" && "${KEEP_PT_CKPTS}" -eq 0 ]]; then
+    PT_SZ=$(du -sm "${CKPT_PT}" 2>/dev/null | cut -f1)
+    rm -rf "${CKPT_PT}" && echo "[clean] removed pretrain ckpt dir (${PT_SZ} MB) — SFT holds the weights"
+fi
 
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""

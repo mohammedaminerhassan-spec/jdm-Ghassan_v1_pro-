@@ -1,0 +1,112 @@
+# Ghassan v1 Compact — English PRETRAIN for Kaggle 2xT4 DDP.
+#
+# Why this recipe exists
+# ----------------------
+# The 1B recipe (pro_1b_2xt4) cannot be trained well inside one Kaggle
+# session: at ~612M active params a T4 pair yields roughly 17M tokens in 8h,
+# which is 0.03 tokens per parameter. The parameters are allocated but never
+# trained, and the model comes out incoherent. The 480M recipe triples the
+# token budget; this one goes further and lands near the compute-optimal ratio
+# for a single-session budget.
+#
+#   recipe          active    tokens/8h (est)   D/N        verdict
+#   pro_1b_2xt4     612M      ~17M               0.016      undertrained
+#   en_2xt4         204M      ~52M               0.11       undertrained
+#   en_compact_2xt4  ~48M      ~215M              ~2.2       usable
+#
+# Architecture: the same MoE/GQA/QK-norm design as the rest of the family, at a
+# size that fits the data budget rather than the VRAM budget. Checkpoint size is
+# ~1.4 GB, so both stages plus the GGUF fit one session with room to spare.
+#
+# DDP contract (data-parallel, NOT sharded): each rank owns a FULL replica and
+# must stay well under 16 GB on its own T4.
+#   global tokens/update = B * T * accum * world = 2*512*32*2 = 65,536
+#   (identical to en_2xt4's 2*1024*16*2 = 65,536, so the optimizer-step
+#   schedule and total-token budget match the other recipes; 2 ranks give
+#   ~2x tok/s, not 2x batch. LR is NOT scaled with world size.)
+# Run: CONFIG_PT=configs/en_compact_2xt4.yaml \
+#      CONFIG_SFT=configs/sft_en_compact_2xt4.yaml \
+#      bash kaggle/train_2xt4.sh
+model:
+  vocab_size: 32000
+  hidden_size: 512
+  num_layers: 12
+  num_heads: 8
+  num_kv_heads: 2
+  intermediate_size: 1408   # dense fallback only (unused when use_moe=true)
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true      # embeddings are 16.4M of the ~62M total: tying keeps them in every token
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 512
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_aux_free: false
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0
+  rope_yarn_high: 32.0
+  sliding_window: 0
+  rope_type: 0
+
+tokenizer:
+  path: artifacts/tokenizer/english32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  fp16_weight_cache: true
+  ce_chunks: 4
+  loss_scale_init: 8192
+  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  loss_scale_window: 2000
+  batch_size: 4
+  seq_len: 512
+  grad_accum: 16            # 4*512*16*2GPUs = 65,536 global (== en_2xt4)
+  max_steps: 0
+  epochs: 2
+  learning_rate: 6.0e-4    # small model wants a higher LR than the 1B recipe
+  min_lr_ratio: 0.1
+  warmup_steps: 300
+  optimizer: adamw          # ~62M params: plenty of headroom for AdamW's 2 moments
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  grad_clip: 1.0
+  ns_steps: 5
+  muon_min_ns_dim: 256
+  muon_vec_ratio: 0.1
+  seed: 314
+  log_every: 20
+  eval_every: 500
+  eval_batches: 20
+  save_every: 1000
+  checkpoint_dir: artifacts/checkpoints/en_compact_2xt4
+  data_dir: artifacts/shards_en
+  resume: auto
+  activation_checkpointing: false   # plenty of VRAM at this size; keep it fast
+  ckpt_segments: 1
+  pack_sequences: true
+  ddp: true
+  output_budget_mb: 17408
+
+data:
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
+  mix:
+    english_chat: 0.55
+    english_instruction: 0.30
+    english_behavior: 0.15
