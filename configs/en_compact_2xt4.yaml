@@ -20,10 +20,18 @@
 #
 # DDP contract (data-parallel, NOT sharded): each rank owns a FULL replica and
 # must stay well under 16 GB on its own T4.
-#   global tokens/update = B * T * accum * world = 2*512*32*2 = 65,536
-#   (identical to en_2xt4's 2*1024*16*2 = 65,536, so the optimizer-step
-#   schedule and total-token budget match the other recipes; 2 ranks give
-#   ~2x tok/s, not 2x batch. LR is NOT scaled with world size.)
+#   global tokens/update = B * T * accum * world = 2*1024*16*2 = 65,536
+#   (identical to en_2xt4's 2*1024*16*2, so the optimizer-step schedule and the
+#   total-token budget match the rest of the family; 2 ranks give ~2x tok/s,
+#   not 2x batch. LR is NOT scaled with world size.)
+#
+# B=2 T=1024 rather than B=4 T=512: the tokens per micro-step are identical, so
+# throughput and VRAM are unchanged (activations scale with B*T), but the shards
+# were windowed at 1024 and the mean conversation is ~360 tokens, so a 1024
+# window packs two or three real conversations per sequence instead of one.
+# The loader marks every document with a segment id, so attention does not bleed
+# across the boundary, and the model still learns what to do after <|end|> —
+# which is exactly the turn-taking behaviour a chat model needs.
 # Run: CONFIG_PT=configs/en_compact_2xt4.yaml \
 #      CONFIG_SFT=configs/sft_en_compact_2xt4.yaml \
 #      bash kaggle/train_2xt4.sh
@@ -70,9 +78,9 @@ training:
   loss_scale_init: 8192
   loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
   loss_scale_window: 2000
-  batch_size: 4
-  seq_len: 512
-  grad_accum: 16            # 4*512*16*2GPUs = 65,536 global (== en_2xt4)
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 16           # 2*1024*16*2GPUs = 65,536 global (== en_2xt4)
   max_steps: 0
   epochs: 2
   learning_rate: 6.0e-4    # small model wants a higher LR than the 1B recipe

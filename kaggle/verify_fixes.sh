@@ -62,7 +62,8 @@ echo "=== [3/5] VRAM pre-flight (all shipped recipes) ==="
 # Pricing those here means a recipe change is caught before the session burns
 # hours of GPU on a config that cannot fit.
 for cfg in en_pro pro_v1 t4_1b pro_auxfree en_ollama sft_en_pro sft_pro_v1 \
-           en_2xt4 sft_en_2xt4 sft_en_4xt4 pro_1b_2xt4 sft_pro_1b_2xt4; do
+           en_2xt4 sft_en_2xt4 sft_en_4xt4 pro_1b_2xt4 sft_pro_1b_2xt4 \
+           en_compact_2xt4 sft_en_compact_2xt4; do
   "${BIN}/gai_train" --config "configs/${cfg}.yaml" --dry-run --device cuda \
     > /tmp/verify_dry_${cfg}.log 2>&1 || fail "dry-run ${cfg}"
   grep -q "TOTAL" /tmp/verify_dry_${cfg}.log || fail "dry-run ${cfg} printed no TOTAL"
@@ -75,6 +76,13 @@ done
 "${BIN}/gai_train" --config configs/sft_pro_1b_2xt4.yaml --dry-run --device cuda \
   --max-vram-mb 16384 > /tmp/verify_gate_1b_sft.log 2>&1 || fail "VRAM gate (sft_pro_1b_2xt4 must fit 16 GiB)"
 pass "1B 2xT4 pair fits a 16 GB T4 with headroom"
+# The compact recipe is the one train_2xt4.sh is meant to run by default: it
+# uses a quarter of the card, so it must pass with a very large margin.
+"${BIN}/gai_train" --config configs/en_compact_2xt4.yaml --dry-run --device cuda \
+  --max-vram-mb 16384 > /tmp/verify_gate_compact.log 2>&1 || fail "VRAM gate (en_compact_2xt4 must fit 16 GiB)"
+"${BIN}/gai_train" --config configs/sft_en_compact_2xt4.yaml --dry-run --device cuda \
+  --max-vram-mb 16384 > /tmp/verify_gate_compact_sft.log 2>&1 || fail "VRAM gate (sft_en_compact_2xt4 must fit 16 GiB)"
+pass "compact pair fits a 16 GB T4 with headroom"
 "${BIN}/gai_train" --config configs/en_pro.yaml --dry-run --device cuda \
   --max-vram-mb 15360 > /tmp/verify_gate.log 2>&1 || fail "VRAM gate (en_pro must fit 15 GiB)"
 pass "flagship fits 16 GB T4 with headroom"

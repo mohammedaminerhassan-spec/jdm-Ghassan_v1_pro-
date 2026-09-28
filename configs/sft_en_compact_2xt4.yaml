@@ -2,7 +2,7 @@
 # Stage 2 after en_compact_2xt4 pretrain. Keep this file's model.* block
 # byte-identical to en_compact_2xt4.yaml or resume fails the architecture gate.
 #
-# DDP contract: per-GPU B=4 T=512, accum=8 => global 4*512*8*2 = 32,768
+# DDP contract: per-GPU B=2 T=1024, accum=8 => global 2*1024*8*2 = 32,768
 # (same global batch as the pretrain stage; LR NOT scaled with world size).
 # Mix includes english_behavior (persona/discipline seasoning from
 # build_english_data.sh [3/3]); preflight fails if its shards are missing.
@@ -49,9 +49,9 @@ training:
   loss_scale_init: 8192
   loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
   loss_scale_window: 2000
-  batch_size: 4
-  seq_len: 512
-  grad_accum: 8             # 4*512*8*2GPUs = 32,768 global (== sft_en_2xt4)
+  batch_size: 2
+  seq_len: 1024
+  grad_accum: 8             # 2*1024*8*2GPUs = 32,768 global (== sft_en_2xt4)
   max_steps: 0
   epochs: 3
   learning_rate: 2.4e-4
