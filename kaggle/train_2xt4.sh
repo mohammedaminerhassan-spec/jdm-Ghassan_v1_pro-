@@ -395,10 +395,26 @@ YAML_PT_WARM=$(yget warmup_steps "${CONFIG_PT}");  [[ "${YAML_PT_WARM}" =~ ^[0-9
 YAML_SFT_WARM=$(yget warmup_steps "${CONFIG_SFT}"); [[ "${YAML_SFT_WARM}" =~ ^[0-9]+$ ]] || YAML_SFT_WARM=200
 PT_WARM=$(( PT_STEPS / 10 ));  [[ "${PT_WARM}" -gt "${YAML_PT_WARM}" ]] && PT_WARM="${YAML_PT_WARM}"
 SFT_WARM=$(( SFT_STEPS / 10 )); [[ "${SFT_WARM}" -gt "${YAML_SFT_WARM}" ]] && SFT_WARM="${YAML_SFT_WARM}"
-[[ "${PT_WARM}" -lt 50 ]] && PT_WARM=50
-[[ "${SFT_WARM}" -lt 50 ]] && SFT_WARM=50
-echo "[plan] warmup PT=${PT_WARM} (yaml ${YAML_PT_WARM}) SFT=${SFT_WARM} (yaml ${YAML_SFT_WARM})"
-EVAL_CAD=$(( TOTAL_STEPS / 10 )); [[ "${EVAL_CAD}" -lt 50 ]] && EVAL_CAD=50
+# A 50-step floor is a FLOOR, not a target: when the whole stage is only a few
+# hundred steps, a 50-step warmup is 10-20% of it, but on a 200-step stage it
+# would be a quarter of the run spent ramping the LR. Cap it at 8% of the
+# stage so a slow pilot cannot turn the entire budget into warmup and leave the
+# model barely trained (which is exactly what happened at 1000 tok/s).
+PT_FLOOR=$(( PT_STEPS / 12 )); [[ "${PT_FLOOR}" -lt 20 ]] && PT_FLOOR=20
+SFT_FLOOR=$(( SFT_STEPS / 12 )); [[ "${SFT_FLOOR}" -lt 15 ]] && SFT_FLOOR=15
+[[ "${PT_WARM}" -lt "${PT_FLOOR}" ]] && PT_WARM="${PT_FLOOR}"
+[[ "${SFT_WARM}" -lt "${SFT_FLOOR}" ]] && SFT_WARM="${SFT_FLOOR}"
+# And never let warmup eat the stage: a warmup at or past the total would
+# never reach peak LR at all.
+[[ "${PT_WARM}" -ge "${PT_STEPS}" ]] && PT_WARM=$(( PT_STEPS > 1 ? PT_STEPS - 1 : 1 ))
+[[ "${SFT_WARM}" -ge "${SFT_STEPS}" ]] && SFT_WARM=$(( SFT_STEPS > 1 ? SFT_STEPS - 1 : 1 ))
+echo "[plan] warmup PT=${PT_WARM}/${PT_STEPS} (yaml ${YAML_PT_WARM}) SFT=${SFT_WARM}/${SFT_STEPS} (yaml ${YAML_SFT_WARM})"
+# Same floor-vs-target problem as warmup: eval_every=50 on a 300-step stage
+# evaluates 6 times, which is fine, but on a 150-step stage it would evaluate
+# every third step and spend real time on validation instead of training. One
+# eval per 12% of the run, with a small floor.
+EVAL_CAD=$(( TOTAL_STEPS / 8 )); [[ "${EVAL_CAD}" -lt 25 ]] && EVAL_CAD=25
+[[ "${EVAL_CAD}" -ge "${TOTAL_STEPS}" ]] && EVAL_CAD=$(( TOTAL_STEPS > 1 ? TOTAL_STEPS - 1 : 1 ))
 echo "[plan] budget=${TIME_BUDGET_MIN}min remain~=${REMAIN_SEC}s total=${TOTAL_STEPS} (PT=${PT_STEPS} SFT=${SFT_STEPS}) ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens"
 
 # How much of the corpus does that plan actually cover? The decision "is one
