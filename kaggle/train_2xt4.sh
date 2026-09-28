@@ -185,42 +185,68 @@ yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space
 # Uses `wait -n -p PID` (bash >= 5.1, which is what Kaggle ships) so we learn
 # WHICH rank finished. Without -p we cannot tell, so we conservatively treat
 # the first exit as a failure and kill the survivor immediately.
+# ---------------- 2-RANK WATCHDOG ------------------------------------------
+# A dead rank leaves its sibling blocked FOREVER: training/distributed.cpp has
+# no NCCL timeout, so the survivor spins in cudaStreamSynchronize until Kaggle
+# kills the whole 12h session. A sequential `wait pid0; wait pid1` cannot save
+# it — wait(pid1) never returns, so the kill-orphans loop after it is dead
+# code. Reap the FIRST rank to exit, then bound how long the survivor may take.
+#
+# This deliberately does NOT use `wait -n -p PID`. Bash clears the -p variable
+# when there is no child left to wait for, and under `set -u` reading it then
+# aborts the script with "PID: unbound variable" — which is exactly what
+# happened on the first pilot run: the ranks had already exited, `wait -n`
+# reaped nothing, and the shell died leaving both ranks orphaned and burning
+# the GPU for the rest of the session. Polling /proc for the zombie state is
+# exact, has no bash-version caveats, and cannot abort the script.
+#
+# 0 = both ranks exited 0.  1 = a rank failed, or one had to be killed.
+_GAI_RANK_EXITED() {
+    local p="$1" st
+    [[ -n "${p}" ]] || return 0
+    [[ -d "/proc/${p}" ]] || return 0                 # process gone
+    st=$(awk '{print $3}' "/proc/${p}/stat" 2>/dev/null) || return 0
+    [[ "${st}" == "Z" ]]                             # zombie == exited, unreaped
+}
+
 wait_ddp_ranks() {
     local label="$1" pid0="$2" pid1="$3" grace="${4:-180}"
-    local poll=5
-    local first="" fst=0
-    if wait -n -p first 2>/dev/null; then fst=0; else fst=$?; fi
-    if [[ -z "${first}" ]]; then
-        # No `wait -n -p` support: we cannot identify the rank. Fail fast
-        # rather than risk waiting on a wedged sibling.
-        echo "[${label}] a rank exited (status ${fst}) but this bash cannot report"
-        echo "[${label}] which one — killing the survivor rather than risk a hang."
-        kill -9 "${pid0}" "${pid1}" 2>/dev/null || true
+    local poll=5 first=-1 waited=0 st=0
+    # Bound far above any session: the first rank only exits when the whole
+    # stage finishes, which for a full budgeted run is hours.
+    while [[ "${first}" -lt 0 ]]; do
+        if _GAI_RANK_EXITED "${pid0}"; then first=0; break; fi
+        if _GAI_RANK_EXITED "${pid1}"; then first=1; break; fi
+        sleep "${poll}"; waited=$(( waited + poll ))
+        if [[ "${waited}" -ge 46000 ]]; then
+            echo "[${label}] no rank exited after ${waited}s — killing both"
+            kill -9 "${pid0}" "${pid1}" 2>/dev/null || true
+            return 1
+        fi
+    done
+    local pids=("${pid0}" "${pid1}")
+    local exited="${pids[$first]}" survivor="${pids[$((1 - first))]}"
+    if wait "${exited}"; then st=0; else st=$?; fi
+    if [[ "${st}" -ne 0 ]]; then
+        echo "[${label}] rank ${first} (pid ${exited}) exited ${st} — killing sibling ${survivor}"
+        kill -9 "${survivor}" 2>/dev/null || true
+        wait "${survivor}" 2>/dev/null || true
         return 1
     fi
-    local other
-    if [[ "${first}" == "${pid0}" ]]; then other="${pid1}"; else other="${pid0}"; fi
-    if [[ "${fst}" -ne 0 ]]; then
-        echo "[${label}] rank pid ${first} exited ${fst} — killing sibling ${other}"
-        kill -9 "${other}" 2>/dev/null || true
-        wait "${other}" 2>/dev/null || true
-        return 1
-    fi
-    # The first rank exited cleanly. Its sibling runs the same collectives and
-    # should follow within seconds; if it does not, it is wedged in NCCL.
-    local waited=0
-    while kill -0 "${other}" 2>/dev/null && [[ "${waited}" -lt "${grace}" ]]; do
+    # The sibling runs the same collectives and should follow within seconds.
+    waited=0
+    while ! _GAI_RANK_EXITED "${survivor}" && [[ "${waited}" -lt "${grace}" ]]; do
         sleep "${poll}"; waited=$(( waited + poll ))
     done
-    if kill -0 "${other}" 2>/dev/null; then
-        echo "[${label}] rank pid ${first} exited but ${other} survived ${grace}s"
+    if ! _GAI_RANK_EXITED "${survivor}"; then
+        echo "[${label}] rank ${first} exited but ${survivor} survived ${grace}s"
         echo "[${label}] — collective desync (NCCL hang). Killing it."
-        kill -9 "${other}" 2>/dev/null || true
-        wait "${other}" 2>/dev/null || true
+        kill -9 "${survivor}" 2>/dev/null || true
+        wait "${survivor}" 2>/dev/null || true
         return 1
     fi
-    if ! wait "${other}" 2>/dev/null; then
-        echo "[${label}] the surviving rank ${other} exited non-zero"
+    if wait "${survivor}"; then :; else
+        echo "[${label}] surviving rank ${survivor} exited non-zero"
         return 1
     fi
     return 0
@@ -337,8 +363,21 @@ echo ""
 echo "[pilot] 2-rank DDP pilot (${PILOT_STEPS} steps, global tok/s from BOTH ranks)..."
 P_START=$(date +%s)
 PIDS=()
-cleanup_pilot() { for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done; }
-trap 'cleanup_pilot; persist_output' INT TERM
+cleanup_pilot() {
+    for pid in "${PIDS[@]:-}"; do
+        [[ -n "${pid}" ]] || continue
+        # -9, not TERM: a rank wedged inside a NCCL collective ignores SIGTERM
+        # and would keep holding its 15 GB card until the session ends.
+        kill -9 "${pid}" 2>/dev/null || true
+    done
+    PIDS=()
+}
+# EXIT matters as much as INT/TERM here. The pilot launched its ranks as
+# background children, so any early exit of the script itself (a `set -u`
+# abort, a failed gate, an unhandled error) used to leave both ranks running
+# as orphans, burning the GPU for the rest of the session with nobody waiting
+# for them. Trap every path and make the handler idempotent.
+trap 'cleanup_pilot; persist_output' EXIT INT TERM
 for i in 0 1; do
     RANK=$i LOCAL_RANK=$i "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
         --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
@@ -470,7 +509,12 @@ launch_ddp() {
     # after the checkpoint is already on disk.
     local grace=$(( EXPORT_MARGIN_SEC + 300 ))
     [[ "${EXPORT_GGUF}" -eq 0 ]] && grace=300
+    # Reap on every path: if this function returns early (watchdog failure) or
+    # the whole script aborts, a live rank would keep its 15 GB card and the
+    # NEXT stage would then fail its own VRAM or quota gate. The pilot's
+    # cleanup_pilot covers PIDS; training ranks are tracked separately.
     if ! wait_ddp_ranks "train" "${pids[0]}" "${pids[1]}" "${grace}"; then
+        for pid in "${pids[@]}"; do kill -9 "${pid}" 2>/dev/null || true; done
         echo "[ERROR] a training rank failed or hung; siblings killed"
         return 1
     fi
