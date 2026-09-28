@@ -43,6 +43,37 @@ def info(m):
     print(f"  [..]   {m}", flush=True)
 
 
+def load_env(path):
+    """Read the KEY="value" lines cell 1 wrote.
+
+    NOT exec(): env.sh is bash, and `exec(compile(...))` on `export FOO="bar"`
+    is a SyntaxError. Parsing it keeps the value intact, which matters because
+    the Kaggle dataset path contains a space (.../Users/Ghassan PC/Desktop/...)
+    and anything that splits on whitespace would truncate it.
+    """
+    env = {}
+    if not os.path.exists(path):
+        return env
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def apply_env(path):
+    for k, v in load_env(path).items():
+        os.environ.setdefault(k, v)
+    return os.environ
+
+
 def run(cmd, tail=30, log=None, env=None, cwd=None):
     t0 = time.time()
     e = dict(os.environ)
@@ -63,8 +94,9 @@ def run(cmd, tail=30, log=None, env=None, cwd=None):
 
 
 ENV = "/kaggle/working/env.sh"
-if os.path.exists(ENV):
-    exec(compile(open(ENV, encoding="utf-8").read(), ENV, "exec"), {}, {})  # noqa: S102
+for k, v in load_env(ENV).items():
+    print(f"  {k} = {v}", flush=True)
+apply_env(ENV)
 # Self-locating (see cell2_data.py): any clone path works, env.sh wins.
 REPO_DIR = os.environ.get("REPO_DIR") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))
