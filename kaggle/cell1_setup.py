@@ -6,11 +6,17 @@
 #   3. prove the build is correct: CUDA/CPU MoE parity + the whole test suite
 #   4. print exactly one PASS/FAIL verdict and the command for the next cell
 #
-# Paste the contents of this file into a Kaggle code cell, or run
-#   %run /kaggle/working/jdm-Ghassan_v1_pro-/kaggle/cell1_setup.py
-# after the clone has happened once.
+# ------------------------------------------------------------------
+# PASTE THIS INTO THE KAGGLE CELL (5 lines, no placeholders):
 #
-# Optional environment (put them in a cell ABOVE this one):
+#     !git clone --depth 1 https://github.com/mohammedaminerhassan-spec/jdm-Ghassan_v1_pro-.git /kaggle/working/repo 2>/dev/null || (cd /kaggle/working/repo && git fetch --all && git reset --hard origin/HEAD)
+#     !cd /kaggle/working/repo && git pull --ff-only 2>/dev/null || true
+#     %run /kaggle/working/repo/kaggle/cell1_setup.py
+#
+# Re-run those three lines after every `git push`: the cell always pulls the
+# newest code first, so the notebook never runs a stale commit.
+# ------------------------------------------------------------------
+# Optional environment (a cell above this one, or just edit REPO_URL here):
 #   REPO_URL   = a different repo/branch
 #   SKIP_TESTS = 1 to skip the test suite (not recommended)
 #   CLEAN      = 1 to wipe build/ first
@@ -104,8 +110,16 @@ run("python -c \"import sys; print('python', sys.version.split()[0])\"; "
 
 # ---------------------------------------------------------------- 1. clone
 rule("CLONE / UPDATE")
+# Self-locating: this file can be run from a clone that already exists (the
+# tiny bootstrap cell clones first, then %run's this), or it clones by itself.
+_here = os.path.dirname(os.path.abspath(__file__))          # <repo>/kaggle
+_cand = os.path.dirname(_here)                              # <repo>
+if os.path.isdir(os.path.join(_cand, "kaggle")) and os.path.exists(
+        os.path.join(_cand, "CMakeLists.txt")):
+    REPO_DIR = _cand
+    ok(f"running from the existing checkout {REPO_DIR}")
 if os.path.isdir(os.path.join(REPO_DIR, ".git")):
-    ok(f"existing checkout at {REPO_DIR}")
+    ok(f"git checkout at {REPO_DIR}")
     rc, out = run("git fetch --all --tags && git reset --hard origin/HEAD", cwd=REPO_DIR, tail=20)
     if rc != 0:
         bad("git reset failed — the local copy is diverged")

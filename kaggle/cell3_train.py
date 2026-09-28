@@ -65,7 +65,9 @@ def run(cmd, tail=30, log=None, env=None, cwd=None):
 ENV = "/kaggle/working/env.sh"
 if os.path.exists(ENV):
     exec(compile(open(ENV, encoding="utf-8").read(), ENV, "exec"), {}, {})  # noqa: S102
-REPO_DIR = os.environ.get("REPO_DIR", "/kaggle/working/jdm-Ghassan_v1_pro-")
+# Self-locating (see cell2_data.py): any clone path works, env.sh wins.
+REPO_DIR = os.environ.get("REPO_DIR") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))
 CFG_PT = os.environ.get("CONFIG_PT", "configs/en_compact_2xt4.yaml")
 CFG_SFT = os.environ.get("CONFIG_SFT", "configs/sft_en_compact_2xt4.yaml")
 GAI = os.path.join(REPO_DIR, "build", "bin", "gai_train")

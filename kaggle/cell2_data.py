@@ -62,7 +62,10 @@ ENV = "/kaggle/working/env.sh"
 if os.path.exists(ENV):
     print(open(ENV, encoding="utf-8").read().strip(), flush=True)
     exec(compile(open(ENV, encoding="utf-8").read(), ENV, "exec"), {}, {})  # noqa: S102
-REPO_DIR = os.environ.get("REPO_DIR", "/kaggle/working/jdm-Ghassan_v1_pro-")
+# Self-locating: works from any clone path (cell 1's bootstrap uses /repo, the
+# clone URL's own name is the other common case), and env.sh wins if it exists.
+REPO_DIR = os.environ.get("REPO_DIR") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))
 EN_DIR = os.environ.get("EN_PARQUET_DIR", "")
 
 rule("PRECHECK")
