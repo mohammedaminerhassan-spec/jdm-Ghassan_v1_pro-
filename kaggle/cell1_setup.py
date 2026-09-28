@@ -21,6 +21,7 @@
 #   SKIP_TESTS = 1 to skip the test suite (not recommended)
 #   CLEAN      = 1 to wipe build/ first
 
+import glob
 import os
 import re
 import shutil
@@ -249,26 +250,38 @@ else:
 
 # ---------------------------------------------------------------- 4. data
 rule("DATA  (English parquet lake)")
-# Kaggle mounts the dataset under a path that CONTAINS A SPACE
-# (.../Users/Ghassan PC/Desktop/english_parquet), so the discovery regex
-# cannot use \S+ — that silently found nothing and reported a working dataset as
-# missing. Take the whole line and strip the file name.
-lake = None
-for line in out_of("find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' "
-                   "2>/dev/null | sort | head -1").splitlines():
-    line = line.strip()
-    if line.endswith(".parquet") and os.path.isdir(os.path.dirname(line)):
-        lake = os.path.dirname(line)
-        break
-n_all = out_of("find /kaggle/input -maxdepth 8 -name '*.parquet' 2>/dev/null | wc -l").strip()
-print(f"  parquet files attached: {n_all}")
+# Discovery in python, not in the shell. The Kaggle dataset path contains a
+# SPACE (.../Users/Ghassan PC/Desktop/english_parquet), and this cell has now
+# been bitten by that in three separate ways: a \S+ regex that matched nothing,
+# an unquoted `ls {EN_DIR}/...` that split at the space, and a du that lost
+# the first half of the path. os.walk/glob take the path as a value, so there
+# is no shell left to re-interpret it.
+def find_lake():
+    for root, dirs, files in os.walk("/kaggle/input"):
+        if root[len("/kaggle/input"):].count(os.sep) > 8:
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.startswith("english_chat_part") and f.endswith(".parquet"):
+                return root
+    return ""
+
+lake = find_lake()
+print(f"  parquet files attached: "
+      f"{len(glob.glob('/kaggle/input/**/*.parquet', recursive=True))}")
 if lake:
     ok(f"lake: {lake}")
-    n_chat = out_of(f"ls '{lake}'/english_chat_part*.parquet 2>/dev/null | wc -l").strip()
-    n_inst = out_of(f"ls '{lake}'/english_instruction_part*.parquet 2>/dev/null | wc -l").strip()
-    sz = out_of(f"du -sh '{lake}' 2>/dev/null").split("\t")[0].strip()
-    print(f"  chat shards: {n_chat} | instruction shards: {n_inst} | {sz}")
-    if n_chat in ("0", "") or n_inst in ("0", ""):
+    # Python, not the shell: the Kaggle dataset path contains a space
+    # (.../Users/Ghassan PC/Desktop/english_parquet) and this cell has been
+    # bitten by that in three different ways already. glob() takes the path as
+    # a value, so there is nothing left to re-split it.
+    parts = glob.glob(os.path.join(lake, "*.parquet"))
+    n_chat = [f for f in parts if os.path.basename(f).startswith("english_chat_part")]
+    n_inst = [f for f in parts if os.path.basename(f).startswith("english_instruction_part")]
+    lake_mb = sum(os.path.getsize(f) for f in parts) // (1024 * 1024)
+    print(f"  chat parts {len(n_chat)} | instruction parts {len(n_inst)} | "
+          f"{len(parts)} parquet files | {lake_mb} MB")
+    if not n_chat or not n_inst:
         bad("the attached dataset is missing english_chat/ or english_instruction parts")
     # This is the value cell 2 needs. Quoted, because of the space.
     with open("/kaggle/working/env.sh", "w", encoding="utf-8") as fh:

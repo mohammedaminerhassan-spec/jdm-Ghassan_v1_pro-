@@ -19,6 +19,7 @@
 
 import os
 import re
+import glob
 import subprocess
 import sys
 import time
@@ -73,9 +74,12 @@ def apply_env(path):
     return os.environ
 
 
-def run(cmd, tail=30, log=None):
+def run(cmd, tail=30, log=None, env=None, cwd=None):
     t0 = time.time()
-    p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    p = subprocess.run(cmd, shell=True, cwd=cwd, env=e, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True, errors="replace")
     out = p.stdout or ""
     if log:
@@ -89,11 +93,29 @@ def run(cmd, tail=30, log=None):
     return p.returncode, out
 
 
-def out_of(cmd, cwd=None):
+def out_of(cmd, cwd=None, env=None):
     """stdout only, no decoration — for parsing numbers."""
-    p = subprocess.run(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    p = subprocess.run(cmd, shell=True, cwd=cwd, env=e, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True, errors="replace")
     return p.stdout or ""
+
+
+def du_mb(path):
+    """Directory size in MB, computed in python (a path with a space must never
+    be handed to `du` through a shell string)."""
+    if not os.path.isdir(path):
+        return 0
+    tot = 0
+    for root, _d, files in os.walk(path):
+        for f in files:
+            try:
+                tot += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return tot // (1024 * 1024)
 
 
 ENV = "/kaggle/working/env.sh"
@@ -111,27 +133,50 @@ run("date; df -h /kaggle/working | tail -1; nproc", tail=5)
 for tool in ("build/bin/data_pipeline", "build/bin/gai_train", "kaggle/build_english_data.sh"):
     p = os.path.join(REPO_DIR, tool)
     ok(tool) if os.path.exists(p) else bad(f"missing {p} — run cell 1 first")
-if not os.path.isdir(EN_DIR):
-    cands = subprocess.run(
-        "find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -1",
-        shell=True, capture_output=True, text=True).stdout.strip()
-    EN_DIR = os.path.dirname(cands) if cands else EN_DIR
-if not os.path.isdir(EN_DIR):
-    bad("no english parquet lake under /kaggle/input — attach the dataset and re-run")
+
+# Every path below is handled in PYTHON, never interpolated into a shell string.
+# The Kaggle dataset path contains a space (.../Users/Ghassan PC/Desktop/...),
+# and this cell has now been bitten by that three separate ways: a \S+ regex that
+# matched nothing, an unquoted `ls {EN_DIR}/...` that split at the space, and a
+# du that lost the first half of the path. glob/os.path take the path as a
+# value, so there is no shell left to re-interpret it.
+def find_lake():
+    if EN_DIR and os.path.isdir(EN_DIR):
+        return EN_DIR
+    for base in ("/kaggle/input",):
+        for root, dirs, _files in os.walk(base):
+            depth = root[len(base):].count(os.sep)
+            if depth > 8:
+                dirs[:] = []
+                continue
+            if any(f.startswith("english_chat_part") and f.endswith(".parquet")
+                   for f in os.listdir(root)):
+                return root
+    return ""
+
+EN_DIR = find_lake()
+if not EN_DIR:
+    bad("no english parquet lake under /kaggle/input — attach the dataset "
+        "(right panel > Add Input) and re-run this cell")
     sys.exit(1)
 ok(f"lake: {EN_DIR}")
-n1 = run(f"ls {EN_DIR}/english_chat_part*.parquet | wc -l", tail=2)[1].strip()
-n2 = run(f"ls {EN_DIR}/english_instruction_part*.parquet | wc -l", tail=2)[1].strip()
-run(f"du -sh {EN_DIR}", tail=2)
-if n1 in ("0", "") or n2 in ("0", ""):
-    bad(f"lake incomplete: {n1} chat parts, {n2} instruction parts")
+
+parts = sorted(glob.glob(os.path.join(EN_DIR, "*.parquet")))
+n_chat = [f for f in parts if os.path.basename(f).startswith("english_chat_part")]
+n_inst = [f for f in parts if os.path.basename(f).startswith("english_instruction_part")]
+lake_mb = sum(os.path.getsize(f) for f in parts) // (1024 * 1024)
+print(f"  chat parts {len(n_chat)} | instruction parts {len(n_inst)} | "
+      f"{len(parts)} parquet files | {lake_mb} MB")
+if not n_chat or not n_inst:
+    bad(f"lake incomplete: {len(n_chat)} chat parts, {len(n_inst)} instruction parts "
+        f"(needs both; the recipe mixes them)")
     sys.exit(1)
 
 tok = os.path.join(REPO_DIR, "artifacts", "tokenizer", "english32k.gtok")
 if not os.path.exists(tok):
     bad(f"tokenizer missing at {tok} — cell 1 must build it before this cell")
     sys.exit(1)
-rc, out = run(f"build/bin/data_pipeline tok-info --tokenizer {tok}", cwd=REPO_DIR, tail=5)
+rc, out = run(f"build/bin/data_pipeline tok-info --tokenizer '{tok}'", cwd=REPO_DIR, tail=5)
 if "vocab_size=32000" not in out:
     bad("tokenizer vocab != 32000")
     sys.exit(1)
@@ -139,8 +184,11 @@ ok("tokenizer 32000 keep-case")
 
 # ---------------------------------------------------------------- build
 rule("BUILD SHARDS  (the long one — Save Version when it finishes)")
-rc, out = run(f"EN_PARQUET_DIR='{EN_DIR}' bash kaggle/build_english_data.sh",
-              cwd=REPO_DIR, log="/kaggle/working/_cell2_shards.log", tail=60)
+# EN_PARQUET_DIR goes through the environment, not through a quoted string in a
+# command line: a space in the value cannot break it.
+rc, out = run("bash kaggle/build_english_data.sh", cwd=REPO_DIR,
+              env={"EN_PARQUET_DIR": EN_DIR},
+              log="/kaggle/working/_cell2_shards.log", tail=60)
 if rc != 0:
     bad("build_english_data.sh failed (log: /kaggle/working/_cell2_shards.log)")
     for ln in out.splitlines():
@@ -187,10 +235,6 @@ run("du -sh artifacts/shards_en artifacts/tokenizer; df -h /kaggle/working | tai
 # and the trainer's own disk guard only fires once the trainer is constructed —
 # i.e. after the pilot has already burned GPU minutes. Price it here instead.
 rule("DISK FOOTPRINT  (the 20 GB that has to hold everything)")
-def du_mb(path):
-    t = out_of(f"du -sm '{path}' 2>/dev/null | cut -f1").strip()
-    return int(t) if t.isdigit() else 0
-
 free_mb = int(out_of("df -Pm /kaggle/working | tail -1 | awk '{print $4}'").strip() or 0)
 build_mb = du_mb(os.path.join(REPO_DIR, "build"))
 shards_mb = du_mb(os.path.join(REPO_DIR, "artifacts", "shards_en"))
