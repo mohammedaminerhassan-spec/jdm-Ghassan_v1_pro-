@@ -9,13 +9,36 @@
 //   3. SWA window forward + backward
 //   4. segment-id packing forward
 //   5. T=1 edge case
-// NOTE on tolerances: the CUDA backward accumulates dk/dv with atomics, so
-// summation order differs from the serial CPU reference by design; 1e-4
-// relative covers float reassociation without hiding real divergence.
+//
+// Parity criterion: |a-b| <= atol + rtol*|b|  (the SAME mixed criterion
+// test_moe_cuda_parity.cpp uses, and for the SAME reason).
+//
+// A PURE element-wise relative error is the wrong test for a reduction. The
+// CUDA backward reassociates every sum: `dot_pg` is a strided per-lane partial
+// plus a __shfl_xor butterfly instead of a serial sum, and each dq row is a
+// per-lane register accumulation plus a __shfl_down tree instead of a serial
+// axpy. That is the same arithmetic in a different order, so it differs in the
+// last bits — and near a cancellation (dq is a sum of terms p_j*(dP_j - sum_l
+// p_l dP_l)*K_j whose terms cancel hard, so some entries land near zero) the
+// PURE relative error explodes while the absolute error stays microscopic.
+//
+// That is exactly what happened on the first T4 run of this gate:
+//   FAIL: attn bwd dq vs CPU max_rel=0.000130572 tol=0.0001
+// — 1.3e-4 against a 1e-4 gate, on an entry orders of magnitude below the
+// tensor's own scale. The MoE gate hit the identical wall ("gate grad max rel
+// err 1.48e-4") and was fixed; this one was left behind, so it has been
+// reporting a red build on a correct kernel.
+//
+// atol scales with the reference tensor's magnitude rather than being a magic
+// constant, and the diagnostic prints max_abs, max_rel, the reference scale
+// and the value at the worst element, so a REAL divergence (wrong index, a
+// dropped term, a missing scale) is still impossible to miss: those move
+// values by O(1e-2..1) relative, not by 1e-7.
 #include "core/ops.h"
 #include "core/ops_cpu.h"
 #include "core/rng.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -27,30 +50,175 @@ static int failures = 0;
     if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; ++failures; } \
 } while (0)
 
-#ifdef GAI_CUDA
-#include "cuda/cuda_ops.h"
-#include "core/device.h"
+static std::vector<float> rnd_vec(Rng& rng, size_t n, float s) {
+    std::vector<float> v(n);
+    for (float& x : v) x = (rng.uniform() * 2.0f - 1.0f) * s;
+    return v;
+}
 
 static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
-                     double tol, const char* what) {
+                     double rtol, const char* what, double atol = 0.0) {
     if (a.size() != b.size()) {
         std::cerr << "FAIL: " << what << " size mismatch\n";
         ++failures;
         return false;
     }
-    double max_rel = 0.0;
+    // Scale from the REFERENCE (the CPU is the oracle), not from `a`.
+    double scale = 0.0;
+    for (float v : b) scale = std::max(scale, std::fabs((double)v));
+    if (atol <= 0.0) atol = 1e-5 * (scale > 0.0 ? scale : 1.0);
+    double max_rel = 0.0, max_abs = 0.0, worst = 0.0;
+    size_t worst_i = 0;
     for (size_t i = 0; i < a.size(); ++i) {
-        double denom = std::fabs((double)b[i]) + 1e-6;
-        double rel = std::fabs((double)a[i] - (double)b[i]) / denom;
-        if (rel > max_rel) max_rel = rel;
+        const double diff = std::fabs((double)a[i] - (double)b[i]);
+        const double tol = atol + rtol * std::fabs((double)b[i]);
+        if (diff > max_abs) { max_abs = diff; worst = (double)b[i]; worst_i = i; }
+        const double denom = std::fabs((double)b[i]) + 1e-30;
+        max_rel = std::max(max_rel, diff / denom);
+        if (diff > tol) {
+            std::cerr << "FAIL: " << what << " elem " << i
+                      << " got " << (double)a[i] << " want " << (double)b[i]
+                      << " |diff| " << diff << " > tol " << tol
+                      << " (atol " << atol << ", ref scale " << scale << ")\n";
+            ++failures;
+            return false;
+        }
     }
-    if (max_rel > tol) {
-        std::cerr << "FAIL: " << what << " max_rel=" << max_rel << " tol=" << tol << "\n";
-        ++failures;
-        return false;
-    }
+    std::cout << "  ok  " << what
+              << "  max_abs " << max_abs << " (worst ref " << worst << " @ " << worst_i
+              << ")  max_rel " << max_rel
+              << "  ref_scale " << scale << "  atol " << atol << "\n";
     return true;
 }
+
+// quiet = true: report the verdict but do not count a failure (the self-test
+// below deliberately feeds this function both a legal reassociation and a real
+// bug, and only one of the two must be counted).
+static bool near_vec_report(const std::vector<float>& a, const std::vector<float>& b,
+                            double rtol, const char* what, double atol, bool quiet) {
+    const int before = failures;
+    const bool r = near_vec(a, b, rtol, what, atol);
+    if (quiet && r && failures > before) failures = before;   // un-count
+    if (quiet && !r) failures = before;                       // un-count
+    return r;
+}
+
+// ---- CPU self-test: does this gate still CATCH a real kernel bug? --------
+//
+// A loosened tolerance is only defensible if it still fails on divergence. This
+// runs on every build (CPU included) and pins both halves of the contract:
+//   * a legal REASSOCIATION of the same sums passes (that is the whole reason
+//     for the absolute floor), and
+//   * three real kernel bugs fail loudly: dropping the softmax-Jacobian
+//     `dot_pg` term, dropping the 1/sqrt(hd) scale, and a one-position index
+//     shift. Each of those moves dq by O(1e-1..1) relative, so a criterion that
+//     let them through would be worthless.
+static void test_tolerance_contract() {
+    Rng rng;
+    rng.seed_with(7781);
+    const int B = 2, T = 9, H = 6, KV = 2, hd = 8;
+    const int group = H / KV;
+    const float scale = 1.0f / std::sqrt((float)hd);
+    const std::vector<float> q = rnd_vec(rng, (size_t)B * T * H * hd, 0.5f);
+    const std::vector<float> k = rnd_vec(rng, (size_t)B * T * KV * hd, 0.5f);
+    const std::vector<float> v = rnd_vec(rng, (size_t)B * T * KV * hd, 0.5f);
+    const std::vector<float> dout = rnd_vec(rng, (size_t)B * T * H * hd, 0.5f);
+
+    std::vector<float> out_cpu((size_t)B * T * H * hd, 0.0f);
+    std::vector<float> probs((size_t)B * H * T * T, 0.0f);
+    cpu::attention_forward(q.data(), k.data(), v.data(), out_cpu.data(),
+                           probs.data(), B, T, H, KV, hd, scale);
+    std::vector<float> dq_ref((size_t)B * T * H * hd, 0.0f);
+    std::vector<float> dk((size_t)B * T * KV * hd, 0.0f);
+    std::vector<float> dv((size_t)B * T * KV * hd, 0.0f);
+    cpu::attention_backward(q.data(), k.data(), v.data(), probs.data(), dout.data(),
+                            dq_ref.data(), dk.data(), dv.data(),
+                            B, T, H, KV, hd, scale);
+
+    const size_t qs = (size_t)T * H * hd, kvs = (size_t)T * KV * hd;
+    auto dot = [&](const float* a, const float* c) {
+        float s = 0.0f;
+        for (int i = 0; i < hd; ++i) s += a[i] * c[i];
+        return s;
+    };
+    // mode 0 = serial (must match the reference bit-for-bit)
+    // mode 1 = pairwise-tree reassociation of the SAME sums (legal): the terms
+    //          are identical, only the grouping differs
+    // mode 2 = softmax-Jacobian term dropped (real bug)
+    // mode 3 = scale dropped (real bug)
+    // mode 4 = k index shifted by one (real bug)
+    // Legal reassociation: the SAME terms, grouped as a binary tree. The
+    // standard pairwise reduction leaves the total in a[0]; no term is
+    // dropped or duplicated (a naive "reduce then sum every slot" double-counts
+    // the untouched ones, which is a VALUE change, not a reassociation).
+    auto pairwise_sum = [](std::vector<float>& a) {
+        for (size_t w = 1; w < a.size(); w *= 2)
+            for (size_t j = 0; j + w < a.size(); j += 2 * w) a[j] += a[j + w];
+        return a[0];
+    };
+    auto serial_sum = [](const std::vector<float>& a) {
+        float s = 0.0f;
+        for (float x : a) s += x;
+        return s;
+    };
+    auto build = [&](int mode) {
+        std::vector<float> dq((size_t)B * T * H * hd, 0.0f);
+        for (int b = 0; b < B; ++b)
+            for (int kvhh = 0; kvhh < KV; ++kvhh)
+                for (int hg = 0; hg < group; ++hg) {
+                    const int h = kvhh * group + hg;
+                    for (int t = 0; t < T; ++t) {
+                        const int len = t + 1;
+                        const float* pr = &probs[((size_t)b * H + h) * T * T + (size_t)t * T];
+                        const float* go = &dout[(size_t)b * qs + ((size_t)t * H + h) * hd];
+                        float* dqh = &dq[(size_t)b * qs + ((size_t)t * H + h) * hd];
+                        std::vector<float> dsv(len), term(len);
+                        for (int j = 0; j < len; ++j) {
+                            dsv[j] = dot(go, &v[(size_t)b * kvs + ((size_t)j * KV + kvhh) * hd]);
+                            term[j] = pr[j] * dsv[j];
+                        }
+                        const float dot_pg = (mode == 1) ? pairwise_sum(term)
+                                                         : serial_sum(term);
+                        for (int c = 0; c < hd; ++c) {
+                            std::vector<float> row(len);
+                            for (int j = 0; j < len; ++j) {
+                                const float sc = (mode == 3) ? 1.0f : scale;
+                                const float ds = pr[j] * ((mode == 2) ? dsv[j]
+                                                                     : dsv[j] - dot_pg) * sc;
+                                const int jj = (mode == 4) ? ((j + 1) % T) : j;
+                                row[j] = ds * k[(size_t)b * kvs + ((size_t)jj * KV + kvhh) * hd + c];
+                            }
+                            dqh[c] += (mode == 1) ? pairwise_sum(row) : serial_sum(row);
+                        }
+                    }
+                }
+        return dq;
+    };
+
+    const std::vector<float> serial   = build(0);
+    const std::vector<float> reassoc  = build(1);
+    const std::vector<float> no_jac   = build(2);
+    const std::vector<float> no_scale = build(3);
+    const std::vector<float> shifted  = build(4);
+
+    // 1. the oracle agrees with its own serial re-implementation
+    CHECK(near_vec(serial, dq_ref, 1e-4, "tolerance contract: serial dq == CPU dq"),
+          "self-test oracle mismatch");
+    // 2. a legal reassociation PASSES the gate
+    CHECK(near_vec_report(reassoc, dq_ref, 1e-4, "reassociation is accepted", 0.0, true),
+          "a legal reassociation of the same sums must pass the mixed criterion");
+    // 3. every real bug still FAILS it
+    CHECK(!near_vec_report(no_jac, dq_ref, 1e-4, "dropped jacobian", 0.0, true),
+          "dropping the softmax-Jacobian dot_pg term must be caught");
+    CHECK(!near_vec_report(no_scale, dq_ref, 1e-4, "dropped scale", 0.0, true),
+          "dropping the 1/sqrt(hd) scale must be caught");
+    CHECK(!near_vec_report(shifted, dq_ref, 1e-4, "shifted k index", 0.0, true),
+          "a one-position k index shift must be caught");
+}
+
+#ifdef GAI_CUDA
+#include "cuda/cuda_ops.h"
+#include "core/device.h"
 
 // Copy a host vector to a CUDA tensor and back.
 static Tensor to_cuda(const std::vector<float>& h) {
@@ -70,12 +238,6 @@ static std::vector<float> to_host(const Tensor& t) {
     device_copy(h.data(), Device::CPU, t.data_ptr(), Device::CUDA,
                 h.size() * sizeof(float));
     return h;
-}
-
-static std::vector<float> rnd_vec(Rng& rng, size_t n, float s) {
-    std::vector<float> v(n);
-    for (float& x : v) x = (rng.uniform() * 2.0f - 1.0f) * s;
-    return v;
 }
 
 static void test_forward_gqa() {
@@ -233,18 +395,23 @@ static void test_t1_edge() {
 #endif // GAI_CUDA
 
 int main() {
+    // Runs on EVERY build, CUDA or not: the gate's own tolerance must be
+    // provably still able to catch a real kernel bug (see the self-test).
+    test_tolerance_contract();
 #ifdef GAI_CUDA
     if (!cuda_available()) {
-        std::cout << "test_attention_cuda_parity: SKIP (no CUDA device)\n";
-        return 0;
+        std::cout << "test_attention_cuda_parity: tolerance contract PASSED, "
+                     "device tests SKIP (no CUDA device)\n";
+    } else {
+        test_forward_gqa();
+        test_backward_gqa();
+        test_swa_window();
+        test_segment_packing_fwd();
+        test_t1_edge();
     }
-    test_forward_gqa();
-    test_backward_gqa();
-    test_swa_window();
-    test_segment_packing_fwd();
-    test_t1_edge();
 #else
-    std::cout << "test_attention_cuda_parity: SKIP (CPU-only build)\n";
+    std::cout << "test_attention_cuda_parity: tolerance contract PASSED, "
+                 "device tests SKIP (CPU-only build)\n";
 #endif
     if (failures == 0) {
         std::cout << "test_attention_cuda_parity: ALL PASS\n";

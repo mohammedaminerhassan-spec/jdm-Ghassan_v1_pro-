@@ -100,6 +100,13 @@ def section(out, pattern, label):
     return hits
 
 
+def out_of(cmd, cwd=None):
+    """stdout only, no decoration — for parsing counts."""
+    p = subprocess.run(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, errors="replace")
+    return p.stdout or ""
+
+
 # ---------------------------------------------------------------- 0. session
 rule("SESSION")
 run("date; echo; nvidia-smi --query-gpu=index,name,memory.total,driver_version "
@@ -167,19 +174,41 @@ if rc != 0:
     sys.exit(1)
 
 cache = os.path.join(REPO_DIR, "build", "CMakeCache.txt")
+# The build's OWN status lines are the source of truth. GAI_HAVE_CUDA and
+# GAI_HAVE_PARQUET are plain (non-cached) variables in CMakeLists.txt, so they
+# never appear in CMakeCache.txt at all — only GAI_HAVE_NCCL is a CACHE var.
+# Reading the cache for those two reported a working CUDA build as broken.
+want = {
+    "cuda":    r"\[ghassan-ai\]\s+cuda\s*:\s*ON",
+    "nccl":    r"\[ghassan-ai\]\s+nccl\s*:\s*ON",
+    "parquet": r"\[ghassan-ai\]\s+parquet\s*:\s*ON",
+}
+for key, pat in want.items():
+    if re.search(pat, out):
+        ok(f"{key}: ON")
+    else:
+        seen = section(out, r"\[ghassan-ai\]\s+(cuda|nccl|parquet)\s*:.*", "")
+        bad(f"{key}: NOT enabled" + (f" (build reported: {seen[0].strip()})" if seen else
+                                     " — no [ghassan-ai] status line in the build log"))
 if os.path.exists(cache):
     txt = open(cache, encoding="utf-8", errors="replace").read()
-    for key, label in (("GAI_HAVE_CUDA:BOOL=ON", "CUDA"),
-                       ("GAI_HAVE_NCCL:BOOL=ON", "NCCL"),
-                       ("GAI_HAVE_PARQUET:BOOL=ON", "Parquet"),
-                       ("GAI_BUILD_TESTS:BOOL=ON", "Tests"),
-                       ("CMAKE_BUILD_TYPE:STRING=Release", "build type")):
-        ok(f"{label}: {'ON' if key in txt else 'MISSING'}") if key in txt \
-            else bad(f"{label} is not enabled ({key})")
+    if "CMAKE_BUILD_TYPE:STRING=Release" in txt:
+        ok("build type: Release")
+    else:
+        bad("build type is not Release")
+    if "GAI_BUILD_TESTS:BOOL=ON" in txt:
+        ok("tests: built")
+    else:
+        bad("tests were not built (GAI_BUILD_TESTS off)")
 else:
     bad("build/CMakeCache.txt missing — the build did not configure")
 
-warn = [ln for ln in out.splitlines() if re.search(r"\bwarning\b", ln)]
+# Compiler warnings only. A bare \bwarning\b also matches apt/dpkg noise
+# ("rehash: warning: skipping ca-certificates.crt"), which is not the build's
+# fault and would cry wolf on every Kaggle run.
+warn = [ln for ln in out.splitlines()
+        if re.search(r"\bwarning\b", ln)
+        and re.search(r"\.(c|cc|cpp|cu|h|hpp)\b|warning:.*-W|\[-W", ln)]
 if warn:
     bad(f"{len(warn)} compiler warning(s) in the build log (the project builds -Werror)")
     for ln in warn[:20]:
@@ -220,22 +249,28 @@ else:
 
 # ---------------------------------------------------------------- 4. data
 rule("DATA  (English parquet lake)")
-rc, out = run("find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null "
-              "| head -3; echo; find /kaggle/input -maxdepth 8 -name '*.parquet' 2>/dev/null "
-              "| wc -l", tail=12)
+# Kaggle mounts the dataset under a path that CONTAINS A SPACE
+# (.../Users/Ghassan PC/Desktop/english_parquet), so the discovery regex
+# cannot use \S+ — that silently found nothing and reported a working dataset as
+# missing. Take the whole line and strip the file name.
 lake = None
-for cand in re.findall(r"(/kaggle/input/\S+/english_chat_part\S*\.parquet)", out):
-    lake = os.path.dirname(cand)
-    break
+for line in out_of("find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' "
+                   "2>/dev/null | sort | head -1").splitlines():
+    line = line.strip()
+    if line.endswith(".parquet") and os.path.isdir(os.path.dirname(line)):
+        lake = os.path.dirname(line)
+        break
+n_all = out_of("find /kaggle/input -maxdepth 8 -name '*.parquet' 2>/dev/null | wc -l").strip()
+print(f"  parquet files attached: {n_all}")
 if lake:
     ok(f"lake: {lake}")
-    n_chat = run(f"ls {lake}/english_chat_part*.parquet 2>/dev/null | wc -l", tail=3)[1]
-    n_inst = run(f"ls {lake}/english_instruction_part*.parquet 2>/dev/null | wc -l", tail=3)[1]
-    sz = run(f"du -sh {lake} 2>/dev/null", tail=3)[1]
-    print(f"  chat shards: {n_chat.strip()} | instruction shards: {n_inst.strip()} | {sz.strip()}")
-    if n_chat.strip() in ("0", "") or n_inst.strip() in ("0", ""):
+    n_chat = out_of(f"ls '{lake}'/english_chat_part*.parquet 2>/dev/null | wc -l").strip()
+    n_inst = out_of(f"ls '{lake}'/english_instruction_part*.parquet 2>/dev/null | wc -l").strip()
+    sz = out_of(f"du -sh '{lake}' 2>/dev/null").split("\t")[0].strip()
+    print(f"  chat shards: {n_chat} | instruction shards: {n_inst} | {sz}")
+    if n_chat in ("0", "") or n_inst in ("0", ""):
         bad("the attached dataset is missing english_chat/ or english_instruction parts")
-    # This is the value cell 2 needs.
+    # This is the value cell 2 needs. Quoted, because of the space.
     with open("/kaggle/working/env.sh", "w", encoding="utf-8") as fh:
         fh.write(f'export EN_PARQUET_DIR="{lake}"\n')
         fh.write(f'export REPO_DIR="{REPO_DIR}"\n')
