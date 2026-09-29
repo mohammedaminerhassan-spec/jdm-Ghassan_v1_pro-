@@ -1,17 +1,17 @@
 // English dialogue-behavior data + generator regression.
 //
 // Covers the English twin of the Darija behavior stack:
-//   * dataset/english_dialogue_data.h: every pool is non-empty, every Exchange
+//   * dataset/english_dialogue_content.h: every pool is non-empty, every Exchange
 //     has non-empty user+assistant, domains have the contracted shape, and no
 //     entry is an obvious template duplicate.
-//   * dataset/english_synth.h: the generator produces well-formed multi-turn
+//   * dataset/english_synthesis_engine.h: the generator produces well-formed multi-turn
 //     conversations whose assistant turns all pass the english_logic answer-
 //     discipline gate (the same gate the pipeline enforces on third-party data).
 //   * english_logic::is_coding: the "return" false positive (shopping "return
 //     a product" misclassified as Coding) stays fixed.
-#include "dataset/english_dialogue_data.h"
-#include "dataset/english_logic.h"
-#include "dataset/english_synth.h"
+#include "dataset/english_dialogue_content.h"
+#include "dataset/english_style_policy.h"
+#include "dataset/english_synthesis_engine.h"
 
 #include <iostream>
 #include <set>

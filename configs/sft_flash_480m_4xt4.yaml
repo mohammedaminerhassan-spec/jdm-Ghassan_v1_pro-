@@ -1,0 +1,90 @@
+# Ghassan v1 Pro English — 4x T4 SFT recipe (FP16 tensor cores + DDP).
+# T4 = Turing sm_75: FP16 tensor cores YES, BF16 tensor cores NO.
+# So: fp32 masters + gemm_fp16=true + loss scaling (NOT bf16).
+# Stage 2 after a 4xT4 pretrain run (or en_pro base for short runs).
+# ARCH MUST match flash_480m_single.yaml (use_qk_norm/z/rope/yarn/swa/rope_type enforced
+# by test_configs parity + runtime SFT gate; see en_2xt4.yaml for 2xT4).
+# Effective batch: 4 GPUs * 2 batch * 1024 seq * 16 accum = 131072 tokens/step.
+# DATA: shared English lake shards (artifacts/shards_en, english32k keep-case).
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 26
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
+  moe_aux_scale: 0.01
+  moe_aux_free: false
+  moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0
+  rope_yarn_high: 32.0
+  sliding_window: 0
+  rope_type: 0
+
+tokenizer:
+  path: artifacts/tokenizer/english32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: sft
+  device: cuda
+  precision: fp32              # fp32 masters; T4 has no BF16 tensor cores
+  gemm_fp16: true              # T4 FP16 tensor cores for large GEMMs
+  loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
+  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  loss_scale_window: 2000
+  batch_size: 2                # Per-GPU micro-batch
+  seq_len: 1024
+  grad_accum: 16               # 16 micro-batches = effective batch 32 per GPU
+  max_steps: 0
+  epochs: 3
+  # Lion x0.1: 1.0e-4 => effective 1.0e-5 SFT.
+  learning_rate: 1.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  optimizer: lion              # Lion saves ~50% optimizer memory
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.99                # lion default (explicit value wins over auto)
+  eps: 1.0e-8
+  grad_clip: 1.0
+  seed: 139
+  log_every: 10
+  eval_every: 100
+  eval_batches: 10
+  save_every: 500
+  data_dir: artifacts/shards_en
+  checkpoint_dir: artifacts/checkpoints/flash_480m_single_sft_4xT4
+  resume: auto
+  pretrained_checkpoint: artifacts/checkpoints/flash_480m_single/last.ckpt
+  allow_no_pretrained: false  # P0 guard: fail loudly without pretrained
+  freeze_embeddings: false
+  activation_checkpointing: true
+  ckpt_segments: 2
+  pack_sequences: true
+  ddp: true                    # Enable multi-GPU DDP
+
+data:
+  train_prefix: train_
+  val_prefix: val_
+  mix:
+    english_chat: 0.55
+    english_instruction: 0.30
+    english_behavior: 0.15

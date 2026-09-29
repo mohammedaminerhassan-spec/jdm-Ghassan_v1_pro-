@@ -21,7 +21,7 @@ const char* ChatTemplate::default_system_latin() {
 const char* ChatTemplate::default_system_english() {
     // PRO-EN persona for the English-Pro model (Ghassan v1 English).
     // This is the inference-time twin of the SFT behavior data in
-    // dataset/english_dialogue_data.cpp: same contract, enforced at runtime.
+    // dataset/english_dialogue_content.cpp: same contract, enforced at runtime.
     // Fast, direct, genuinely helpful: answers first, explains after.
     // Never breaks character with AI-disclosure boilerplate, never pads with
     // empty politeness, and says "I don't know" honestly when unsure.

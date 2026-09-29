@@ -6,8 +6,9 @@
 #include <utility>
 #include <vector>
 
-// Device-dispatching operator layer. Every op has a CPU reference implementation
-// (core/ops_cpu.cpp) and, when built with CUDA, a GPU implementation (cuda/*.cu).
+// Device-dispatching operator layer. Every op has CPU reference implementations
+// (core/ops_cpu_dense.cpp for dense kernels, core/ops_cpu_moe.cpp for MoE)
+// and, when built with CUDA, a GPU implementation (cuda/*.cu).
 // The model / trainer code is written once against this interface.
 
 namespace gai {

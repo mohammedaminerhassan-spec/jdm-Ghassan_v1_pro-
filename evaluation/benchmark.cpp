@@ -1,6 +1,6 @@
 // benchmark.cpp — implementation of the Ghassan AI evaluation benchmark.
 #include "evaluation/benchmark.h"
-#include "dataset/english_logic.h"
+#include "dataset/english_style_policy.h"
 #include "inference/generator.h"
 #include "dataset/langid.h"
 #include "dataset/cleaner.h"

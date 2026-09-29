@@ -47,9 +47,9 @@ int main() {
     // arithmetic path is checked at production size; the equivalence is proven
     // on the small configs below.
     static const char* kConfigs[] = {
-        "configs/en_pro.yaml", "configs/pro_v1.yaml", "configs/t4_1b.yaml",
-        "configs/en_ollama.yaml", "configs/pro_auxfree.yaml", "configs/sft_en_pro.yaml",
-        "configs/smoke.yaml",
+        "configs/flash_480m_single.yaml", "configs/pro_1b_single.yaml", "configs/pro_1b_4xt4_legacy.yaml",
+        "configs/flash_480m_ollama_compat.yaml", "configs/pro_1b_auxfree_research.yaml", "configs/sft_flash_480m_single.yaml",
+        "configs/cpu_smoke_test.yaml",
     };
     for (const char* path : kConfigs) {
         std::error_code ec;

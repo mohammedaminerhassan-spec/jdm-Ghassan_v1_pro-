@@ -4,7 +4,7 @@
 //
 //   1. Jitter reaches only the training forward. Both routers gate it on the
 //      training path (cuda/moe.cu k_route: `train = probs != nullptr`;
-//      core/ops_moe.cpp: `jj > 0 && probs_cache`), so an eval forward must be
+//      core/ops_cpu_moe.cpp: `jj > 0 && probs_cache`), so an eval forward must be
 //      bit-identical no matter what jitter seed is installed.
 //   2. Trainer::evaluate() silences the global and RESTORES it. A restore that
 //      is missing (or an evaluate() that zeroes without restoring) leaves every

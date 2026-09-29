@@ -1,5 +1,5 @@
 # Ghassan v1 Pro 1B — 2xT4 DDP pretrain (the missing 1B+2xT4 recipe).
-# Same unified 1B architecture as pro_v1.yaml: ~1.04B total / ~612M active.
+# Same unified 1B architecture as pro_1b_single.yaml: ~1.04B total / ~612M active.
 #   36 layers, 768 hidden, 12 heads, 4 KV heads, 8 experts top-4 + shared.
 # DDP contract (data-parallel, NOT sharded): each rank owns a FULL replica and
 # must stay <=16GB VRAM on its own T4 (same ~14.4GB envelope as pro_v1 single).
@@ -8,7 +8,7 @@
 #   schedule and total-tokens budget are preserved; 2 ranks give ~2x tok/s,
 #   not 2x batch. LR is NOT scaled with world size.)
 # Run: CONFIG_PT=configs/pro_1b_2xt4.yaml CONFIG_SFT=configs/sft_pro_1b_2xt4.yaml \
-#      bash kaggle/train_2xt4.sh (verifies NCCL, VRAM, parity, data, quota).
+#      bash configs/kaggle/train_2xt4.sh (verifies NCCL, VRAM, parity, data, quota).
 # NOTE: the 1B honest peak (~14.4GB) needs the full-16GB preflight gate
 # (--max-vram-mb 16384); the 15GiB gate is for the 480M recipes only.
 

@@ -168,7 +168,7 @@ endif()
 # ---------------------------------------------------------------- Parquet (THE lake input, Hermes English)
 # Native .parquet reading needs Apache Arrow C++ (large dependency, absent on
 # most machines). OFF by default for local CPU builds; Kaggle training MUST
-# use kaggle/setup.sh --with-parquet which installs Arrow and turns this ON.
+# use configs/kaggle/setup.sh --with-parquet which installs Arrow and turns this ON.
 # There is NO JSON file route anymore (parquet-only project): the supplied
 # english_parquet lake is read directly into .gbin shards.
 set(GAI_HAVE_PARQUET OFF)
@@ -181,7 +181,7 @@ if(GAI_ENABLE_PARQUET)
         target_compile_definitions(gai_core PUBLIC GAI_PARQUET=1)
         message(STATUS "[ghassan-ai] parquet: Arrow ${Arrow_VERSION} (native lake input enabled)")
     else()
-        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled (install Arrow: kaggle/setup.sh --with-parquet)")
+        message(WARNING "[ghassan-ai] parquet: GAI_ENABLE_PARQUET=ON but Arrow/Parquet not found -> parquet route disabled (install Arrow: configs/kaggle/setup.sh --with-parquet)")
     endif()
 endif()
 
@@ -195,11 +195,11 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------- executables
-add_executable(ghassan-ai      tools/main.cpp tools/cli_common.cpp)
-add_executable(train_tokenizer tools/train_tokenizer_main.cpp tools/cli_common.cpp)
-add_executable(corpus_stats    tools/corpus_stats_main.cpp tools/cli_common.cpp)
-add_executable(data_pipeline   tools/data_pipeline_main.cpp tools/cli_common.cpp)
-add_executable(gai_train       tools/train_main.cpp tools/cli_common.cpp)
+add_executable(ghassan-ai      tools/inference_cli.cpp tools/cli_common.cpp)
+add_executable(train_tokenizer tools/tokenizer_trainer_cli.cpp tools/cli_common.cpp)
+add_executable(corpus_stats    tools/corpus_inspector_cli.cpp tools/cli_common.cpp)
+add_executable(data_pipeline   tools/data_pipeline_cli.cpp tools/cli_common.cpp)
+add_executable(gai_train       tools/training_cli.cpp tools/cli_common.cpp)
 
 foreach(t ghassan-ai train_tokenizer corpus_stats data_pipeline gai_train)
     target_link_libraries(${t} PRIVATE gai_core)
@@ -207,15 +207,15 @@ foreach(t ghassan-ai train_tokenizer corpus_stats data_pipeline gai_train)
 endforeach()
 
 # ---------------------------------------------------------------- gemini-chat (optional, C++ + libcurl)
-# Maybni ghir ila CURL MSVC-compatible kayna (vcpkg install curl + toolchain).
-# MinGW/msys curl (msys64/ucrt64) makhdamch m3a MSVC linker/headers -> OFF automatically.
-# Ila OFF, khdem b tools/gemini_chat.py (stdlib only, bla install, nefs log format).
+# Built only when an MSVC-compatible libcurl is found (vcpkg: curl + toolchain).
+# A MinGW/msys curl (msys64/ucrt64) cannot link against MSVC -> OFF automatically.
+# When OFF, use the Python helper instead (stdlib only, same log format).
 option(GAI_BUILD_GEMINI_CHAT "Build C++ gemini-chat (needs MSVC-compatible libcurl)" ON)
 find_package(CURL QUIET)
 set(GAI_HAVE_USABLE_CURL OFF)
 if(CURL_FOUND AND GAI_BUILD_GEMINI_CHAT)
     if(MSVC AND "${CURL_INCLUDE_DIR}" MATCHES "[Mm]ingw|[Mm]sys|ucrt64|[Cc]ygwin")
-        message(STATUS "[ghassan-ai] gemini-chat : OFF (found CURL is MinGW/msys: ${CURL_INCLUDE_DIR}; use tools/gemini_chat.py or vcpkg curl)")
+        message(STATUS "[ghassan-ai] gemini-chat : OFF (found CURL is MinGW/msys: ${CURL_INCLUDE_DIR}; use the Python helper or vcpkg curl)")
     else()
         set(GAI_HAVE_USABLE_CURL ON)
     endif()
@@ -226,7 +226,7 @@ if(GAI_HAVE_USABLE_CURL AND EXISTS "${CMAKE_SOURCE_DIR}/tools/gemini_chat.cpp")
     gai_apply_cxx_flags(gemini-chat)
     message(STATUS "[ghassan-ai] gemini-chat : ON (libcurl)")
 elseif(GAI_BUILD_GEMINI_CHAT AND NOT (MSVC AND CURL_FOUND AND "${CURL_INCLUDE_DIR}" MATCHES "[Mm]ingw|[Mm]sys|ucrt64|[Cc]ygwin"))
-    message(STATUS "[ghassan-ai] gemini-chat : OFF (no usable libcurl or tools/gemini_chat.cpp missing; use tools/gemini_chat.py)")
+    message(STATUS "[ghassan-ai] gemini-chat : OFF (no usable libcurl or tools/gemini_chat.cpp missing)")
 endif()
 
 # ---------------------------------------------------------------- tests (portable: cpu + cuda)
@@ -234,6 +234,10 @@ endif()
 if(GAI_BUILD_TESTS)
     enable_testing()
     file(GLOB GAI_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
+    list(LENGTH GAI_TEST_SOURCES GAI_TEST_COUNT)
+    if(GAI_TEST_COUNT EQUAL 0)
+        message(WARNING "[ghassan-ai] GAI_BUILD_TESTS=ON but no tests/test_*.cpp found -> no test targets")
+    endif()
     foreach(tsrc ${GAI_TEST_SOURCES})
         get_filename_component(tname ${tsrc} NAME_WE)
         add_executable(${tname} ${tsrc} ${CMAKE_SOURCE_DIR}/tools/cli_common.cpp)

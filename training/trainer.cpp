@@ -457,7 +457,7 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         if (cfg_.optimizer == "adamw" && total_params > 800000000LL &&
             model_.device() == Device::CUDA) {
             GAI_FAIL(strfmt("optimizer mismatch: %s params with AdamW needs ~%.1fGB extra moments vs Lion and OOMs T4 16GB. "
-                            "Use optimizer: lion for 1B models (see configs/t4_1b.yaml, pro_v1.yaml). "
+                            "Use optimizer: lion for 1B models (see configs/pro_1b_4xt4_legacy.yaml, pro_1b_single.yaml). "
                             "AdamW is optimal only for <=500M models (flash/pro).",
                             human_count(static_cast<u64>(total_params)).c_str(),
                             static_cast<double>(total_params) * 4.0 / 1e9));
@@ -472,12 +472,12 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         if (total_params > 800000000LL && model_.device() == Device::CUDA) {
             if (cfg_.batch_size > 1) {
                 GAI_FAIL(strfmt("1B/T4 recipe: batch_size=%d OOMs 16GB (measured 14.7GB at B=1/T=512/Lion). "
-                                "Use batch_size=1 + grad_accum for throughput (see configs/t4_1b.yaml).",
+                                "Use batch_size=1 + grad_accum for throughput (see configs/pro_1b_4xt4_legacy.yaml).",
                                 cfg_.batch_size));
             }
             if (cfg_.seq_len > 512) {
                 GAI_FAIL(strfmt("1B/T4 recipe: seq_len=%d OOMs 16GB (activations+logits scale with T; T=512 fits, T=1024 kills). "
-                                "Use seq_len=512 for 1B on T4 (see configs/t4_1b.yaml).",
+                                "Use seq_len=512 for 1B on T4 (see configs/pro_1b_4xt4_legacy.yaml).",
                                 cfg_.seq_len));
             }
         }
@@ -1291,7 +1291,7 @@ double Trainer::evaluate(i64 max_batches) {
     Batch batch;
     // Router jitter is TRAIN-ONLY exploration noise (ops.h). Both routers
     // already gate it on the training path (cuda/moe.cu k_route: `train =
-    // probs != nullptr`; core/ops_moe.cpp: `jj > 0 && probs_cache`), and eval
+    // probs != nullptr`; core/ops_cpu_moe.cpp: `jj > 0 && probs_cache`), and eval
     // forwards pass no probs cache, so this is defence in depth rather than a
     // live bug: it makes "eval is never routed noisily" an explicit property of
     // this function instead of an invariant spread across two kernels, and it

@@ -1,6 +1,6 @@
 // Attention CUDA parity gate (P1-4): the custom kernels in cuda/attention.cu
 // (flash-style tiled forward, GQA, SWA, segment-masked packing) must match
-// the CPU references in core/ops_cpu.cpp before any production run.
+// the CPU references in core/ops_cpu_dense.cpp + core/ops_cpu_moe.cpp before any production run.
 //
 // Runs ONLY when built with CUDA on a machine with a device; otherwise prints
 // SKIP and passes (same contract as test_moe_cuda_parity). Covers:

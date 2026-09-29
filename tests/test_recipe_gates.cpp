@@ -39,8 +39,8 @@ static int failures = 0;
 static size_t vram_gate_mb(const std::string& path) {
     const std::string n = fs::path(path).filename().string();
     if (n.find("1b") != std::string::npos ||
-        n.find("pro_v1") != std::string::npos ||
-        n.find("t4_1b") != std::string::npos) {
+        n.find("pro_1b_single") != std::string::npos ||
+        n.find("pro_1b_4xt4_legacy") != std::string::npos) {
         return 16384;
     }
     return 15360;
@@ -185,8 +185,8 @@ int main() {
         // ---- SFT stage: it must name the pretrain checkpoint that SOME
         //      pretrain recipe actually writes, or stage B dies AFTER the whole
         //      pretrain has burned the session. Resolved by the checkpoint path
-        //      itself, not by the file name: sft_en_4xt4.yaml is the 4-GPU
-        //      SFT of en_pro.yaml, so a "strip sft_" lookup would be wrong.
+        //      itself, not by the file name: sft_flash_480m_4xt4.yaml is the 4-GPU
+        //      SFT of flash_480m_single.yaml, so a "strip sft_" lookup would be wrong.
         if (r.t.is_sft() && !r.t.pretrained_checkpoint.empty()) {
             const Recipe* partner = nullptr;
             for (const Recipe& p : recipes) {

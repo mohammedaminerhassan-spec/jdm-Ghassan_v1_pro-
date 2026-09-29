@@ -98,14 +98,14 @@ static ModelConfig model_from_file(const std::string& path) {
 static void test_arch_parity() {
     // Flagship pairs must match exactly (init_std excluded by design).
     const std::vector<std::pair<std::string, std::string>> pairs = {
-        {"configs/en_pro.yaml", "configs/sft_en_pro.yaml"},
-        {"configs/en_pro.yaml", "configs/sft_en_4xt4.yaml"},
-        {"configs/pro_v1.yaml", "configs/sft_pro_v1.yaml"},
+        {"configs/flash_480m_single.yaml", "configs/sft_flash_480m_single.yaml"},
+        {"configs/flash_480m_single.yaml", "configs/sft_flash_480m_4xt4.yaml"},
+        {"configs/pro_1b_single.yaml", "configs/sft_pro_1b_single.yaml"},
         {"configs/pro_1b_2xt4.yaml", "configs/sft_pro_1b_2xt4.yaml"},
-{"configs/en_pro.yaml", "configs/en_2xt4.yaml"},
-{"configs/en_2xt4.yaml", "configs/sft_en_2xt4.yaml"},
-{"configs/sft_en_pro.yaml", "configs/sft_en_2xt4.yaml"},
-{"configs/en_compact_2xt4.yaml", "configs/sft_en_compact_2xt4.yaml"},
+{"configs/flash_480m_single.yaml", "configs/flash_480m_2xt4.yaml"},
+{"configs/flash_480m_2xt4.yaml", "configs/sft_flash_480m_2xt4.yaml"},
+{"configs/sft_flash_480m_single.yaml", "configs/sft_flash_480m_2xt4.yaml"},
+{"configs/flash_109m_compact_2xt4.yaml", "configs/sft_flash_109m_compact_2xt4.yaml"},
     };
     for (const auto& [a_path, b_path] : pairs) {
         try {
@@ -123,7 +123,7 @@ static void test_arch_parity() {
     }
     // Negative control: flipping one model-function field must be detected.
     {
-        ModelConfig a = model_from_file("configs/en_pro.yaml");
+        ModelConfig a = model_from_file("configs/flash_480m_single.yaml");
         ModelConfig b = a;
         b.use_qk_norm = !a.use_qk_norm;
         std::string why;

@@ -1,0 +1,115 @@
+# Ghassan v1 Pro 1B — FLAGSHIP English pretrain for maximum strength (single-T4).
+# Unified 1B architecture: ~1.04B total / ~612M active.
+#   36 layers, 12 heads, 4 KV heads (GQA), 8 experts top-4 + shared, QK-Norm.
+#   E=1280 (20x64, tensor-core aligned), K=4 dense-MoE for strong dialogue.
+# Use flash_480m_single.yaml (480M) when you want the fastest responses; use this file
+# when you want the strongest English understanding on one T4.
+# T4 fit: 1B fp32 = 4.15GB weights + 4.15GB grads + Lion 4.15GB = ~12.4GB,
+# so optimizer MUST stay lion, batch_size=1, seq_len=512, grad_accum=128
+# (65,536 tokens/step). 32k English tokenizer is MANDATORY.
+# Output budget: Kaggle /kaggle/working is 20GB; keep total <=17GB
+# (checkpoints hardlink best+last ~7.9GB + GGUF Q4 ~0.6GB + shards).
+#
+# DATA (Parquet-only, English Hermes lake — Kaggle):
+#   Tokenizer/shards are shared with en_pro: build them once with
+#   EN_PARQUET_DIR=<lake> bash configs/kaggle/build_english_data.sh
+#   (english32k.gtok keep-case + train_english_{chat,instruction}_*.gbin).
+#   Shard recipe there uses --seq-len 1024 windows; the trainer reads
+#   seq_len=512 windows out of them (DataLoader windows any T <= shard docs).
+#
+# CONTEXT WINDOW (controllable):
+#   - model.max_seq_len below is the HARD maximum (KV cache is sized from it).
+#   - training.seq_len (512) is the window the model trains on (<= max_seq_len).
+#   - inference: ghassan-ai generate/chat --ctx N with N <= max_seq_len.
+#   - presets: 2048 = fastest; 4096 = default; 8192 needs rope_scale 2.0
+#     (approximate NTK extrapolation, validate perplexity first).
+#
+# TRAIN (single T4, timeboxed by pilot-measured tok/s, NOT by epochs):
+#   TOK=artifacts/tokenizer/english32k.gtok \
+#   CONFIG_PT=configs/pro_1b_single.yaml CONFIG_SFT=configs/sft_pro_1b_single.yaml \
+#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
+#   CKPT_PT=artifacts/checkpoints/pro_1b_single CKPT_SFT=artifacts/checkpoints/pro_1b_single_sft \
+#   GGUF_OUT=artifacts/ghassan-v1-pro-1b_q4_0.gguf \
+#   bash configs/kaggle/train_1b.sh --time-budget-min 540 --export-profile q4_0
+
+model:
+  vocab_size: 32000
+  hidden_size: 768
+  num_layers: 36
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240  # dense fallback only (unused when use_moe=true)
+  max_seq_len: 4096
+  rope_theta: 10000.0
+  rms_eps: 1.0e-5
+  tie_embeddings: true
+  init_std: 0.02
+  use_moe: true
+  num_experts: 8
+  moe_top_k: 4
+  moe_expert_dim: 1280
+  moe_shared: true
+  moe_aux_scale: 0.01      # classic aux loss (aux-free=false)
+  moe_aux_free: false       # Pro: true = no aux grad (requires aux_scale 0.0)
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
+  rope_yarn_low: 1.0        # Pro YaRN ramp (default = legacy)
+  rope_yarn_high: 32.0
+  sliding_window: 0         # Pro SWA: 0=off (full causal)
+  rope_type: 0              # Pro: 0=interleaved (current kernels)
+
+tokenizer:
+  path: artifacts/tokenizer/english32k.gtok
+  vocab_size: 32000
+
+training:
+  stage: pretrain
+  device: cuda
+  precision: fp32
+  gemm_fp16: true
+  fp16_weight_cache: false
+  ce_chunks: 4
+  loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
+  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  loss_scale_window: 2000
+  batch_size: 1
+  seq_len: 512
+  grad_accum: 128
+  max_steps: 0
+  epochs: 2
+  learning_rate: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 1500
+  optimizer: lion
+  scheduler: wsd
+  sched_decay_frac: 0.2
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+  grad_clip: 1.0
+  ns_steps: 5
+  muon_min_ns_dim: 256
+  muon_vec_ratio: 0.1
+  seed: 42
+  log_every: 10
+  eval_every: 250
+  eval_batches: 20
+  save_every: 500
+  checkpoint_dir: artifacts/checkpoints/pro_1b_single
+  data_dir: artifacts/shards_en
+  resume: auto
+  activation_checkpointing: false
+  ckpt_segments: 1
+  pack_sequences: true
+  output_budget_mb: 18432
+
+data:
+  train_glob: artifacts/shards_en/train_*.gbin
+  val_glob: artifacts/shards_en/val_*.gbin
+  mix:
+    english_chat: 0.80
+    english_instruction: 0.20

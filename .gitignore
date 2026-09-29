@@ -1,5 +1,5 @@
 # Ghassan AI — build artifacts (never commit; local + Kaggle only)
-# NOTE: both build layouts are ignored: kaggle/setup.sh uses build/,
+# NOTE: both build layouts are ignored: configs/kaggle/setup.sh uses build/,
 # local Windows verification builds use build_test/. Binaries/logs inside
 # them (Testing/, bin/, *.ninja) must never pollute git status.
 build/

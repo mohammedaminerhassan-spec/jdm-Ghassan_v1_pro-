@@ -1,5 +1,5 @@
 #include "inference/chat.h"
-#include "dataset/english_logic.h"
+#include "dataset/english_style_policy.h"
 
 #include <iostream>
 #include <algorithm>
