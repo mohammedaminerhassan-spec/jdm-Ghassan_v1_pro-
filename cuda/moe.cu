@@ -139,7 +139,7 @@ __global__ void k_route(const float* logits, float* probs, i32* idx, float* w,
     __syncthreads();
     float sum = 0.0f;
     for (int i = 0; i < W; ++i) sum += sred[i];
-    const float inv = 1.0f / sum;
+    const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
 
     if (probs) {
         float* pr = probs + t * ne;
@@ -213,7 +213,7 @@ __global__ void k_route_bias(const float* logits, const float* bias,
     __syncthreads();
     float sum = 0.0f;
     for (int i = 0; i < W; ++i) sum += sred[i];
-    const float inv = 1.0f / sum;
+    const float inv = sum > 1e-8f ? (1.0f / sum) : 0.0f;
     if (probs) {
         float* pr = probs + t * ne;
         for (int e = tid; e < ne; e += W) {

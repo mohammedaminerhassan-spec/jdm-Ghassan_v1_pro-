@@ -5,8 +5,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="full"
 
-CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/flash_480m_single.yaml}"
-CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_flash_480m_single.yaml}"
+CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/pro_1b_single.yaml}"
+CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_pro_1b_single.yaml}"
 
 SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-540}"
 DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))
@@ -63,13 +63,13 @@ if [[ ! -f "${TOK}" ]]; then
 fi
 PT_DIR="${PT_DIR:-${REPO_DIR}/artifacts/shards_en}"
 SFT_DIR="${SFT_DIR:-${REPO_DIR}/artifacts/shards_en}"
-CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_pro}"
-CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_pro_sft}"
+CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/pro_1b_single}"
+CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/pro_1b_single_sft}"
 GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf}"
 
 echo "============================================================"
 echo "  Ghassan v1 Pro English — Two-Stage Training [${MODE}]"
-echo "  FLAGSHIP single-T4 recipe: ~480M total / ~204M active MoE | WSD + resume"
+echo "  FLAGSHIP single-T4 recipe: ~1.04B total / ~240M active MoE | WSD + resume"
 echo "============================================================"
 
 persist_output() {

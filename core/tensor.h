@@ -47,10 +47,10 @@ public:
     Tensor(std::initializer_list<i64> shape, DType dt, Device dev = Device::CPU)
         : Tensor(std::vector<i64>(shape), dt, dev) {}
 
-    static Tensor zeros(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
-    static Tensor empty(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
+    [[nodiscard]] static Tensor zeros(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
+    [[nodiscard]] static Tensor empty(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
 
-    static Tensor wrap_external(std::vector<i64> shape, DType dt,
+    [[nodiscard]] static Tensor wrap_external(std::vector<i64> shape, DType dt,
                                 void* ptr, size_t nbytes,
                                 std::shared_ptr<void> owner);
     bool is_external() const { return storage_ && storage_->external(); }
@@ -77,10 +77,10 @@ public:
     i32*         i32p()       { return ptr<i32>(); }
     const i32*   i32p() const { return ptr<i32>(); }
 
-    Tensor view(std::vector<i64> shape) const;
+    [[nodiscard]] Tensor view(std::vector<i64> shape) const;
 
-    Tensor to(Device dev) const;
-    Tensor clone() const;
+    [[nodiscard]] Tensor to(Device dev) const;
+    [[nodiscard]] Tensor clone() const;
     void   zero_();
     void   copy_from(const Tensor& src);
 

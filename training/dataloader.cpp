@@ -69,7 +69,11 @@ ShardWriter::ShardWriter(const std::string& path, int vocab_size, bool with_loss
 }
 
 ShardWriter::~ShardWriter() {
-    closed_ = true;
+    // [FIX LOW-4] Flush any pending data. close() is idempotent (no-op if already closed).
+    // Without this, forgetting to call close() silently discards all added documents.
+    if (!closed_) {
+        try { close(); } catch (...) {}  // never throw from destructor
+    }
 }
 
 void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector<u8>* mask) {

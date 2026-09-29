@@ -481,7 +481,7 @@ __global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __res
         sm[33] = t;
     }
     __syncthreads();
-    float inv = 1.0f / sm[33];
+    float inv = sm[33] > 0.0f ? 1.0f / sm[33] : 0.0f;
 
     float* o = out + size_t(h) * hd;
     for (int c = threadIdx.x; c < hd; c += blockDim.x) {
@@ -494,7 +494,8 @@ __global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __res
 __device__ __forceinline__ size_t decode_ring_slot(int j, int pinned_prefix,
                                                      int ring_start, int ring_capacity) {
     if (j < pinned_prefix) return (size_t)j;
-    return (size_t)pinned_prefix + (size_t)((ring_start + (j - pinned_prefix)) % ring_capacity);
+    int cap = ring_capacity > 0 ? ring_capacity : 1;
+    return (size_t)pinned_prefix + (size_t)((ring_start + (j - pinned_prefix)) % cap);
 }
 
 __global__ void k_attn_decode_ring(const float* __restrict__ q, const float* __restrict__ kc,
@@ -551,7 +552,7 @@ __global__ void k_attn_decode_ring(const float* __restrict__ q, const float* __r
         sm[33] = t;
     }
     __syncthreads();
-    float inv = 1.0f / sm[33];
+    float inv = sm[33] > 0.0f ? 1.0f / sm[33] : 0.0f;
 
     float* o = out + size_t(h) * hd;
     for (int c = threadIdx.x; c < hd; c += blockDim.x) {

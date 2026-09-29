@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include <algorithm>
@@ -400,11 +401,11 @@ static const float* rope_freqs(int half, int head_dim, float theta,
     for (int i = 0; i < half; ++i)
         buf[static_cast<size_t>(i)] =
             1.0f / std::pow(theta, (2.0f * static_cast<float>(i)) / static_cast<float>(head_dim));
-    cached = buf;
+    cached = buf;         // copy into thread_local cache
     cached_half = half;
     cached_hd = head_dim;
     cached_theta = theta;
-    return buf.data();
+    return cached.data(); // [FIX CRITICAL-3] return pointer to cached, not to buf (buf may be re-used)
 }
 
 static inline float yarn_freq_single(int i, int head_dim, float theta,
@@ -849,7 +850,7 @@ void attention_decode_ex(const float* q, const float* kcache, const float* vcach
         }
         float sum = 0.f;
         for (int j = j0; j < cur_len; ++j) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
-        float inv = 1.0f / sum;
+        float inv = sum > 0.f ? 1.0f / sum : 0.0f; // [FIX MEDIUM-1] guard against sum=0 (all-masked window)
         float* o = out + static_cast<size_t>(h) * hd;
         std::memset(o, 0, sizeof(float) * static_cast<size_t>(hd));
         for (int j = j0; j < cur_len; ++j) {
@@ -861,8 +862,9 @@ void attention_decode_ex(const float* q, const float* kcache, const float* vcach
 
 static inline size_t decode_ring_slot(int j, int pinned_prefix, int ring_start, int ring_capacity) {
     if (j < pinned_prefix) return static_cast<size_t>(j);
+    const int cap = ring_capacity > 0 ? ring_capacity : 1;
     return static_cast<size_t>(pinned_prefix) +
-           static_cast<size_t>((ring_start + (j - pinned_prefix)) % ring_capacity);
+           static_cast<size_t>((ring_start + (j - pinned_prefix)) % cap);
 }
 
 void attention_decode_ring(const float* q, const float* kcache, const float* vcache,
@@ -900,7 +902,7 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
         }
         float sum = 0.f;
         for (int j = j0; j < cur_len; ++j) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
-        float inv = 1.0f / sum;
+        float inv = sum > 0.f ? 1.0f / sum : 0.0f; // [FIX MEDIUM-1] guard against sum=0 (all-masked ring window)
         float* o = out + static_cast<size_t>(h) * hd;
         std::memset(o, 0, sizeof(float) * static_cast<size_t>(hd));
         for (int j = j0; j < cur_len; ++j) {
@@ -964,11 +966,14 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
 }
 
 namespace {
+// [FIX CRITICAL-2] Protect SCE accumulator from data races (DDP / future multi-thread)
+std::mutex g_sce_acc_mutex;
 double g_sce_acc_loss = 0.0;
 i64 g_sce_acc_count = 0;
 }
 
 void sce_acc_begin() {
+    std::lock_guard<std::mutex> lk(g_sce_acc_mutex);
     g_sce_acc_loss = 0.0;
     g_sce_acc_count = 0;
 }
@@ -978,11 +983,13 @@ void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
     double csum = 0.0;
     i64 cn = 0;
     softmax_cross_entropy(logits, targets, dlogits, n, V, &csum, &cn, z_scale);
+    std::lock_guard<std::mutex> lk(g_sce_acc_mutex);
     g_sce_acc_loss += csum;
     g_sce_acc_count += cn;
 }
 
 void sce_acc_end(double* out_loss_sum, i64* out_count) {
+    std::lock_guard<std::mutex> lk(g_sce_acc_mutex);
     if (out_loss_sum) *out_loss_sum = g_sce_acc_loss;
     if (out_count) *out_count = g_sce_acc_count;
 }
