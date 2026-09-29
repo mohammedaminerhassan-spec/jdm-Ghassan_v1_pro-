@@ -1,20 +1,3 @@
-// Router jitter is TRAIN-ONLY, and evaluate() must leave it that way.
-//
-// The contract has two halves and both are easy to break:
-//
-//   1. Jitter reaches only the training forward. Both routers gate it on the
-//      training path (cuda/moe.cu k_route: `train = probs != nullptr`;
-//      core/ops_cpu_moe.cpp: `jj > 0 && probs_cache`), so an eval forward must be
-//      bit-identical no matter what jitter seed is installed.
-//   2. Trainer::evaluate() silences the global and RESTORES it. A restore that
-//      is missing (or an evaluate() that zeroes without restoring) leaves every
-//      step after the first validation training with a dead router — a silent,
-//      permanent loss of exploration that no log line would ever report.
-//
-// Half 1 is asserted on the real forward/forward_backward pair: the same input
-// and weights give different gradients with different jitter seeds on the
-// training path, and identical logits on the eval path. Half 2 is asserted
-// against a real Trainer.
 #include "training/trainer.h"
 #include "core/ops.h"
 
@@ -45,7 +28,7 @@ static ModelConfig tiny_moe() {
     cfg.moe_expert_dim    = 16;
     cfg.moe_shared        = true;
     cfg.use_qk_norm       = true;
-    cfg.moe_jitter        = 0.01f;   // the value every shipped MoE recipe uses
+    cfg.moe_jitter        = 0.01f;
     return cfg;
 }
 
@@ -57,7 +40,7 @@ static void write_shards(const fs::path& dir, u32 vocab) {
         const std::string p = (dir / (std::string(prefix) + "_dom_0000.gbin")).string();
         std::error_code ec;
         fs::remove(p, ec);
-        ShardWriter w(p, static_cast<int>(vocab), /*with_loss_mask=*/false);
+        ShardWriter w(p, static_cast<int>(vocab), false);
         for (int d = 0; d < 8; ++d) w.add_document(doc);
         w.close();
     }
@@ -81,7 +64,7 @@ static TrainerConfig cfg_for(const fs::path& dir) {
     c.optimizer      = "adamw";
     c.device         = "cpu";
     c.ddp            = false;
-    c.eval_every     = 0;          // evaluate() is called explicitly below
+    c.eval_every     = 0;
     c.save_every     = 0;
     c.log_every      = 0;
     c.checkpoint_dir = (dir / "ckpt").string();
@@ -94,7 +77,6 @@ int main() {
     fs::remove_all(root, ec);
     write_shards(root, 32);
 
-    // ---- half 1: the TRAINING path is jitter-sensitive, the EVAL path is not.
     {
         const ModelConfig m = tiny_moe();
         Model model(m, Device::CPU);
@@ -110,7 +92,7 @@ int main() {
         model.forward_backward(ids.data(), tgt.data(), 1, 16, tr);
         const float g1 = model.find_parameter("layers.0.moe_gate")->g.f32()[0];
         model.zero_grad();
-        ops::set_moe_jitter_seed(2);          // same weights, different noise
+        ops::set_moe_jitter_seed(2);
         model.forward_backward(ids.data(), tgt.data(), 1, 16, tr);
         const float g2 = model.find_parameter("layers.0.moe_gate")->g.f32()[0];
         CHECK(g1 != g2,
@@ -128,14 +110,13 @@ int main() {
               "bit-identical across jitter seeds");
     }
 
-    // ---- half 2: Trainer::evaluate() must restore the configured jitter.
     {
         const ModelConfig m = tiny_moe();
         Model model(m, Device::CPU);
         model.init_weights(11);
         model.enable_grad(true);
         Trainer trainer(model, cfg_for(root));
-        trainer.run();                        // wires loaders + eval arena
+        trainer.run();
         CHECK(ops::moe_jitter() == m.moe_jitter,
               "the run installed the recipe's moe_jitter (" +
                   std::to_string(ops::moe_jitter()) + ")");

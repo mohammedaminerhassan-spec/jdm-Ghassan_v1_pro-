@@ -12,11 +12,7 @@
 
 namespace gai {
 
-// ================================================================ GGUF Format
-// Based on llama.cpp GGUF specification
-// https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
-
-constexpr uint32_t GGUF_MAGIC = 0x46554747u;  // "GGUF"
+constexpr uint32_t GGUF_MAGIC = 0x46554747u;
 constexpr uint32_t GGUF_VERSION = 3;
 
 enum class GGUFType : uint32_t {
@@ -35,7 +31,6 @@ enum class GGUFType : uint32_t {
     FLOAT64 = 12,
 };
 
-// Quantization types (matching GGML)
 enum class GGMLType : uint32_t {
     F32  = 0,
     F16  = 1,
@@ -55,7 +50,7 @@ enum class GGMLType : uint32_t {
 
 struct GGUFMetadataValue {
     GGUFType type;
-    std::vector<uint8_t> data;  // serialized value
+    std::vector<uint8_t> data;
 };
 
 struct GGUFTensorInfo {
@@ -70,8 +65,8 @@ class GGUFWriter {
 public:
     explicit GGUFWriter(const std::string& path);
 
-    void set_arch(const std::string& arch);           // e.g., "ghassan"
-    void set_model_name(const std::string& name);     // e.g., "Ghassan AI 200M"
+    void set_arch(const std::string& arch);
+    void set_model_name(const std::string& name);
     void set_vocab_size(uint32_t v);
     void set_hidden_size(uint32_t h);
     void set_num_layers(uint32_t l);
@@ -85,24 +80,23 @@ public:
     void set_rope_scaling(const std::map<std::string, std::string>& scaling);
     void set_rms_eps(float eps);
     void set_tie_embeddings(bool tie);
-    void set_norm_type(const std::string& type);      // "rmsnorm"
-    void set_ffn_type(const std::string& type);       // "swiglu"
-    void set_attn_type(const std::string& type);      // "gqa_causal"
-    void set_tokenizer_model(const std::string& model); // "bpe"
+    void set_norm_type(const std::string& type);
+    void set_ffn_type(const std::string& type);
+    void set_attn_type(const std::string& type);
+    void set_tokenizer_model(const std::string& model);
     void set_tokenizer_tokens(const std::vector<std::string>& tokens);
     void set_tokenizer_scores(const std::vector<float>& scores);
     void set_tokenizer_token_types(const std::vector<int32_t>& types);
-    void set_tokenizer_merges(const std::vector<std::string>& merges); // "left right"
-    void set_tokenizer_pre(const std::string& pre);       // e.g. "gpt-2"
-    void set_tokenizer_chat_template(const std::string& tmpl); // tokenizer.chat_template
-    // Spec-correct UINT32 writers (token IDs, counts, flags are U32 in GGUF).
+    void set_tokenizer_merges(const std::vector<std::string>& merges);
+    void set_tokenizer_pre(const std::string& pre);
+    void set_tokenizer_chat_template(const std::string& tmpl);
+
     void set_u32(const std::string& key, uint32_t v);
-    // Standard top-level keys (so llama.cpp / ollama / LM Studio can parse).
-    void set_general_type(const std::string& t);          // general.type = "model"
-    void set_quantization_version(uint32_t v);            // general.quantization_version = 2
-    void set_size_label(const std::string& s);            // general.size_label = "500M"
-    // Exact .gtok image embedded for bit-perfect tokenizer restore
-    // (ghassan.tokenizer.gtok ARRAY[UINT8] + ghassan.normalizer.config U32).
+
+    void set_general_type(const std::string& t);
+    void set_quantization_version(uint32_t v);
+    void set_size_label(const std::string& s);
+
     void set_gtok_blob(const std::vector<uint8_t>& blob);
     void set_normalizer_config(uint32_t bits);
     void set_tokenizer_bos_id(uint32_t id);
@@ -111,8 +105,8 @@ public:
     void set_tokenizer_pad_id(uint32_t id);
     void set_tokenizer_add_bos(bool add);
     void set_tokenizer_add_eos(bool add);
-    void set_quantization_profile(const std::string& profile); // "fp16", "q4_0", etc.
-    void set_file_type(uint32_t type);                // 1=fp16, 2=q4_0, etc.
+    void set_quantization_profile(const std::string& profile);
+    void set_file_type(uint32_t type);
     void set_description(const std::string& desc);
     void add_custom_metadata(const std::string& key, const std::string& value);
     void add_custom_metadata(const std::string& key, uint64_t value);
@@ -147,7 +141,7 @@ public:
     int64_t get_int(const std::string& key, int64_t def = 0) const;
     float get_float(const std::string& key, float def = 0.0f) const;
     bool get_bool(const std::string& key, bool def = false) const;
-    // Raw ARRAY[UINT8] blob (exact embedded .gtok image, empty if absent).
+
     std::vector<uint8_t> get_blob(const std::string& key) const;
 
     ModelConfig model_config() const;
@@ -156,8 +150,7 @@ public:
 
     const std::vector<GGUFTensorInfo>& tensors() const { return tensor_infos_; }
     const GGUFTensorInfo* find_tensor(const std::string& name) const;
-    // Finds a weight by our internal name, falling back to the standard
-    // llama.cpp tensor name (so our engine also loads --compat llama files).
+
     const GGUFTensorInfo* find_weight(const std::string& internal) const;
 
     Tensor read_tensor_f32(const std::string& name) const;
@@ -176,11 +169,7 @@ private:
     std::vector<int32_t> tokenizer_token_types_;
     std::vector<uint8_t> gtok_blob_;
     uint64_t file_size_ = 0;
-    // Byte offset where tensor data starts (aligned past the tensor-info
-    // block). Captured ONCE in open() from the checked parse, so every
-    // tensor read seeks directly instead of re-walking the whole header
-    // (data_start_ avoids re-skipping metadata+infos per tensor).
-    // models AND re-parsed with unchecked reads — corrupt-file crash vector).
+
     uint64_t data_start_ = 0;
 
     bool read_metadata(std::istream& is, uint64_t metadata_count);
@@ -200,30 +189,20 @@ struct ExportProfileGGUF {
     std::string name = "fp16";
 };
 
-ExportProfileGGUF gguf_profile_for(const std::string& name);  // fp32 | fp16 | q8_k | q4_0
+ExportProfileGGUF gguf_profile_for(const std::string& name);
 
 void export_model_gguf(const std::string& path, Model& model,
                       const std::string& tokenizer_path,
                       const ExportProfileGGUF& profile,
                       const std::map<std::string, std::string>& extra_meta = {},
                       const std::string& compat = "native");
-// llama.cpp interop: dense Ghassan nets are structurally Llama-compatible
-// (RMSNorm + GQA + RoPE + SwiGLU). Returns false with a reason for MoE /
-// QK-Norm / YaRN configs that have NO exact llama.cpp equivalent — refusing
-// beats writing a file that loads but computes silently-wrong math.
+
 bool llama_compat_ok(const ModelConfig& cfg, std::string* reason);
-// Internal weight name -> standard llama.cpp tensor name ("layers.0.wq" ->
-// "blk.0.attn_q.weight"). Empty when there is no equivalent (MoE parts).
+
 std::string llama_tensor_name(const std::string& internal);
-// MoE Ollama path (experimental Mixtral-style): maps routed experts to
-// blk.{L}.ffn_gate_exps/up_exps/down_exps + router to ffn_gate_inp (transposed).
-// Requires moe_shared=false (no shared-expert equivalent in llama.cpp),
-// no QK-Norm/YaRN/SWA/NeoX/aux-free. Verify with `ghassan-ai logits` vs llama.cpp.
+
 bool llama_moe_compat_ok(const ModelConfig& cfg, std::string* reason);
 std::string llama_moe_tensor_name(const std::string& internal);
-
-// ================================================================
-// Template definitions (must be in header for instantiation)
 
 inline uint64_t GGUFWriter::align_up(uint64_t x, uint64_t alignment) {
     return (x + alignment - 1) & ~(alignment - 1);
@@ -254,18 +233,16 @@ bool GGUFReader::read_pod(std::istream& is, T& v) {
 inline bool GGUFReader::read_string(std::istream& is, std::string& out) {
     uint64_t len = 0;
     if (!is.read(reinterpret_cast<char*>(&len), 8)) return false;
-    // Corrupt-file guard: a u64 length straight into resize() turns 8 header
-    // bytes into a TB-scale allocation attempt (host OOM = hard kill, no
-    // catch). Real strings here are names/tokens (bytes–KBs); refuse loudly.
+
     if (len > (1ull << 28)) return false;
     out.resize(static_cast<size_t>(len));
     return static_cast<bool>(is.read(out.data(), static_cast<std::streamsize>(len)));
 }
 
 inline bool GGUFReader::read_array(std::istream& is, std::vector<uint8_t>& out, uint64_t count) {
-    if (count > (1ull << 30)) return false;  // same corrupt-file guard as above
+    if (count > (1ull << 30)) return false;
     out.resize(static_cast<size_t>(count));
     return static_cast<bool>(is.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(count)));
 }
 
-} // namespace gai
+}

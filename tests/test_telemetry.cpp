@@ -1,7 +1,3 @@
-// Acceptance criterion 9: the telemetry counters fire on the real training
-// path (MoE dispatches, loss evaluations, optimizer steps, syncs) and the
-// report renders. This runs the CPU reference path; on CUDA the same notes
-// fire from the dispatchers in core/ops.cpp.
 #include "core/ops.h"
 #include "model/model.h"
 #include "training/optimizer.h"
@@ -51,7 +47,7 @@ int main() {
     {
         const ops::PerfCounters c = ops::perf_counters();
         CHECK(c.gemm_calls > 0, "GEMM dispatches are counted");
-        // one MoE forward + one backward dispatch per layer
+
         CHECK(c.moe_fwd_calls == static_cast<u64>(cfg.num_layers),
               "MoE forward dispatches == num_layers (launch-storm denominator)");
         CHECK(c.moe_bwd_calls == static_cast<u64>(cfg.num_layers),

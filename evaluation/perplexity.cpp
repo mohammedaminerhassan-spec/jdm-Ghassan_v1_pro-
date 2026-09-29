@@ -42,6 +42,9 @@ PerplexityResult evaluate_shard_perplexity(Generator& generator,
     Batch batch;
     while (batches < max_batches && loader.next(batch)) {
         i64 count = 0;
+
+        GAI_CHECK(batch.ids.size() == batch.targets.size(),
+                  "perplexity: ids/targets length mismatch (dataloader contract)");
         std::vector<u8> loss_mask(batch.ids.size(), 0);
         for (size_t i = 0; i + 1 < batch.targets.size(); ++i) {
             loss_mask[i + 1] = batch.targets[i] >= 0 ? 1 : 0;

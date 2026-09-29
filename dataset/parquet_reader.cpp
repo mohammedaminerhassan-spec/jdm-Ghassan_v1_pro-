@@ -1,15 +1,9 @@
-// dataset/parquet_reader.cpp — see parquet_reader.h for the contract.
 #include "dataset/parquet_reader.h"
 
 #include <algorithm>
 #include <filesystem>
 #include <string>
 
-// Third-party headers MUST live at global scope: including Arrow inside
-// `namespace gai` (as this file once did) drags <bitset>/<string>/etc. into
-// gai:: scope and GCC 11 + Arrow 25 fails with
-// "'__throw_out_of_range_fmt' was not declared in this scope" plus cascading
-// unused-function errors. Global scope keeps ::arrow / ::parquet / ::std exact.
 #ifdef GAI_PARQUET
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
@@ -42,18 +36,12 @@ std::vector<std::string> list_parquet_files(const std::string& dir_or_file) {
 
 #ifdef GAI_PARQUET
 
-// Decode one chunk to UTF-8 strings. Handles the encodings our factory
-// emits (PLAIN + RLE_DICTIONARY over BYTE_ARRAY): plain string/binary
-// arrays read directly, dictionary arrays go through compute::Cast to utf8.
-// Anything else -> empty column + one warning (loud skip, never fatal).
 static bool chunk_to_strings(const arrow::Array& arr, std::vector<std::string>& out,
                              size_t cap, const std::string& file, const std::string& col) {
     const arrow::Array* a = &arr;
-    std::shared_ptr<arrow::Array> held;  // keeps cast results alive
+    std::shared_ptr<arrow::Array> held;
     if (a->type_id() == arrow::Type::DICTIONARY) {
-        // Our lake files are dictionary-encoded strings (pyarrow default).
-        // CastOptions with to_type set is the version-stable spelling
-        // (avoids Safe()/Unsafe() factory drift across Arrow releases).
+
         arrow::compute::CastOptions opts;
         opts.to_type = arrow::utf8();
         auto res = arrow::compute::Cast(arrow::Datum(a), opts);
@@ -61,15 +49,13 @@ static bool chunk_to_strings(const arrow::Array& arr, std::vector<std::string>& 
             log_warn("parquet: cannot decode dictionary column '" + col + "' in " + file);
             return false;
         }
-        // Cast of a whole Array yields an Array datum (not chunked).
+
         held = res.ValueOrDie().make_array();
         a = held.get();
     }
-    // NOTE: LargeStringArray is NOT a BinaryArray (int64 offsets), so the
-    // two layouts need separate accessors. GetString(int64)->std::string is
-    // the long-standing accessor on both classes.
+
     auto push_capped = [&](std::string s) {
-        if (s.size() > cap) s.resize(cap);  // truncate, keep streaming
+        if (s.size() > cap) s.resize(cap);
         out.push_back(std::move(s));
     };
     if (a->type_id() == arrow::Type::STRING || a->type_id() == arrow::Type::BINARY) {
@@ -99,11 +85,7 @@ ParquetTableInfo inspect_parquet(const std::string& path) {
     auto maybe_file = arrow::io::ReadableFile::Open(path);
     if (!maybe_file.ok()) return info;
     std::shared_ptr<arrow::io::RandomAccessFile> file = maybe_file.ValueOrDie();
-// Result-based OpenFile (the Status out-param overload is gone in Arrow 25).
-// The Result spelling below compiles on old AND new Arrow alike.
-    // Arrow 25: OpenFile needs the pool passed explicitly (no default arg),
-    // and row counts come from the file metadata (FileReader::num_rows and
-    // ParquetFileReader::num_rows/num_row_groups are all gone).
+
     auto maybe_reader = parquet::arrow::OpenFile(file, arrow::default_memory_pool());
     if (!maybe_reader.ok()) return info;
     std::unique_ptr<parquet::arrow::FileReader> reader = std::move(maybe_reader).ValueOrDie();
@@ -140,9 +122,7 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
         }
         std::vector<std::string> cols;
         for (int i = 0; i < schema->num_fields(); ++i) cols.push_back(schema->field(i)->name());
-        // Row counts via the file metadata: FileReader::num_rows() and the
-        // ParquetFileReader direct counters are gone in Arrow 25, while
-        // FileMetaData::num_rows()/num_row_groups() are long-stable.
+
         const int64_t file_rows = reader->parquet_reader()->metadata()->num_rows();
         const int file_groups = reader->parquet_reader()->metadata()->num_row_groups();
         if (opts.verbose) {
@@ -152,12 +132,10 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
                             path.c_str(), static_cast<long long>(file_rows),
                             static_cast<int>(cols.size()), cl.c_str()));
         }
-        // Row-group streaming: one group resident at a time (bounded RAM even
-        // for the 275k-row QA table).
+
         for (int rg = 0; rg < file_groups; ++rg) {
             if (opts.max_rows > 0 && static_cast<size_t>(delivered) >= opts.max_rows) break;
-            // Result-based ReadRowGroup: the Status out-param overload is
-            // deprecated since Arrow 24 (fatal under our -Werror).
+
             auto maybe_table = reader->ReadRowGroup(rg);
             if (!maybe_table.ok()) {
                 log_warn(strfmt("parquet: unreadable row group %d in %s; skipped", rg, path.c_str()));
@@ -168,7 +146,7 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
                 log_warn(strfmt("parquet: unreadable row group %d in %s; skipped", rg, path.c_str()));
                 continue;
             }
-            // Decode the needed columns once per group, then zip rows.
+
             std::vector<std::vector<std::string>> col_data(cols.size());
             std::vector<char> col_ok(cols.size(), 0);
             for (size_t c = 0; c < cols.size(); ++c) {
@@ -191,7 +169,7 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
                 for (size_t c = 0; c < cols.size(); ++c) {
                     if (!col_ok[c]) continue;
                     const auto& v = col_data[c];
-                    // A skipped unreadable chunk shortens the column: pad "".
+
                     row[cols[c]] = (r < static_cast<int64_t>(v.size())) ? v[static_cast<size_t>(r)] : "";
                 }
                 cb(row);
@@ -202,26 +180,26 @@ size_t read_parquet_docs(const std::vector<std::string>& files,
     return delivered;
 }
 
-#else  // ---- no Arrow backend: loud stubs (never silent) ----
+#else
 
 bool parquet_available() { return false; }
 
 ParquetTableInfo inspect_parquet(const std::string& path) {
     ParquetTableInfo info;
     info.path = path;
-    info.rows = -1;  // unknown without Arrow
+    info.rows = -1;
     return info;
 }
 
 size_t read_parquet_docs(const std::vector<std::string>& files,
-                         ParquetRowCallback /*cb*/,
-                         const ParquetOptions& /*opts*/) {
+                         ParquetRowCallback ,
+                         const ParquetOptions& ) {
     (void)files;
     GAI_FAIL("parquet input needs Apache Arrow: rebuild with -DGAI_ENABLE_PARQUET=ON "
              "(kaggle/setup.sh --with-parquet). No JSON fallback exists (parquet-only).");
     return 0;
 }
 
-#endif  // GAI_PARQUET
+#endif
 
-} // namespace gai
+}

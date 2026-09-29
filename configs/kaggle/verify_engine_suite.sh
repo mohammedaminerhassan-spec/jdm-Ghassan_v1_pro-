@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/verify_engine_suite.sh — the "is every engine correct?" gate.
-#
-# Cell 3/4/6 prove the build, DDP and the application path. This cell covers
-# what no other cell has:
-#   1. every engine test individually, so a break NAMES ITSELF (ctest hides it)
-#   2. data-quality report on the REAL shards (corpus_stats)
-#   3. the ACTIVATION CHECKPOINTING path on a real T4 -- the flagship
-#      flash_480m_single.yaml ships activation_checkpointing=true + ckpt_segments=2 +
-#      batch_size=2, and until now NO run had ever executed that path on CUDA
-#      (Cell 6 warned "no effect" because it used batch_size=1)
-#   4. ckpt vs non-ckpt numerical agreement (segmented backward must produce
-#      the same gradients as the full arena, or the flagship trains differently)
-#   5. quantization accuracy: val perplexity of fp16 vs q8_k vs q4_0
-#   6. every shipped config with --strict-config (dead/unknown keys fail)
-#   7. resume round-trip on CUDA (train -> kill -> resume -> finish)
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -51,16 +37,9 @@ for t in ${TESTS}; do
 done
 
 step "[2/8] data quality on the REAL corpus (parquet -> text -> corpus_stats)"
-# DISCOVER the lake instead of hardcoding a Kaggle slug: an attached dataset
-# nests arbitrarily deep (.../<slug>/Users/<name>/Desktop/english_parquet),
-# so a literal path breaks the moment the dataset is re-uploaded or renamed —
-# and the gate below then SILENTLY skips, which is worse than failing.
-# EN_LAKE still wins if the caller sets it.
+
 if [[ -z "${EN_LAKE:-}" ]]; then
-    # Strip the filename with parameter expansion, NOT `xargs dirname`: an
-    # attached dataset nests under a path that can contain a space (e.g.
-    # ".../Users/Ghassan PC/Desktop/english_parquet"), and xargs would split
-    # that into two arguments and emit two dirname lines.
+
     _hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
     [[ -n "${_hit}" ]] && EN_LAKE="${_hit%/*}"
     unset _hit
@@ -113,7 +92,7 @@ PY
         ok "conversation JSONL correctly refused ($(grep -c 'cannot parse' "${WORK}/ret_bad.log") parse warnings)"
     fi
     echo "  ---- shipped synth configs are REAL (they are data_pipeline configs) ----"
-    for spec in "synth_large:synth" "synth_billion:synth" "synth_billion:sft_synth"; do
+    for spec in "synthesis_large_200k:synth" "synthesis_billion_scale:synth" "synthesis_billion_scale:sft_synth"; do
         cfg="${spec%%:*}"; sec="${spec##*:}"
         if "${BIN}/data_pipeline" synth --config "configs/${cfg}.yaml" --section "${sec}" --n 5 \
              --out "${WORK}/${cfg}_${sec}.jsonl" > "${WORK}/${cfg}_${sec}.log" 2>&1; then
@@ -125,7 +104,7 @@ PY
         fi
     done
     echo "  ---- an unknown key in a synth config must fail, not be ignored ----"
-    sed 's/^  seed: .*/  seed: 1234\n  p_bogus_typo: 0.5/' configs/synth_large.yaml > "${WORK}/synth_typo.yaml"
+    sed 's/^  seed: .*/  seed: 1234\n  p_bogus_typo: 0.5/' configs/synthesis_large_200k.yaml > "${WORK}/synth_typo.yaml"
     if "${BIN}/data_pipeline" synth --config "${WORK}/synth_typo.yaml" --n 2 \
          --out "${WORK}/typo.jsonl" > "${WORK}/typo.log" 2>&1; then
         bad "unknown synth config key was silently accepted"
@@ -137,7 +116,7 @@ else
 fi
 
 step "[3/8] ACTIVATION CHECKPOINTING on T4 (the flagship path, never run before)"
-# batch_size=2 + ckpt_segments=2 => use_ckpt_ must be TRUE (no 'no effect' warning).
+
 "${BIN}/gai_train" --config configs/flash_480m_single.yaml --device cuda \
   --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
   --batch-size 2 --seq-len 256 --grad-accum 1 --max-steps 3 --warmup 0 \
@@ -154,12 +133,8 @@ fi
 grep -q "pretrain done" "${WORK}/ckpt_on.log" && ok "segmented training completed" || bad "segmented training did not finish"
 
 step "[4/8] segmented backward == full-arena backward (identical data, fp32 exact)"
-# The ONLY difference allowed is the backward strategy: same batch_size (so the
-# sampler draws the SAME windows with the same seed), same everything else, and
-# --ckpt-segments 2 vs 1. Run in pure fp32 (--gemm-fp16 0) so any difference is
-# a real numerical bug, not fp16 accumulation order. Then repeat with fp16 and
-# allow the shape-dependent accumulation slack.
-run_ckpt() {  # $1=segments  $2=gemm_fp16  $3=out log
+
+run_ckpt() {
     "${BIN}/gai_train" --config configs/flash_480m_single.yaml --device cuda \
       --vocab 32000 --layers 2 --hidden 128 --heads 4 --kv-heads 2 \
       --batch-size 2 --seq-len 256 --grad-accum 1 --max-steps 2 --warmup 0 \
@@ -168,7 +143,7 @@ run_ckpt() {  # $1=segments  $2=gemm_fp16  $3=out log
       --data "${SHARDS}" --checkpoint-dir "${WORK}/ckpt_a$1_$2" \
       --tokenizer "${TOK}" --resume none --seed 21 > "$3" 2>&1
 }
-compare() {  # $1=label  $2=logA  $3=logB  $4=max rel diff
+compare() {
     local a b
     a=$(grep -oE "step +1 \| loss [0-9.]+" "$2" | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
     b=$(grep -oE "step +1 \| loss [0-9.]+" "$3" | grep -oE "loss [0-9.]+" | cut -d' ' -f2)
@@ -217,7 +192,8 @@ awk -v fp="${PPL_fp16}" -v q8="${PPL_q8k}" -v q4="${PPL_q40}" 'BEGIN{
 }' || bad "quantization accuracy gate"
 
 step "[6/8] every shipped config parses under --strict-config"
-for cfg in flash_480m_single pro_1b_single pro_1b_4xt4_legacy pro_1b_auxfree_research flash_480m_ollama_compat sft_flash_480m_single sft_pro_1b_single sft_flash_480m_4xt4 cpu_smoke_test; do
+
+for cfg in flash_480m_single pro_1b_single pro_1b_4xt4_legacy pro_1b_auxfree_research flash_480m_ollama_compat sft_flash_480m_single sft_pro_1b_single sft_flash_480m_4xt4 cpu_smoke_test flash_480m_2xt4 sft_flash_480m_2xt4 pro_1b_2xt4 sft_pro_1b_2xt4 flash_109m_compact_2xt4 sft_flash_109m_compact_2xt4; do
     if "${BIN}/gai_train" --config "configs/${cfg}.yaml" --dry-run --device cuda --strict-config \
          > "/tmp/ghassan_engine_cfg_${cfg}.log" 2>&1; then
         printf "  [ok] %-16s %s\n" "${cfg}" "$(grep TOTAL "/tmp/ghassan_engine_cfg_${cfg}.log" | head -1)"

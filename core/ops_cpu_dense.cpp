@@ -14,20 +14,11 @@
 namespace gai {
 namespace cpu {
 
-// ================================================================ GEMM
-// Row-major. Four transpose cases with loop orders chosen for cache locality.
-// The dominant case in this model is NT (C = A * B^T) because weights are
-// stored [out_features, in_features].
-
-// Explicit AVX2+FMA kernels with runtime dispatch. The default build stays
-// baseline x86-64 (SSE2) so binaries run everywhere; on AVX2+FMA machines the
-// hot dot/axpy loops switch to intrinsics.
-// Scalar path is untouched (used on ARM/MSVC/old x86 and via GAI_NO_SIMD=1).
 #if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__) && !defined(_MSC_VER)
 #define GAI_HAVE_AVX2_DISPATCH 1
 #include <immintrin.h>
 namespace simd {
-// Cached once per process (GAI_NO_SIMD=1 forces scalar, e.g. for A/B tests).
+
 inline bool supported() {
     static const bool v = [] {
         const char* e = std::getenv("GAI_NO_SIMD");
@@ -78,7 +69,7 @@ __attribute__((target("avx2,fma"))) inline void axpy_avx2(float* y, const float*
     }
     for (; i < n; ++i) y[i] += a * x[i];
 }
-} // namespace simd
+}
 #else
 #define GAI_HAVE_AVX2_DISPATCH 0
 #endif
@@ -122,7 +113,6 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float beta, float* C, int ldc) {
     if (M <= 0 || N <= 0) return;
 
-    // scale / clear C
     if (beta == 0.0f) {
 #ifdef GAI_OPENMP
         #pragma omp parallel for if(M > 8) schedule(static)
@@ -139,12 +129,6 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     }
     if (K <= 0 || alpha == 0.0f) return;
 
-    // ---------------------------------------------------------------- GEMV
-    // Every GEMM below parallelises over M, but at decode time M==1 so a
-    // plain omp-for would run one iteration on one thread. Split the M==1 NT
-    // case (the shape every linear_forward uses) over N instead, guarded
-    // against nested parallel regions. Small rows stay serial: GEMV decode is
-    // bandwidth-bound, so threads add little there.
     if (M == 1 && !trans_a && trans_b) {
         const float* a = A;
         float*       c = C;
@@ -158,7 +142,7 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     }
 
     if (!trans_a && trans_b) {
-        // C[m,n] += alpha * dot(A[m,:], B[n,:])
+
 #ifdef GAI_OPENMP
         #pragma omp parallel for if(M * static_cast<long long>(N) > 4096) schedule(static)
 #endif
@@ -170,7 +154,7 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
             }
         }
     } else if (!trans_a && !trans_b) {
-        // C[m,:] += alpha * sum_k A[m,k] * B[k,:]
+
 #ifdef GAI_OPENMP
         #pragma omp parallel for if(M > 2) schedule(static)
 #endif
@@ -183,8 +167,7 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
             }
         }
     } else if (trans_a && !trans_b) {
-        // A is [K,M]: C[m,:] += alpha * sum_k A[k,m] * B[k,:]
-        // parallelise over M with a strided read of A (correct, no races)
+
 #ifdef GAI_OPENMP
         #pragma omp parallel for if(M > 2) schedule(static)
 #endif
@@ -196,7 +179,7 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
             }
         }
     } else {
-        // A [K,M], B [N,K]
+
 #ifdef GAI_OPENMP
         #pragma omp parallel for if(M > 2) schedule(static)
 #endif
@@ -246,11 +229,10 @@ void split_qkv(const float* qkv, float* q, float* k, float* v, i64 n, int qd, in
 
 void linear_backward(const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N) {
-    if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, w, K, 1.0f, dx, K);   // dx += dy * W
-    if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);   // dw += dy^T * x
+    if (dx) gemm(false, false, M, K, N, 1.0f, dy, N, w, K, 1.0f, dx, K);
+    if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
 }
 
-// ================================================================ elementwise
 void add(const float* a, const float* b, float* out, i64 n) {
 #ifdef GAI_OPENMP
     #pragma omp parallel for if(n > 8192) schedule(static)
@@ -272,7 +254,6 @@ void scale_inplace(float* a, float s, i64 n) {
     for (i64 i = 0; i < n; ++i) a[i] *= s;
 }
 
-// ================================================================ embedding
 void embedding_forward(const i32* ids, const float* table, float* out,
                        i64 ntok, int dim, int vocab) {
 #ifdef GAI_OPENMP
@@ -288,10 +269,7 @@ void embedding_forward(const i32* ids, const float* table, float* out,
 
 void embedding_backward(const i32* ids, const float* dout, float* dtable,
                         i64 ntok, int dim, int vocab) {
-    // Tokens sharing an id race on the same row, so a naive parallel-for is
-    // wrong. Instead: group positions by id (sort), then run groups in
-    // parallel — groups touch disjoint rows (race-free), each accumulating
-    // positions in ascending order.
+
     if (ntok <= 0) return;
     if (ntok < 256) {
         for (i64 t = 0; t < ntok; ++t) {
@@ -303,11 +281,7 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
         }
         return;
     }
-    // NOTE: these MUST be frame-local, not thread_local: the parallel loop
-    // below runs on worker threads, and a thread_local here would resolve to
-    // each worker's own EMPTY copy (out-of-bounds reads). Workers share the
-    // calling thread's vectors read-only, which is safe. Two small mallocs
-    // per call (~40KB) are negligible next to the megabytes accumulated.
+
     std::vector<std::pair<i32, i64>> order;
     std::vector<size_t> bounds;
     order.reserve(static_cast<size_t>(ntok));
@@ -317,9 +291,7 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
         order.emplace_back(id, t);
     }
     if (order.empty()) return;
-    // FIX P2 (bit-identical claim): std::sort is unstable so positions within
-    // the same id reorder nondeterministically and intra-row add order differs
-    // vs the serial path (~ulp drift). stable_sort keeps (id,t) order exact.
+
     std::stable_sort(order.begin(), order.end(),
               [](const std::pair<i32, i64>& a, const std::pair<i32, i64>& b) {
                   return a.first < b.first;
@@ -332,8 +304,7 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
     }
     bounds.push_back(order.size());
     const size_t ngroups = bounds.size() - 1;
-    // OpenMP loop variable must be signed for MSVC; long long works on all
-    // platforms.
+
 #ifdef GAI_OPENMP
     #pragma omp parallel for schedule(static) if(ngroups > 4)
 #endif
@@ -348,7 +319,6 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
     }
 }
 
-// ================================================================ rmsnorm
 void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrms,
                      i64 rows, int dim, float eps) {
 #ifdef GAI_OPENMP
@@ -356,12 +326,11 @@ void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrm
 #endif
     for (i64 r = 0; r < rows; ++r) {
         const float* xr = x + r * dim;
-        // DeepSeek numerical rule: variance accumulate in f64. In f32,
-        // exploded activations overflow to inf -> inv=0 -> silent zero-out.
+
         double ss = 0.0;
         for (int i = 0; i < dim; ++i) ss += static_cast<double>(xr[i]) * xr[i];
         double inv_d = 1.0 / std::sqrt(ss / static_cast<double>(dim) + static_cast<double>(eps));
-        // Clamp non-finite (eps<=0 or inf input can still produce inf/NaN).
+
         float inv = std::isfinite(inv_d) ? static_cast<float>(inv_d) : 0.0f;
         if (rrms) rrms[r] = inv;
         float* o = out + r * dim;
@@ -371,7 +340,7 @@ void rmsnorm_forward(const float* x, const float* weight, float* out, float* rrm
 
 void rmsnorm_backward(const float* x, const float* weight, const float* dout,
                       const float* rrms, float* dx, float* dweight, i64 rows, int dim) {
-    // dweight needs cross-row accumulation -> per-thread buffers.
+
     int nthreads = 1;
 #ifdef GAI_OPENMP
     nthreads = omp_get_max_threads();
@@ -391,7 +360,6 @@ void rmsnorm_backward(const float* x, const float* weight, const float* dout,
         float inv = rrms[r];
         float* dwl = dw_buf.data() + static_cast<size_t>(tid) * static_cast<size_t>(dim);
 
-        // dot = sum_i g_i * w_i * x_i
         float dot = 0.f;
         for (int i = 0; i < dim; ++i) dot += gr[i] * weight[i] * xr[i];
         float coef = inv * inv * inv / static_cast<float>(dim) * dot;
@@ -411,8 +379,6 @@ void rmsnorm_backward(const float* x, const float* weight, const float* dout,
     }
 }
 
-// ================================================================ rope
-// Interleaved-pair convention: dims (2i, 2i+1) rotate together.
 static inline void rope_pair(float& a, float& b, float c, float s) {
     float na = a * c - b * s;
     float nb = a * s + b * c;
@@ -420,9 +386,6 @@ static inline void rope_pair(float& a, float& b, float c, float s) {
     b = nb;
 }
 
-// `freq` depends only on `i`, never on the token: hoist the frequency table
-// out of the token loop (`half` pow() calls per call instead of ntok*half).
-// A thread-local cache keyed by (head_dim, theta) avoids per-call allocation.
 static const float* rope_freqs(int half, int head_dim, float theta,
                                std::vector<float>& buf) {
     thread_local int cached_half = -1;
@@ -444,8 +407,6 @@ static const float* rope_freqs(int half, int head_dim, float theta,
     return buf.data();
 }
 
-// Full YaRN ramp per-dim frequency (YaRN paper §3): wavelength = 2π/freq.
-// < low -> linear (no scaling), > high -> full 1/scale, else interpolated.
 static inline float yarn_freq_single(int i, int head_dim, float theta,
                                      float yarn_scale, float yarn_low, float yarn_high) {
     float base = 1.0f / std::pow(theta, (2.0f * static_cast<float>(i)) / static_cast<float>(head_dim));
@@ -479,12 +440,13 @@ static void rope_apply(float* q, float* k, const i32* pos,
     #pragma omp parallel for schedule(static)
 #endif
     for (i64 t = 0; t < ntok; ++t) {
-        float p = static_cast<float>(pos[t]);
+
+        const double p = static_cast<double>(pos[t]);
         for (int i = 0; i < half; ++i) {
-            float ang  = p * freqs[i];
+            float ang  = static_cast<float>(p * static_cast<double>(freqs[i]));
             float c = std::cos(ang), s = std::sin(ang) * sign;
             if (rope_type == 1) {
-                // NeoX half-rotate: pair (i, i+half).
+
                 if (q) {
                     for (int h = 0; h < n_heads; ++h) {
                         float* qh = q + (t * n_heads + h) * head_dim;
@@ -522,7 +484,7 @@ void rope_forward(float* q, float* k, const i32* pos,
 
 void rope_backward(float* dq, float* dk, const i32* pos,
                    i64 ntok, int n_heads, int n_kv, int head_dim, float theta) {
-    // rotation is orthogonal -> backward is rotation by -angle
+
     rope_apply(dq, dk, pos, ntok, n_heads, n_kv, head_dim, theta, 0, 1.0f, 32.0f, 1.0f, -1.0f);
 }
 
@@ -548,23 +510,22 @@ static void rope_apply_cached(float* q, float* k, const i32* pos, const float* i
     #pragma omp parallel for schedule(static)
 #endif
     for (i64 t = 0; t < ntok; ++t) {
-        for (int h = 0; h < n_heads; ++h) {
-            float* row = q + (t * n_heads + h) * head_dim;
-            for (int i = 0; i < half; ++i) {
-                float c = std::cos(static_cast<float>(pos[t]) * inv_freq[i]);
-                float s = std::sin(static_cast<float>(pos[t]) * inv_freq[i]) * sign;
+
+        const double p = static_cast<double>(pos[t]);
+        for (int i = 0; i < half; ++i) {
+            const float ang = static_cast<float>(p * static_cast<double>(inv_freq[i]));
+            float c = std::cos(ang);
+            float s = std::sin(ang) * sign;
+            if (q) for (int h = 0; h < n_heads; ++h) {
+                float* row = q + (t * n_heads + h) * head_dim;
                 if (rope_type == 1) {
                     rope_pair(row[i], row[i + half], c, s);
                 } else {
                     rope_pair(row[2 * i], row[2 * i + 1], c, s);
                 }
             }
-        }
-        for (int h = 0; h < n_kv; ++h) {
-            float* row = k + (t * n_kv + h) * head_dim;
-            for (int i = 0; i < half; ++i) {
-                float c = std::cos(static_cast<float>(pos[t]) * inv_freq[i]);
-                float s = std::sin(static_cast<float>(pos[t]) * inv_freq[i]) * sign;
+            if (k) for (int h = 0; h < n_kv; ++h) {
+                float* row = k + (t * n_kv + h) * head_dim;
                 if (rope_type == 1) {
                     rope_pair(row[i], row[i + half], c, s);
                 } else {
@@ -585,7 +546,6 @@ void rope_backward_cached(float* dq, float* dk, const i32* pos, const float* inv
     rope_apply_cached(dq, dk, pos, inv_freq, ntok, n_heads, n_kv, head_dim, rope_type, -1.0f);
 }
 
-// ================================================================ swiglu
 static inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 void swiglu_forward(const float* g, const float* u, float* out, i64 n) {
@@ -610,9 +570,8 @@ void swiglu_backward(const float* g, const float* u, const float* dout,
     }
 }
 
-// ================================================================ softmax
 void softmax_row(float* x, int n) {
-    // Guard n<=0 (misconfig): never read x[0] unconditionally.
+
     if (n <= 0 || !x) return;
     float mx = x[0];
     for (int i = 1; i < n; ++i) mx = std::max(mx, x[i]);
@@ -622,11 +581,6 @@ void softmax_row(float* x, int n) {
     for (int i = 0; i < n; ++i) x[i] *= inv;
 }
 
-// ================================================================ attention
-// q [B,T,H,hd], k/v [B,T,KV,hd], out [B,T,H,hd]
-// probs (optional) [B,H,T,T] lower-triangular (upper part left as 0).
-// Reuse a thread-local scratch that only grows (same monotonic-pool idea as
-// CUDA workspaces). Identical math, zero per-row mallocs.
 void attention_forward(const float* q, const float* k, const float* v,
                        float* out, float* probs,
                        int B, int T, int H, int KV, int hd, float scale) {
@@ -685,14 +639,12 @@ void attention_backward(const float* q, const float* k, const float* v,
                         const float* probs, const float* dout,
                         float* dq, float* dk, float* dv,
                         int B, int T, int H, int KV, int hd, float scale) {
+
+    GAI_CHECK(probs != nullptr, "attention_backward requires cached probs (training path)");
     const int group = H / KV;
     const size_t qs  = static_cast<size_t>(T) * H  * hd;
     const size_t kvs = static_cast<size_t>(T) * KV * hd;
 
-    // Parallelise over (b, kv-head) so that dk/dv writes never race:
-    // all query heads in a group map to the same kv head, handled by one thread.
-    // Flattened loop (no collapse clause: MSVC warns C4849 on it).
-    // Same thread-local reuse as forward.
 #ifdef GAI_OPENMP
     #pragma omp parallel
 #endif
@@ -716,7 +668,6 @@ void attention_backward(const float* q, const float* k, const float* v,
                     const float* qh = q + static_cast<size_t>(b) * qs + (static_cast<size_t>(t) * H + h) * hd;
                     float* dqh = dq + static_cast<size_t>(b) * qs + (static_cast<size_t>(t) * H + h) * hd;
 
-                    // dP_j = dot(go, v_j) ; also accumulate dv_j += p_j * go
                     float dot_pg = 0.f;
                     for (int j = 0; j < len; ++j) {
                         const float* vh = v + static_cast<size_t>(b) * kvs + (static_cast<size_t>(j) * KV + kvh) * hd;
@@ -726,7 +677,7 @@ void attention_backward(const float* q, const float* k, const float* v,
                         float* dvh = dv + static_cast<size_t>(b) * kvs + (static_cast<size_t>(j) * KV + kvh) * hd;
                         axpy_f32(dvh, go, pr[j], hd);
                     }
-                    // softmax jacobian: dS_j = p_j * (dP_j - sum_l p_l dP_l)
+
                     for (int j = 0; j < len; ++j) {
                         float ds = pr[j] * (dsv[static_cast<size_t>(j)] - dot_pg) * scale;
                         if (ds == 0.0f) continue;
@@ -873,8 +824,14 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
 void attention_decode_ex(const float* q, const float* kcache, const float* vcache,
                          float* out, int H, int KV, int hd, int cur_len, int max_len,
                          float scale, float* scratch, int window) {
+    GAI_CHECK(H > 0 && KV > 0 && hd > 0, "attention_decode_ex: empty shape");
+    GAI_CHECK(H % KV == 0, "attention_decode_ex: H must be a multiple of KV");
+    GAI_CHECK(cur_len >= 0 && max_len >= 0 && cur_len <= max_len,
+              "attention_decode_ex: cur_len exceeds KV cache max_len (increase max_context)");
+    GAI_CHECK(q != nullptr && kcache != nullptr && vcache != nullptr && out != nullptr,
+              "attention_decode_ex: null pointer");
+    GAI_CHECK(scratch != nullptr, "attention_decode_ex: null scratch (need H*cur_len floats)");
     const int group = H / KV;
-    (void)max_len;
 #ifdef GAI_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
@@ -954,20 +911,20 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
     }
 }
 
-// ================================================================ loss
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale) {
     double total = 0.0;
     i64 count = 0;
 
-    // dlogits are SUM grads (mirrors CUDA; caller scales by its loss scale
-    // only). Count is still reported.
     for (i64 i = 0; i < n; ++i) if (targets[i] >= 0 && targets[i] < V) ++count;
 
-    // OpenMP reduction order is unspecified, so the loss scalar is not
-    // bit-reproducible run to run. GAI_DETERMINISTIC=1 forces the serial
-    // order for debugging.
+    for (i64 i = 0; i < n; ++i) {
+        GAI_CHECK(targets[i] < V,
+                  strfmt("softmax_cross_entropy: target out of range targets[%lld]=%d (vocab=%d; "
+                         "tokenizer/dataloader mismatch?)", (long long)i, (int)targets[i], V));
+    }
+
     [[maybe_unused]] const bool deterministic = [] {
         const char* e = std::getenv("GAI_DETERMINISTIC");
         return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
@@ -980,7 +937,7 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
         i32 tgt = targets[i];
         float* d = dlogits ? dlogits + i * V : nullptr;
 
-        if (tgt < 0 || tgt >= V) {
+        if (tgt < 0) {
             if (d) std::memset(d, 0, sizeof(float) * static_cast<size_t>(V));
             continue;
         }
@@ -1006,12 +963,10 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     if (out_count)    *out_count = count;
 }
 
-// Host-side loss/count accumulator. Single-threaded by contract; the CUDA
-// backend keeps its accumulators on device.
 namespace {
 double g_sce_acc_loss = 0.0;
 i64 g_sce_acc_count = 0;
-} // namespace
+}
 
 void sce_acc_begin() {
     g_sce_acc_loss = 0.0;
@@ -1032,7 +987,6 @@ void sce_acc_end(double* out_loss_sum, i64* out_count) {
     if (out_count) *out_count = g_sce_acc_count;
 }
 
-// ================================================================ optimizer
 void adamw_step(float* w, const float* g, float* m, float* v, i64 n,
                 float lr, float beta1, float beta2, float eps, float weight_decay,
                 float bc1, float bc2, float grad_scale) {
@@ -1085,7 +1039,6 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
     return s;
 }
 
-// ---------------------------------------------------------------- fast sampling
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids) {
     GAI_CHECK(V > 0 && K >= 1 && K <= V, "topk_select: K out of range");
     std::vector<int> idx(static_cast<size_t>(V));
@@ -1134,5 +1087,5 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
     }
 }
 
-} // namespace cpu
-} // namespace gai
+}
+}

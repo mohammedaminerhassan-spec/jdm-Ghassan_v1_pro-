@@ -7,7 +7,6 @@
 
 namespace gai {
 
-// ---------------------------------------------------------------- PII
 struct PiiReport {
     int emails = 0, phones = 0, urls_with_creds = 0, ibans = 0, cards = 0;
     int api_keys = 0, ids = 0, ips = 0;
@@ -16,17 +15,13 @@ struct PiiReport {
     std::string summary() const;
 };
 
-// Detects and (optionally) redacts personal data. Hand-written scanners rather
-// than std::regex: 10x faster on multi-GB corpora and unicode-safe.
 PiiReport   scan_pii(const std::string& text);
 std::string redact_pii(const std::string& text, PiiReport* report = nullptr);
 
-// ---------------------------------------------------------------- cleaning
 struct CleanConfig {
     bool strip_html          = true;
-    bool strip_urls          = false;   // URLs are legitimate chat content
     bool fix_mojibake        = true;
-    bool drop_pii_lines      = true;    // whole line dropped when PII is found
+    bool drop_pii_lines      = true;
     bool redact_instead_drop = false;
     int  min_chars           = 2;
     int  max_chars           = 100000;
@@ -45,7 +40,6 @@ class Cleaner {
 public:
     explicit Cleaner(CleanConfig cfg = {}) : cfg_(cfg), norm_(cfg.normalizer) {}
 
-    // returns false when the line should be dropped
     bool clean_line(const std::string& in, std::string& out, CleanStats& st) const;
 
     const CleanConfig& config() const { return cfg_; }
@@ -58,19 +52,18 @@ private:
 std::string strip_html_tags(const std::string& s);
 std::string fix_mojibake(const std::string& s);
 
-// ---------------------------------------------------------------- quality
 struct QualityConfig {
-    double max_symbol_ratio    = 0.25;   // punctuation+symbols / chars
+    double max_symbol_ratio    = 0.25;
     double max_digit_ratio     = 0.30;
     double max_upper_ratio     = 0.40;
-    double max_repeat_line     = 0.15;   // fraction of duplicated lines within a doc (stricter)
-    double max_word_repeat     = 0.15;   // most common word / total words (stricter)
+    double max_repeat_line     = 0.15;
+    double max_word_repeat     = 0.15;
     double min_letter_ratio    = 0.45;
     int    min_words           = 2;
     int    max_word_length     = 60;
     bool   require_arabic_or_latin = true;
-    bool   reject_ai_disclaimers   = true; // prevent model from acting like AI assistant
-    bool   reject_placeholders     = true; // prevent unresolved templates/placeholders
+    bool   reject_ai_disclaimers   = true;
+    bool   reject_placeholders     = true;
 };
 
 struct QualityVerdict {
@@ -80,18 +73,9 @@ struct QualityVerdict {
 
 QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg = {});
 
-// PARQUET-ONLY EN profile (Hermes lake: 522k chat + 478k instruction).
-// Relaxed for English code/math/multiple-choice:
-//   min_words=1 (keeps "A."/"D." answers that Darija min_words=2 drops),
-//   min_letter_ratio=0.30 (code has symbols), max_symbol=0.35, max_digit=0.50,
-//   hard AI-disclosure only (normal politeness kept).
-// Use when --style-mode en; Darija keeps quality_check().
 QualityConfig english_quality_config();
 QualityVerdict quality_check_english(const std::string& text, const QualityConfig& cfg = {});
 
-// ---------------------------------------------------------------- toxicity
-// Deliberately conservative: rule lists over slurs/explicit content in Arabic,
-// Darija, French and English. Reduces the worst outputs; not a safety guarantee.
 struct ToxicityResult {
     bool  toxic = false;
     int   hits = 0;
@@ -100,4 +84,4 @@ struct ToxicityResult {
 
 ToxicityResult check_toxicity(const std::string& text);
 
-} // namespace gai
+}

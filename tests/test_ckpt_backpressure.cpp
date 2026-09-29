@@ -12,9 +12,6 @@ static int failures = 0;
     else { std::cout << "  [ok] " << msg << "\n"; } \
 } while (0)
 
-// Old (buggy) policy vs new policy, evaluated at Kaggle 2xT4 RAM = 29GB.
-// Old: budget = 35% phys, gate fails when bytes*2 > budget.
-// New: budget = phys - 8GB reserve, gate fails only when single > budget.
 static size_t old_budget_for(size_t phys) {
     return static_cast<size_t>(static_cast<double>(phys) * 0.35);
 }
@@ -31,22 +28,21 @@ static size_t new_budget_for(size_t phys) {
 static void test_budget_math() {
     const size_t phys_29 = 29ULL << 30;
     const size_t snap_480m = static_cast<size_t>(5.76 * 1024.0 * 1024.0 * 1024.0);
-    const size_t snap_1b_lion = 8ULL << 30;  // ~1B Lion: 4GB weights + 4GB moments
+    const size_t snap_1b_lion = 8ULL << 30;
 
     size_t old_b = old_budget_for(phys_29);
     size_t new_b = new_budget_for(phys_29);
     std::cout << "  phys=29GB old_budget=" << old_b / (1024*1024) << "MB"
               << " new_budget=" << new_b / (1024*1024) << "MB\n";
 
-    // Old policy deterministically rejects the flagship: 5.76*2 > 10.15GB.
     CHECK(snap_480m * 2 > old_b, "old policy rejects 480M (reproduces P0 blocker)");
-    // New policy progresses: single copy fits with margin.
+
     CHECK(snap_480m <= new_b, "new policy allows 480M single copy");
     CHECK(snap_480m * 2 <= new_b, "new policy allows 480M two unique copies (active+queued)");
-    // 1B Lion also progresses under the new budget.
+
     CHECK(snap_1b_lion <= new_b, "new policy allows 1B-Lion single copy");
     CHECK(snap_1b_lion * 2 <= new_b, "new policy allows 1B-Lion active+queued");
-    // Absurd model still fails fast (single copy larger than budget).
+
     CHECK((40ULL << 30) > new_b, "40GB snapshot still exceeds 21GB budget (fail-fast kept)");
 }
 
@@ -63,7 +59,7 @@ static void test_snapshot_bytes_excludes_grads() {
     Model m(cfg, Device::CPU);
     m.init_weights(42);
     m.enable_grad(true);
-    // Dirty a grad so it is non-zero: bytes() must still ignore it.
+
     for (Parameter* p : m.parameters()) {
         if (p->g.defined()) {
             float* g = p->g.f32();
@@ -78,7 +74,7 @@ static void test_snapshot_bytes_excludes_grads() {
     for (const auto& t : snap.weights) w += t.nbytes();
     size_t expect = w + snap.optimizer.bytes();
     CHECK(snap.bytes() == expect, "snapshot bytes = weights + optimizer moments (no grads)");
-    // Grad storage exists on the model but is not serialized.
+
     size_t grad_bytes = 0;
     for (Parameter* p : m.parameters()) if (p->g.defined()) grad_bytes += p->g.nbytes();
     CHECK(grad_bytes > 0, "model grads exist but are excluded from checkpoint");
@@ -101,7 +97,7 @@ static void test_unique_dedup() {
     AdamW opt(m, oc);
     TrainState st;
     auto snap = std::make_shared<CheckpointSnapshot>(Checkpoint::capture(m, opt, st));
-    // Same-step best+last share one pointer: unique bytes count it ONCE.
+
     std::vector<std::shared_ptr<CheckpointSnapshot>> refs = {snap, snap, snap};
     CHECK(unique_snapshot_bytes(refs) == snap->bytes(), "shared snapshot deduped to 1x (best+last same step)");
     auto snap2 = std::make_shared<CheckpointSnapshot>(Checkpoint::capture(m, opt, st));
@@ -114,7 +110,7 @@ int main() {
     test_budget_math();
     test_snapshot_bytes_excludes_grads();
     test_unique_dedup();
-    // Real machine budget sanity (not Kaggle-specific).
+
     size_t b = Trainer::ckpt_ram_budget_public();
     std::cout << "  live ckpt_ram_budget=" << b / (1024*1024) << "MB\n";
     CHECK(b >= (8ULL << 30) || b <= (32ULL << 30), "live budget within [floor,cap] clamp");

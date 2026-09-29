@@ -12,17 +12,14 @@ enum class DType : u32 {
     BF16 = 2,
     I32  = 3,
     I8   = 4,
-    Q8_0 = 5,   // block of 64 int8 + 1 fp32 scale
-    Q4_0 = 6,   // block of 32 int4 (symmetric) + 1 fp16 scale
-    Q4_1 = 7,   // block of 32 int4 + fp16 scale + fp16 min
+    Q8_0 = 5,
+    Q4_0 = 6,
+    Q4_1 = 7,
     U16  = 8,
-    // I64: exact 64-bit integer counters (DDP supervised-token all-reduce via
-    // NCCL ncclInt64). Never a compute dtype — only device-side staging for
-    // collectives, so no kernel needs an I64 path.
+
     I64  = 9,
 };
 
-// ---- quantization block layout (packed, no padding assumptions violated) ----
 constexpr int Q8_BLOCK = 64;
 constexpr int Q4_BLOCK = 32;
 
@@ -32,12 +29,12 @@ struct BlockQ8_0 {
     i8    q[Q8_BLOCK];
 };
 struct BlockQ4_0 {
-    u16 scale;              // fp16 bits
-    u8  q[Q4_BLOCK / 2];    // two nibbles per byte
+    u16 scale;
+    u8  q[Q4_BLOCK / 2];
 };
 struct BlockQ4_1 {
-    u16 scale;              // fp16 bits
-    u16 min;                // fp16 bits
+    u16 scale;
+    u16 min;
     u8  q[Q4_BLOCK / 2];
 };
 #pragma pack(pop)
@@ -49,11 +46,10 @@ static_assert(sizeof(BlockQ4_1) == 4 + Q4_BLOCK / 2, "BlockQ4_1 layout");
 const char* dtype_name(DType t);
 DType       dtype_from_name(const std::string& s);
 bool        dtype_is_quantized(DType t);
-int         dtype_block_size(DType t);      // elements per storage block (1 for dense)
-size_t      dtype_block_bytes(DType t);     // bytes per storage block
+int         dtype_block_size(DType t);
+size_t      dtype_block_bytes(DType t);
 size_t      dtype_nbytes(DType t, size_t numel);
 
-// ------------------------------------------------------------------ fp16
 inline u16 fp32_to_fp16(float f) {
     u32 x;
     std::memcpy(&x, &f, 4);
@@ -61,16 +57,16 @@ inline u16 fp32_to_fp16(float f) {
     i32 exp  = static_cast<i32>((x >> 23) & 0xFF) - 127 + 15;
     u32 mant = x & 0x7FFFFFu;
 
-    if (((x >> 23) & 0xFF) == 0xFF) {                    // inf / nan
+    if (((x >> 23) & 0xFF) == 0xFF) {
         return static_cast<u16>(sign | 0x7C00u | (mant ? 0x200u : 0u));
     }
-    if (exp >= 0x1F) return static_cast<u16>(sign | 0x7C00u);   // overflow -> inf
-    if (exp <= 0) {                                             // subnormal / zero
+    if (exp >= 0x1F) return static_cast<u16>(sign | 0x7C00u);
+    if (exp <= 0) {
         if (exp < -10) return static_cast<u16>(sign);
         mant |= 0x800000u;
         u32 shift = static_cast<u32>(14 - exp);
         u32 sub   = mant >> shift;
-        if ((mant >> (shift - 1)) & 1u) sub += 1;               // round to nearest
+        if ((mant >> (shift - 1)) & 1u) sub += 1;
         return static_cast<u16>(sign | sub);
     }
     u16 h = static_cast<u16>(sign | (static_cast<u32>(exp) << 10) | (mant >> 13));
@@ -86,7 +82,7 @@ inline float fp16_to_fp32(u16 h) {
     if (exp == 0) {
         if (mant == 0) { out = sign; }
         else {
-            // subnormal -> normalize
+
             int e = -1;
             do { mant <<= 1; ++e; } while ((mant & 0x400u) == 0);
             mant &= 0x3FFu;
@@ -102,11 +98,10 @@ inline float fp16_to_fp32(u16 h) {
     return f;
 }
 
-// ------------------------------------------------------------------ bf16
 inline u16 fp32_to_bf16(float f) {
     u32 x;
     std::memcpy(&x, &f, 4);
-    if (((x >> 23) & 0xFF) == 0xFF) return static_cast<u16>(x >> 16);   // inf/nan
+    if (((x >> 23) & 0xFF) == 0xFF) return static_cast<u16>(x >> 16);
     u32 rounded = x + 0x7FFFu + ((x >> 16) & 1u);
     return static_cast<u16>(rounded >> 16);
 }
@@ -118,4 +113,4 @@ inline float bf16_to_fp32(u16 b) {
     return f;
 }
 
-} // namespace gai
+}

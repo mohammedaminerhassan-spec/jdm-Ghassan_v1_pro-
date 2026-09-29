@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/train_full.sh — Ghassan v1 Pro English two-stage training (Kaggle GPU, one session).
-#
-#   Stage A (pretrain, ~55% of budget): English LM on artifacts/shards_en
-#   Stage B (SFT,      ~45% of budget): chat tuning on artifacts/shards_en
-#   -> GGUF export -> English smoke test. Fits inside ONE Kaggle session.
-#
-# Usage:
-#   bash configs/kaggle/train_full.sh                                   # 6h budget (default)
-#   bash configs/kaggle/train_full.sh --time-budget-min 420             # custom budget
-#   bash configs/kaggle/train_full.sh --export-profile q4_0             # default fp16
-#   bash configs/kaggle/train_full.sh --no-export                       # skip GGUF export
-#   bash configs/kaggle/train_full.sh --pilot-only                      # measure speed only
-# ----------------------------------------------------------------
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -19,15 +7,14 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="full"
 CONFIG_PT="${REPO_DIR}/configs/flash_480m_single.yaml"
 CONFIG_SFT="${REPO_DIR}/configs/sft_flash_480m_single.yaml"
-CONFIG_PILOT="${REPO_DIR}/configs/pilot_moe_smoke.yaml"
 TIME_BUDGET_MIN=360
 EXPORT_GGUF=1
 EXPORT_PROFILE="fp16"
 PILOT_STEPS=100
 EXPORT_MARGIN_SEC=900
-PT_FRACTION=55   # % of training time for pretrain (rest goes to SFT)
+PT_FRACTION=55
 
-while [[ $# -gt 0 ]]; do
+while [[ $
     case "$1" in
         --pilot-only)      MODE="pilot";   shift ;;
         --time-budget-min) TIME_BUDGET_MIN="$2"; shift 2 ;;
@@ -40,24 +27,38 @@ done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
-TOK="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
-PT_DIR="${REPO_DIR}/artifacts/shards_en"
-SFT_DIR="${REPO_DIR}/artifacts/shards_en"
-CKPT_PT="${REPO_DIR}/artifacts/checkpoints/en_pro"
-CKPT_SFT="${REPO_DIR}/artifacts/checkpoints/en_pro_sft"
-GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
+TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
+PT_DIR="${PT_DIR:-${REPO_DIR}/artifacts/shards_en}"
+SFT_DIR="${SFT_DIR:-${REPO_DIR}/artifacts/shards_en}"
+CKPT_PT="${CKPT_PT:-${REPO_DIR}/artifacts/checkpoints/en_pro}"
+CKPT_SFT="${CKPT_SFT:-${REPO_DIR}/artifacts/checkpoints/en_pro_sft}"
+GGUF_OUT="${GGUF_OUT:-${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf}"
 
-# FIX P2 (6h run lost on preemption): train_full.sh had no persist trap while
-# train_1b.sh does. Copy the same snapshot-on-exit so Kaggle preemption keeps
-# checkpoints + GGUF (mirrors train_1b.sh:74-83).
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-17408}"
+SESSION_SPENT_MIN="${SESSION_SPENT_MIN:-0}"
+if [[ "${SESSION_SPENT_MIN}" -gt 0 ]]; then
+    TIME_BUDGET_MIN=$(( TIME_BUDGET_MIN - SESSION_SPENT_MIN ))
+    [[ "${TIME_BUDGET_MIN}" -lt 60 ]] && {
+        echo "[ERROR] only ${TIME_BUDGET_MIN}m left after ${SESSION_SPENT_MIN}m spent; refusing a doomed run."
+        exit 1
+    }
+    echo "[time] session already spent ~${SESSION_SPENT_MIN}m; training budget -> ${TIME_BUDGET_MIN}m"
+fi
+
 persist_output() {
-    if [[ -d "/kaggle/working" ]]; then
-        mkdir -p /kaggle/working/output 2>/dev/null || true
-        cp -r "${CKPT_PT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -r "${CKPT_SFT}" /kaggle/working/output/ 2>/dev/null || true
-        cp -f "${GGUF_OUT}" /kaggle/working/output/ 2>/dev/null || true
-        echo "[persist] snapshot copied to /kaggle/working/output"
-    fi
+    [[ -d "/kaggle/working" ]] || return 0
+    local dest="/kaggle/working/output"
+    mkdir -p "${dest}" 2>/dev/null || true
+    local src
+    for src in "${CKPT_PT}" "${CKPT_SFT}" "${GGUF_OUT}"; do
+        case "${src}" in
+            /kaggle/working/*)
+                echo "[persist] already persisted by the platform, skip copy: ${src}" ;;
+            *)
+                echo "[persist] copying ${src} -> ${dest}/"
+                cp -r "${src}" "${dest}/" 2>/dev/null || true ;;
+        esac
+    done
 }
 trap persist_output EXIT INT TERM
 
@@ -91,24 +92,54 @@ else
     echo "[prec] CC ${CC_MAJOR:-?}.x -> fp16 tensor GEMMs"
 fi
 
-# (Old fp32 override REMOVED 2026-09-16: it forced 3-5x-slower pure-fp32 SGEMM
-# on pilot + both stages, so the pilot measured the WRONG recipe. The fp16
-# path is validated by the setup.sh CUDA parity gate + loss-scaler machinery;
-# pilot and stages now run the yaml recipe. Pre-Volta GPUs still fall back
-# to fp32 via the CC<7 check above.)
-
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-mkdir -p "${CKPT_PT}" "${REPO_DIR}/artifacts/checkpoints/en_pro_sft"
+mkdir -p "${CKPT_PT}" "${CKPT_SFT}"
 
-# ---------------------------------------------------------------- pilot: measure tok/s
+run_preflight() {
+    echo ""
+    echo "==================== preflight ===================="
+    [[ -f "${CONFIG_PT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_PT}"; return 1; }
+    [[ -f "${CONFIG_SFT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_SFT}"; return 1; }
+    SFT_PT_CKPT="$(yget pretrained_checkpoint "${CONFIG_SFT}" || true)"
+    if [[ -n "${SFT_PT_CKPT}" ]]; then
+        case "${SFT_PT_CKPT}" in
+            /*) SFT_PT_CKPT_ABS="${SFT_PT_CKPT}" ;;
+            *)  SFT_PT_CKPT_ABS="${REPO_DIR}/${SFT_PT_CKPT}" ;;
+        esac
+        if [[ "${SFT_PT_CKPT_ABS}" != "${CKPT_PT}/last.ckpt" ]]; then
+            echo "[preflight FAIL] SFT->PT chain mismatch: yaml wants ${SFT_PT_CKPT_ABS}, stage A writes ${CKPT_PT}/last.ckpt"
+            echo "              fix: export CKPT_PT=$(dirname "${SFT_PT_CKPT_ABS}") or edit training.pretrained_checkpoint"
+            return 1
+        fi
+        echo "[preflight] SFT->PT checkpoint chain OK"
+    fi
+    [[ -f "${TOK}" ]] || { echo "[preflight FAIL] tokenizer missing: ${TOK}"; return 1; }
+    echo "[preflight] tokenizer present"
+    for d in "${PT_DIR}" "${SFT_DIR}"; do
+        n=$(find "$d" -name "train_*.gbin" 2>/dev/null | wc -l)
+        [[ "$n" -gt 0 ]] || { echo "[preflight FAIL] no train shards in $d"; return 1; }
+    done
+    echo "[preflight] shard dirs non-empty"
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cpu --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cpu --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    echo "==================== preflight: ALL GATES PASSED ===================="
+    return 0
+}
+run_preflight || { echo "[ERROR] preflight failed — fix the gates above."; exit 1; }
+
 echo ""
-echo "[pilot] Measuring real speed (${PILOT_STEPS} steps on pretrain shards)..."
+echo "[pilot] Measuring real speed (${PILOT_STEPS} steps on the REAL PT recipe)..."
 P_START=$(date +%s)
-# --resume none: a stale pilot checkpoint would make this do ~zero work
-# and corrupt the session budget with an absurd tok/s (see train_1b.sh).
-"${BINARY}" --config "${CONFIG_PILOT}" --device cuda --tokenizer "${TOK}" \
-    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --resume none "${FP16_OVERRIDE[@]}"
+
+PILOT_CKPT="${PILOT_CKPT:-/tmp/gai_pilot_full}"
+rm -rf "${PILOT_CKPT}"; mkdir -p "${PILOT_CKPT}"
+trap 'rm -rf "${PILOT_CKPT}"; persist_output' EXIT INT TERM
+
+"${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
+    --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
+    --checkpoint-dir "${PILOT_CKPT}" --output-budget-mb "${OUTPUT_BUDGET_MB}" "${FP16_OVERRIDE[@]}"
+rm -rf "${PILOT_CKPT}"
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START ))
 [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
@@ -117,7 +148,6 @@ P_TPS=$(( $(yget batch_size "${CONFIG_PILOT}") * $(yget seq_len "${CONFIG_PILOT}
 echo "[pilot] ${PILOT_STEPS} steps in ${P_ELAPSED}s -> ~${P_TPS} tok/s"
 if [[ "${MODE}" == "pilot" ]]; then echo "[pilot] Done."; exit 0; fi
 
-# ---------------------------------------------------------------- budget -> steps
 FULL_TPS=$(( $(yget batch_size "${CONFIG_PT}") * $(yget seq_len "${CONFIG_PT}") \
               * $(yget grad_accum "${CONFIG_PT}") ))
 echo "[plan] Full config: ${FULL_TPS} tokens/step"
@@ -125,7 +155,7 @@ BUDGET_SEC=$(( TIME_BUDGET_MIN * 60 ))
 USED_SEC=$(($(date +%s) - P_START))
 REMAIN_SEC=$(( BUDGET_SEC - USED_SEC - EXPORT_MARGIN_SEC ))
 [[ "${REMAIN_SEC}" -lt 600 ]] && { echo "[ERROR] <10min left of budget. Aborting."; exit 1; }
-# seconds per full step ≈ FULL_TPS / P_TPS (pilot tokens are representative)
+
 TOTAL_STEPS=$(awk "BEGIN {printf \"%d\", (${REMAIN_SEC} * ${P_TPS}) / ${FULL_TPS}}")
 [[ "${TOTAL_STEPS}" -lt 100 ]] && TOTAL_STEPS=100
 PT_STEPS=$(( TOTAL_STEPS * PT_FRACTION / 100 ))
@@ -139,38 +169,38 @@ echo "[plan] budget=${TIME_BUDGET_MIN}min used=${USED_SEC}s remain~=${REMAIN_SEC
 echo "[plan] total_steps=${TOTAL_STEPS} (pretrain=${PT_STEPS}, sft=${SFT_STEPS})"
 echo "[plan] ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens this session"
 
-# ---------------------------------------------------------------- Stage A: pretrain
 echo ""
 echo "[stage-A] Pretraining Pro English (${PT_STEPS} steps)..."
 T0=$(date +%s)
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
     --data "${PT_DIR}" --max-steps "${PT_STEPS}" --warmup "${PT_WARM}" \
     --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-    --checkpoint-dir "${CKPT_PT}" --resume auto "${FP16_OVERRIDE[@]}"
+    --checkpoint-dir "${CKPT_PT}" --resume auto "${FP16_OVERRIDE[@]}" \
+    --output-budget-mb "${OUTPUT_BUDGET_MB}"
 echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 
-# ---------------------------------------------------------------- Stage B: SFT
 echo ""
 echo "[stage-B] Instruction tuning on English chat (${SFT_STEPS} steps)..."
 T0=$(date +%s)
+
 if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
+        --checkpoint-dir "${CKPT_SFT}" \
         --resume auto "${FP16_OVERRIDE[@]}" \
+        --output-budget-mb "${OUTPUT_BUDGET_MB}" \
         --export "${GGUF_OUT}" --export-profile "${EXPORT_PROFILE}"
 else
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-        --resume auto "${FP16_OVERRIDE[@]}"
+        --checkpoint-dir "${CKPT_SFT}" \
+        --resume auto "${FP16_OVERRIDE[@]}" \
+        --output-budget-mb "${OUTPUT_BUDGET_MB}"
 fi
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"
 
-# ---------------------------------------------------------------- smoke test (English!)
-# SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
-# must carry its own tokenizer) and no swallowed failure — a broken export
-# must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
     echo "[smoke] English generation test (no sidecar)..."

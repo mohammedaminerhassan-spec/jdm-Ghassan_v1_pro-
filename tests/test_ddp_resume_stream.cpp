@@ -1,8 +1,3 @@
-// P1-10: DDP resume rebuilds each non-root rank as
-// reseed(rank_seed) + skip(saved_batches) instead of inheriting rank 0's
-// loader state. Prove on CPU that this rebuild reproduces the rank's exact
-// data stream (ids + targets + segment_ids), i.e. a resumed rank 1 sees
-// bit-identical batches to an uninterrupted rank 1.
 #include "training/dataloader.h"
 
 #include <filesystem>
@@ -43,7 +38,6 @@ int main() {
     spec.batch_size = 2;
     spec.seq_len = 16;
 
-    // Uninterrupted "rank 1": its own seed stream, 4 batches in.
     const u64 rank1_seed = 42u + 1u * 1000003u;
     DataLoader rank1;
     CHECK(rank1.open({path.string()}, spec, rank1_seed), "rank1 loader opens");
@@ -52,7 +46,6 @@ int main() {
           "rank1 advances 4 batches");
     CHECK(rank1.next(b4), "rank1 batch 4 recorded");
 
-    // A different seed must give a different stream (seeds actually separate).
     {
         DataLoader other;
         CHECK(other.open({path.string()}, spec, 777u), "other-seed loader opens");
@@ -61,8 +54,6 @@ int main() {
         CHECK(!same_batch(ob, b0), "different seeds give different streams");
     }
 
-    // Resume rebuild: fresh loader, reseed to rank1's seed, skip what rank1
-    // already consumed, then the stream must match bit-exactly.
     DataLoader rebuilt;
     CHECK(rebuilt.open({path.string()}, spec, 999u), "rebuilt loader opens");
     rebuilt.reseed(rank1_seed);

@@ -1,10 +1,3 @@
-// v11 regression: a resume with a DIFFERENT tokenizer (.gtok) of the same
-// vocab_size must be REFUSED, not silently trained on different token ids.
-//
-// Why this matters: a multi-session run rebuilds nothing, but a FRESH session
-// (new Kaggle clone) trains its own BPE from the lake. Same vocab_size (32000)
-// does NOT mean same merges -> different ids -> every embedding row and the
-// output softmax point at the wrong tokens. vocab_size alone cannot catch it.
 #include "training/checkpoint.h"
 #include "core/ops.h"
 #include "core/common.h"
@@ -36,7 +29,6 @@ static ModelConfig small_cfg() {
     return c;
 }
 
-// FNV-1a over an in-memory blob, matching gai::fingerprint_file's algorithm.
 static u64 fingerprint_blob(const std::string& s) {
     u64 h = 1469598103934665603ULL;
     for (unsigned char ch : s) { h ^= ch; h *= 1099511628211ULL; }
@@ -51,7 +43,6 @@ int main() {
 
     const std::string path = "test_tok_fp.ckpt";
 
-    // ---- save with fingerprint A
     {
         AdamW opt(model, AdamWConfig{});
         TrainState st;
@@ -63,35 +54,31 @@ int main() {
         Checkpoint::save(path, model, opt, st);
     }
 
-    // ---- same tokenizer (A): resume must be ACCEPTED
     {
         TrainState st;
         bool restored = false;
         const bool ok = Checkpoint::load(path, model, static_cast<AdamW*>(nullptr), st,
-                                         &restored, /*strict=*/false);
+                                         &restored, false);
         CHECK(ok, "resume with the SAME tokenizer is accepted");
         CHECK(st.tok_fingerprint == fingerprint_blob("tokenizer-A-gtok-bytes"),
               "fingerprint round-trips through the checkpoint");
     }
 
-    // ---- DIFFERENT tokenizer (B, same vocab_size): the checkpoint data is
-    // identical, so only the fingerprint can catch this.
     {
         TrainState st;
         const bool ok = Checkpoint::load(path, model, static_cast<AdamW*>(nullptr), st,
-                                         nullptr, /*strict=*/false);
+                                         nullptr, false);
         CHECK(ok, "load itself succeeds (the trainer is what refuses)");
         CHECK(st.tok_vocab == cfg.vocab_size, "vocab_size is identical (size cannot catch it)");
         const u64 fp_b = fingerprint_blob("tokenizer-B-different-merges");
         CHECK(fp_b != fingerprint_blob("tokenizer-A-gtok-bytes"),
               "the two tokenizers really differ in content");
-        // The trainer gate compares exactly these two values.
+
         const bool trainer_would_refuse = (st.tok_fingerprint != 0 && fp_b != 0 &&
                                            st.tok_fingerprint != fp_b);
         CHECK(trainer_would_refuse, "trainer gate refuses a different tokenizer");
     }
 
-    // ---- unknown fingerprint (pre-v11 file) must NOT block: 0 == unknown
     {
         TrainState st;
         st.tok_fingerprint = 0;
@@ -101,7 +88,6 @@ int main() {
         CHECK(!trainer_blocks, "an unknown (pre-v11) fingerprint never blocks a resume");
     }
 
-    // ---- fingerprint_file agrees with the in-memory hash (real file path)
     {
         const std::string tok = "test_tok_fp_fixture.gtok";
         const std::string bytes = "tokenizer-A-gtok-bytes";

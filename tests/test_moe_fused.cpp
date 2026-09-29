@@ -1,8 +1,3 @@
-// F-03 regression: the fused grouped MoE forward must be bit-exact against
-// the token-major reference. This validates the pack/save/scatter fusion
-// LOGIC (indexing, grouped layout, weight application) that cuda/moe.cu
-// implements in k_pack_all / k_save3_all / k_scatter_add_all — so a CUDA bug
-// can only be a translation typo, never a design error.
 #include "core/ops_cpu.h"
 #include "core/rng.h"
 
@@ -35,10 +30,6 @@ static bool exact(const std::vector<float>& a, const std::vector<float>& b,
     return true;
 }
 
-// The final output accumulates expert contributions in grouped order instead
-// of token order, so (like every other CPU/GPU pair in this repo) it agrees
-// to ~1 ulp rather than bitwise. Everything that feeds backward (the saved
-// G/U/A copies) is a pure copy and must be bitwise.
 static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
                      const char* what) {
     if (a.size() != b.size()) {
@@ -63,9 +54,9 @@ static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
 int main() {
     Rng rng;
     rng.seed_with(1234);
-    const int N = 11;      // odd on purpose (tails, uneven expert loads)
-    const int d = 12;      // divisible by 4 (float4 path) ...
-    const int E = 10;      // ... while E is not (scalar tail path)
+    const int N = 11;
+    const int d = 12;
+    const int E = 10;
     const int ne = 5;
     const int K = 2;
     const i64 NK = static_cast<i64>(N) * K;
@@ -113,8 +104,6 @@ int main() {
     exact(su_ref, su_fused, "F-03: saved up activations identical");
     exact(sa_ref, sa_fused, "F-03: saved swiglu activations identical");
 
-    // The grouped layout must be a permutation of the slots (each slot routed
-    // exactly once; empty experts contribute nothing).
     {
         std::vector<int> seen(nslot, 0);
         int total = 0;
@@ -130,7 +119,6 @@ int main() {
         for (size_t s = 0; s < nslot; ++s) CHECK(seen[s] == 1, "F-03: no slot lost or duplicated");
     }
 
-    // idx/w caches agree (same routing decisions).
     {
         bool same = true;
         for (size_t s = 0; s < nslot; ++s)
@@ -138,7 +126,6 @@ int main() {
         CHECK(same, "F-03: routing decisions identical");
     }
 
-    // Dense (no shared expert) variant: routed contribution starts from zero.
     {
         std::fill(out_ref.begin(), out_ref.end(), 0.0f);
         std::fill(out_fused.begin(), out_fused.end(), 0.0f);

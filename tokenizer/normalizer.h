@@ -7,20 +7,17 @@
 namespace gai {
 
 struct NormalizerConfig {
-    bool strip_diacritics    = true;   // harakat carry no information in Darija
+    bool strip_diacritics    = true;
     bool strip_tatweel       = true;
-    bool unify_presentation  = true;   // FB50..FEFF -> base letters
-    bool arabic_digits_ascii = true;   // ٠..٩ -> 0..9
-    bool fold_letters        = false;  // أإآ->ا etc.  OFF for the LM, ON for langid/dedup
+    bool unify_presentation  = true;
+    bool arabic_digits_ascii = true;
+    bool fold_letters        = false;
     bool lowercase_latin     = true;
     bool collapse_whitespace = true;
     bool strip_control       = true;
-    bool strip_zero_width    = true;   // keeps ZWNJ inside Arabic words
-    // P1-11 FIX: Set to false so training/inference text preserves natural
-    // character repetition (e.g. Darija هههههه, code ======, Arabizi laughter).
-    // True was collapsing useful linguistic signals in the LM training data.
-    // Normalizer::canonical() (used for dedup hashing) stays aggressive.
-    bool collapse_repeats    = false;  // was true; false preserves repetitions
+    bool strip_zero_width    = true;
+
+    bool collapse_repeats    = false;
     bool fold_fullwidth      = true;
     int  max_repeat          = 3;
 
@@ -28,7 +25,6 @@ struct NormalizerConfig {
     static NormalizerConfig unpack(u32 bits);
 };
 
-// Text normalization used by both the tokenizer and the dataset pipeline.
 class Normalizer {
 public:
     Normalizer() = default;
@@ -38,17 +34,15 @@ public:
     const NormalizerConfig& config() const { return cfg_; }
     void set_config(const NormalizerConfig& c) { cfg_ = c; }
 
-    // aggressive variant used for hashing / language id / dedup
     static std::string canonical(const std::string& text);
 
 private:
     NormalizerConfig cfg_;
 };
 
-// ---------------------------------------------------------------- pre-tokenizer
 enum class ChunkKind : u8 {
-    Arabic = 0,     // Arabic-script word
-    Latin  = 1,     // Latin word, may embed arabizi digits (3, 7, 9 ...)
+    Arabic = 0,
+    Latin  = 1,
     Number = 2,
     Punct  = 3,
     Space  = 4,
@@ -57,12 +51,10 @@ enum class ChunkKind : u8 {
 };
 
 struct Chunk {
-    std::string text;      // includes the leading space, if any
+    std::string text;
     ChunkKind   kind = ChunkKind::Other;
 };
 
-// Splits text into BPE-mergeable units. A leading space is glued to the following
-// word so detokenisation is exactly reversible.
 std::vector<Chunk> pre_tokenize(const std::string& text);
 
-} // namespace gai
+}

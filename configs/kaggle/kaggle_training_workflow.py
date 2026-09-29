@@ -1,19 +1,3 @@
-# configs/kaggle/kaggle_training_workflow.py ÔÇö Kaggle training workflow, step 3 of 3 (run after cell 2 + Save Version)
-#
-# Runs the whole training session: preflight gates -> 2-rank DDP pilot (measures
-# the real tok/s) -> pretrain -> SFT -> q4_0 GGUF export -> generation smoke.
-#
-# The recipe (flash_109m_compact_2xt4) is the one that fits a single Kaggle session:
-# 109M params / 36M active per token, 4.05 GiB of the 15 GiB per-GPU budget,
-# and a D/N ratio near 2 instead of the 1B's 0.02.
-#
-# Optional environment (a cell above this one):
-#   SESSION_SPENT_MIN  minutes the session ALREADY used (setup + shard build).
-#                      Set it or the 12h Kaggle cap will kill the run mid-stage.
-#                      The cell times its own start and prints a guess otherwise.
-#   CONFIG_PT / CONFIG_SFT  override the recipe pair
-#   KEEP_PT_CKPTS=1        keep stage-1 checkpoints too (costs output quota)
-
 import os
 import re
 import subprocess
@@ -23,25 +7,20 @@ import time
 STEP = [0]
 FAILED = []
 
-
 def rule(title):
     STEP[0] += 1
     bar = "=" * 74
     print("\n" + bar + f"\n[{STEP[0]}] {title}\n" + bar, flush=True)
 
-
 def ok(m):
     print(f"  [ok]   {m}", flush=True)
-
 
 def bad(m):
     FAILED.append(m)
     print(f"  [FAIL] {m}", flush=True)
 
-
 def info(m):
     print(f"  [..]   {m}", flush=True)
-
 
 def load_env(path):
     """Read the KEY="value" lines cell 1 wrote.
@@ -67,12 +46,10 @@ def load_env(path):
             env[k.strip()] = v.strip().strip('"').strip("'")
     return env
 
-
 def apply_env(path):
     for k, v in load_env(path).items():
         os.environ.setdefault(k, v)
     return os.environ
-
 
 def run(cmd, tail=30, log=None, env=None, cwd=None):
     t0 = time.time()
@@ -92,12 +69,11 @@ def run(cmd, tail=30, log=None, env=None, cwd=None):
     print(f"  -> rc={p.returncode}  ({time.time()-t0:.0f}s)", flush=True)
     return p.returncode, out
 
-
 ENV = "/kaggle/working/env.sh"
 for k, v in load_env(ENV).items():
     print(f"  {k} = {v}", flush=True)
 apply_env(ENV)
-# Self-locating (see kaggle_data_workflow.py): any clone path works, env.sh wins.
+
 REPO_DIR = os.environ.get("REPO_DIR") or os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 CFG_PT = os.environ.get("CONFIG_PT", "configs/flash_109m_compact_2xt4.yaml")
@@ -108,10 +84,6 @@ rule("SESSION + GATES")
 run("date; nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader; "
     "df -h /kaggle/working | tail -1; free -g | head -2", tail=12)
 
-# How much of the 12h cap is already gone? Kaggle kills the notebook at 720 min
-# from the SESSION start, not from this cell, and the trainer's own budget clock
-# starts here. If the operator does not say, say it loudly rather than
-# guessing: a 2h data build + an 11h budget = a run killed mid-stage-B.
 spent = os.environ.get("SESSION_SPENT_MIN")
 if not spent:
     info("SESSION_SPENT_MIN is not set.")
@@ -121,11 +93,11 @@ if not spent:
     info("    !SESSION_SPENT_MIN=170 bash configs/kaggle/run_kaggle_en.sh")
     spent = "0"
 
-# The gates are cheap and they are the whole point: prove the recipe fits
-# before the pilot burns GPU minutes.
-for label, cfg, vram, out_mb in (("PT", CFG_PT, 15360, 17408), ("SFT", CFG_SFT, 15360, 17408)):
+is_1b = ("1b" in CFG_PT) or ("1b" in CFG_SFT)
+vram_gate, out_gate = (16384, 18432) if is_1b else (15360, 17408)
+for label, cfg in (("PT", CFG_PT), ("SFT", CFG_SFT)):
     rc, out = run(f"{GAI} --config {cfg} --dry-run --device cuda --strict-config "
-                  f"--max-vram-mb {vram} --output-budget-mb {out_mb}",
+                  f"--max-vram-mb {vram_gate} --output-budget-mb {out_gate}",
                   cwd=REPO_DIR, log=f"/kaggle/working/_cell3_dryrun_{label}.log", tail=28)
     if rc != 0:
         bad(f"{label} dry-run gate failed ÔÇö this recipe would not fit")
@@ -150,7 +122,7 @@ print(f"  session already used: {spent} min", flush=True)
 cmd = "bash configs/kaggle/run_kaggle_en.sh --pt-fraction 60"
 rc, out = run(f"SESSION_SPENT_MIN={spent} CONFIG_PT={CFG_PT} CONFIG_SFT={CFG_SFT} {cmd}",
               cwd=REPO_DIR, log="/kaggle/working/_cell3_train.log", tail=70)
-# The live log is what matters; keep echoing the decision lines as they land.
+
 plan = {}
 for key, pat in (("throughput", r"\[pilot\].*GLOBAL tok/s"),
                  ("plan", r"\[plan\] budget="),
@@ -167,7 +139,7 @@ if rc != 0:
     for ln in out.splitlines():
         if re.search(r"ERROR|FAIL|guard|abort", ln):
             print("   | " + ln.rstrip())
-    # A killed-by-timeout session still leaves a usable last.ckpt; say so.
+
     ck = os.path.join(REPO_DIR, "artifacts", "checkpoints")
     if os.path.isdir(ck):
         for d in sorted(os.listdir(ck)):

@@ -1,7 +1,3 @@
-// F-10 regression: the device-side loss/count accumulate API must agree with
-// repeated single-shot calls, and the host-side fully-masked-block skip must
-// not change numerics. Runs the CPU backend; on CUDA the same dispatchers in
-// core/ops.cpp route to the device accumulators in cuda/kernels.cu.
 #include "core/ops.h"
 #include "core/rng.h"
 #include "model/model.h"
@@ -29,7 +25,6 @@ int main() {
     for (i64 i = 0; i < N; ++i)
         targets[static_cast<size_t>(i)] = (i % 3 == 0) ? -100 : static_cast<i32>(i % V);
 
-    // ---- 1. accumulate API == sum of single-shot calls --------------------
     double ref_sum = 0.0;
     i64 ref_n = 0;
     std::vector<float> dlogits_ref(logits.size(), 0.0f);
@@ -71,7 +66,6 @@ int main() {
         CHECK(same, "F-10: accumulate writes identical dlogits");
     }
 
-    // ---- 2. z-loss scale flows through the accumulate path ----------------
     {
         ops::sce_acc_begin(Device::CPU);
         ops::sce_accumulate(Device::CPU, logits.data(), targets.data(),
@@ -87,7 +81,6 @@ int main() {
               "F-10: z-loss scale is honoured by the accumulate path");
     }
 
-    // ---- 3. host mirror skip: fully-masked blocks change nothing -----------
     {
         ModelConfig cfg;
         cfg.vocab_size = static_cast<int>(V);
@@ -104,8 +97,8 @@ int main() {
         Activations act = m.make_activations(B, T, true, 4);
         std::vector<i32> ids(static_cast<size_t>(B) * T), tgt(static_cast<size_t>(B) * T, -100);
         for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<i32>(i % (V - 1)) + 1;
-        for (size_t i = 0; i < 4; ++i) tgt[i] = ids[i + 1];   // first block supervised...
-        // ...the tail blocks are fully masked (PAD-like).
+        for (size_t i = 0; i < 4; ++i) tgt[i] = ids[i + 1];
+
         i64 ntok_mirror = -1, ntok_plain = -2;
         const double l_mirror = m.forward_backward(ids.data(), tgt.data(), B, T, act,
                                                    &ntok_mirror, 1.0f, false, nullptr,

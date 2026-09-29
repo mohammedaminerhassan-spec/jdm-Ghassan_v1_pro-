@@ -26,7 +26,6 @@ std::string CleanStats::summary() const {
                   human_bytes(bytes_in).c_str(), human_bytes(bytes_out).c_str());
 }
 
-// ================================================================ PII scanners
 namespace {
 
 inline bool isd(char c) { return c >= '0' && c <= '9'; }
@@ -35,7 +34,6 @@ inline bool isaln(char c) { return isd(c) || isal(c); }
 
 struct Span { size_t begin, end; };
 
-// name@domain.tld
 void find_emails(const std::string& s, std::vector<Span>& out) {
     for (size_t i = 0; i < s.size(); ++i) {
         if (s[i] != '@') continue;
@@ -54,7 +52,6 @@ void find_emails(const std::string& s, std::vector<Span>& out) {
     }
 }
 
-// Moroccan and international phone numbers
 void find_phones(const std::string& s, std::vector<Span>& out) {
     size_t i = 0;
     while (i < s.size()) {
@@ -69,12 +66,12 @@ void find_phones(const std::string& s, std::vector<Span>& out) {
             ++e;
         }
         while (e > b && !isd(s[e - 1])) --e;
-        // Moroccan mobile 06/07 + 8 digits, or +212..., or any 9-15 digit run
+
         bool ma = (digits == 10 && b + 1 < s.size() && s[b] == '0' && (s[b + 1] == '6' || s[b + 1] == '7'));
         bool intl = (s[b] == '+' && digits >= 9);
-        bool longrun = digits >= 9 && digits <= 15;
+        bool longrun = digits >= 10 && digits <= 15;
         if (ma || intl || longrun) {
-            // avoid flagging plain long numbers with no separators & no country hint
+
             if (ma || intl || (e - b) > static_cast<size_t>(digits))
                 out.push_back({b, e});
         }
@@ -82,7 +79,6 @@ void find_phones(const std::string& s, std::vector<Span>& out) {
     }
 }
 
-// scheme://user:pass@host
 void find_url_creds(const std::string& s, std::vector<Span>& out) {
     size_t p = 0;
     while ((p = s.find("://", p)) != std::string::npos) {
@@ -132,7 +128,7 @@ void find_cards(const std::string& s, std::vector<Span>& out) {
         }
         while (e > b && !isd(s[e - 1])) --e;
         if (digits >= 13 && digits <= 19) {
-            // Luhn check keeps the false-positive rate low
+
             int sum = 0, parity = digits % 2;
             int idx = 0;
             for (size_t k = b; k < e; ++k) {
@@ -165,14 +161,13 @@ void find_api_keys(const std::string& s, std::vector<Span>& out) {
     }
 }
 
-// Moroccan CIN: 1-2 letters + 5-6 digits
 void find_ids(const std::string& s, std::vector<Span>& out) {
     for (size_t i = 0; i < s.size(); ++i) {
-        if (!isal(s[i])) continue;
+        if (!isal(s[i]) || (s[i] < 'A' || s[i] > 'Z')) continue;
         if (i > 0 && isaln(s[i - 1])) continue;
         size_t j = i;
         int letters = 0;
-        while (j < s.size() && isal(s[j]) && letters < 2) { ++j; ++letters; }
+        while (j < s.size() && s[j] >= 'A' && s[j] <= 'Z' && letters < 2) { ++j; ++letters; }
         size_t k = j;
         int digits = 0;
         while (k < s.size() && isd(s[k])) { ++k; ++digits; }
@@ -200,12 +195,19 @@ void find_ips(const std::string& s, std::vector<Span>& out) {
                 else { ok = false; break; }
             }
         }
-        if (ok && parts == 4 && (e >= s.size() || !isaln(s[e]))) out.push_back({i, e});
+
+        if (ok && parts == 4 && (e >= s.size() || !isaln(s[e]))) {
+            if (e < s.size() && s[e] == '.' && e + 1 < s.size() && isd(s[e + 1])) {
+                i = std::max(e, i + 1);
+                continue;
+            }
+            out.push_back({i, e});
+        }
         i = std::max(e, i + 1);
     }
 }
 
-} // namespace
+}
 
 PiiReport scan_pii(const std::string& text) {
     PiiReport r;
@@ -250,7 +252,7 @@ std::string redact_pii(const std::string& text, PiiReport* report) {
     out.reserve(text.size());
     size_t cur = 0;
     for (const auto& t : all) {
-        if (t.s.begin < cur) continue;   // overlapping match already handled
+        if (t.s.begin < cur) continue;
         out.append(text, cur, t.s.begin - cur);
         out += t.tag;
         cur = t.s.end;
@@ -259,7 +261,6 @@ std::string redact_pii(const std::string& text, PiiReport* report) {
     return out;
 }
 
-// ================================================================ cleaning
 std::string strip_html_tags(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -267,7 +268,7 @@ std::string strip_html_tags(const std::string& s) {
     for (size_t i = 0; i < s.size(); ++i) {
         char c = s[i];
         if (c == '<') {
-            // only treat as a tag if it looks like one
+
             size_t j = i + 1;
             if (j < s.size() && (isal(s[j]) || s[j] == '/' || s[j] == '!')) { in_tag = true; continue; }
         }
@@ -277,7 +278,7 @@ std::string strip_html_tags(const std::string& s) {
         }
         out.push_back(c);
     }
-    // common entities
+
     static const std::pair<const char*, const char*> ents[] = {
         {"&nbsp;", " "}, {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
         {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"}, {"&mdash;", "-"},
@@ -294,8 +295,7 @@ std::string strip_html_tags(const std::string& s) {
 }
 
 std::string fix_mojibake(const std::string& s) {
-    // Arabic UTF-8 read as latin-1 then re-encoded produces "Ø§Ù„..." patterns.
-    // Detect a high density of C3/C2-prefixed sequences and undo the double encode.
+
     size_t suspicious = 0, total = 0;
     for (size_t i = 0; i + 1 < s.size(); ++i) {
         u8 a = static_cast<u8>(s[i]);
@@ -304,7 +304,6 @@ std::string fix_mojibake(const std::string& s) {
     }
     if (total == 0 || suspicious * 2 < total) return s;
 
-    // decode utf8 -> take low byte of each codepoint -> reinterpret as utf8
     std::string bytes;
     bytes.reserve(s.size());
     size_t i = 0;
@@ -323,7 +322,8 @@ bool Cleaner::clean_line(const std::string& in, std::string& out, CleanStats& st
     st.bytes_in += in.size();
 
     if (in.empty()) { ++st.dropped_empty; return false; }
-    if (static_cast<int>(in.size()) > cfg_.max_chars) { ++st.dropped_long; return false; }
+
+    if (static_cast<int>(utf8_length(in)) > cfg_.max_chars) { ++st.dropped_long; return false; }
 
     std::string s = in;
     if (cfg_.fix_mojibake) s = fix_mojibake(s);
@@ -348,7 +348,6 @@ bool Cleaner::clean_line(const std::string& in, std::string& out, CleanStats& st
     return true;
 }
 
-// ================================================================ quality
 QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) {
     QualityVerdict v;
     if (text.empty()) { v.accept = false; v.reason = "empty"; return v; }
@@ -359,8 +358,9 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
             "as an ai language model", "as a language model",
             "as an artificial intelligence", "i don't have personal opinions",
             "i cannot fulfill this request", "i am an ai", "i'm an ai",
-            "openai", "chatgpt", "i cannot provide", "i'm sorry, but i cannot",
+            "i cannot provide", "i'm sorry, but i cannot",
             "i am a large language model"
+
         };
         for (const char* d : disclaimers) {
             if (low.find(d) != std::string::npos) {
@@ -394,7 +394,6 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
     if (symbol_ratio > cfg.max_symbol_ratio) { v.accept = false; v.reason = "symbol spam"; return v; }
     if (digit_ratio > cfg.max_digit_ratio)   { v.accept = false; v.reason = "digit spam"; return v; }
 
-    // uppercase (latin only)
     size_t upper = 0;
     {
         size_t i = 0;
@@ -407,7 +406,6 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
         v.accept = false; v.reason = "shouting"; return v;
     }
 
-    // word statistics
     std::unordered_map<std::string, int> wc;
     std::string cur;
     size_t nwords = 0, maxlen = 0;
@@ -439,7 +437,6 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
         }
     }
 
-    // repeated lines inside a document
     {
         std::unordered_map<std::string, int> lc;
         std::istringstream ls(text);
@@ -461,21 +458,18 @@ QualityVerdict quality_check(const std::string& text, const QualityConfig& cfg) 
     return v;
 }
 
-// ================================================================ english quality
-// PARQUET-ONLY EN profile: keeps Hermes multiple-choice ("A."), code and
-// math that the Darija defaults drop. Single source of truth for --style-mode en.
 QualityConfig english_quality_config() {
     QualityConfig c;
-    c.max_symbol_ratio = 0.35;   // code: = * / { } ; are legitimate
-    c.max_digit_ratio = 0.50;    // math: numbers dominate short answers
-    c.max_upper_ratio = 0.60;    // "A. It compensates..." is uppercase-heavy
+    c.max_symbol_ratio = 0.35;
+    c.max_digit_ratio = 0.50;
+    c.max_upper_ratio = 0.60;
     c.max_repeat_line = 0.30;
-    c.max_word_repeat = 0.40;    // short answers repeat the prompt words
+    c.max_word_repeat = 0.40;
     c.min_letter_ratio = 0.30;
-    c.min_words = 1;             // CRITICAL: keeps "A." multiple-choice answers
-    c.max_word_length = 80;      // URLs / code tokens are long
+    c.min_words = 1;
+    c.max_word_length = 80;
     c.require_arabic_or_latin = true;
-    c.reject_ai_disclaimers = false;  // handled by hard list below (not the full Darija list)
+    c.reject_ai_disclaimers = false;
     c.reject_placeholders = true;
     return c;
 }
@@ -494,11 +488,11 @@ static bool has_hard_disclosure_en(const std::string& text) {
 
 QualityVerdict quality_check_english(const std::string& text, const QualityConfig& cfg) {
     QualityConfig c = cfg;
-    // defaults are the EN profile when the caller passes a default cfg
+
     if (c.min_words == 2 && c.min_letter_ratio == 0.45) c = english_quality_config();
     QualityVerdict v = quality_check(text, c);
     if (!v.accept) {
-        // single-letter / "A." answers fail word stats: rescue them explicitly.
+
         std::string t = text;
         size_t a = t.find_first_not_of(" \t\n\r");
         size_t b = t.find_last_not_of(" \t\n\r");
@@ -517,12 +511,10 @@ QualityVerdict quality_check_english(const std::string& text, const QualityConfi
     return v;
 }
 
-// ================================================================ toxicity
 ToxicityResult check_toxicity(const std::string& text) {
-    // Conservative rule lists. Word-boundary matching to avoid false positives on
-    // innocuous substrings.
+
     static const std::vector<std::pair<const char*, const char*>> terms = {
-        // {term, category} - explicit slurs and sexual content markers
+
         {"قحبة", "slur"}, {"زامل", "slur"}, {"كلب ابن", "slur"},
         {"نيك", "sexual"}, {"طيز", "sexual"}, {"زب", "sexual"},
         {"7mar wld", "slur"}, {"9a7ba", "slur"}, {"zamel", "slur"},
@@ -533,14 +525,12 @@ ToxicityResult check_toxicity(const std::string& text) {
         {"انتحار", "self-harm"}, {"اقتل نفسك", "self-harm"},
     };
 
-    // Match on ASCII alnum boundaries (substring find would fire inside
-    // innocent tokens: "rape" in "grape").
     auto is_word_char = [](char ch) {
         return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
     };
     ToxicityResult r;
     std::string low = to_lower_ascii(text);
-    // pad once so boundary checks never go out of range
+
     const std::string hay = " " + low + " ";
     for (const auto& [term, cat] : terms) {
         size_t pos = 0;
@@ -560,4 +550,4 @@ ToxicityResult check_toxicity(const std::string& text) {
     return r;
 }
 
-} // namespace gai
+}

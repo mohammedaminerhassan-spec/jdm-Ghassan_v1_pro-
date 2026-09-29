@@ -1,7 +1,3 @@
-# Ghassan AI — build artifacts (never commit; local + Kaggle only)
-# NOTE: both build layouts are ignored: configs/kaggle/setup.sh uses build/,
-# local Windows verification builds use build_test/. Binaries/logs inside
-# them (Testing/, bin/, *.ninja) must never pollute git status.
 build/
 build_test/
 build_cpu/
@@ -12,7 +8,6 @@ out/
 *.sdf
 *.opensdf
 
-# Compiled objects / libs / exes
 *.obj
 *.o
 *.lib
@@ -24,7 +19,6 @@ out/
 *.ilk
 *.exp
 
-# Training artifacts (large, local/Kaggle only)
 artifacts/
 kaggle_upload/
 english_parquet/
@@ -39,7 +33,6 @@ data/
 !evaluation/datasets/**/*.jsonl
 corpus_*.txt
 
-# Kaggle / local temp
 *.log
 *.tlog
 *.recipe
@@ -47,7 +40,6 @@ corpus_*.txt
 tmp/
 temp/
 
-# OS / editor
 .DS_Store
 Thumbs.db
 Desktop.ini
@@ -58,7 +50,6 @@ Desktop.ini
 *.swp
 *~
 
-# Python / misc
 __pycache__/
 *.pyc
 .venv/

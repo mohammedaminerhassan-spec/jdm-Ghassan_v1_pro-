@@ -22,8 +22,7 @@ const char* lang_name(LangTag t) {
 }
 
 struct LangId::Lexicons {
-    // High-precision Darija markers in Arabic script. These words essentially never
-    // appear in MSA, so their presence is strong evidence.
+
     std::unordered_set<std::string> darija_ar = {
         "شنو","شنی","اشنو","فين","فوقاش","علاش","كيفاش","شحال","بزاف","دابا","واخا",
         "غادي","كاين","كاينة","ماكاينش","مزيان","مزيانة","زوين","زوينة","دير","ديري",
@@ -39,7 +38,7 @@ struct LangId::Lexicons {
         "طاجين","كسكس","حرشة","أطاي","اتاي","درهم","سوق","دار","الدار","حومة",
         "خويا","خوتي","صاحبي","سحابي","ولد","بنت","والدي","ميمتي","بابا"
     };
-    // Latin/Arabizi Darija markers
+
     std::unordered_set<std::string> darija_latn = {
         "chno","shno","chnou","fin","fine","fo9ach","foqach","3lach","3lash","kifach",
         "kifash","kifak","chhal","shhal","bzaf","bezzaf","daba","wakha","waxa","ghadi",
@@ -55,7 +54,7 @@ struct LangId::Lexicons {
         "labas","lbas","hamdollah","hamdulah","nichan","nishan","bzzaf","bghina",
         "khedma","khdma","tanjia","msakn","3ndna","3ndkom","fhamt","fhemt","mafhemtch"
     };
-    // MSA-only markers (formal register). Their density separates MSA from Darija.
+
     std::unordered_set<std::string> msa = {
         "الذي","التي","الذين","اللذان","هذا","هذه","هؤلاء","ذلك","تلك","أولئك",
         "إن","أن","لكن","لأن","حيث","بينما","عندما","بالتالي","لذلك","إذن",
@@ -75,9 +74,7 @@ struct LangId::Lexicons {
         "bonjour","merci","salut","oui","non","peut","très","bien","plus","aussi",
         "problème","travail","école","maison","voiture","argent","temps","chose"
     };
-    // PARQUET-ONLY EN: expanded from 30 to ~220 markers so Hermes English
-    // (522k chat + 478k instruction) classifies as en, not Other.
-    // Covers questions, instructions, connectors, reasoning, coding.
+
     std::unordered_set<std::string> english = {
         "the","and","is","are","was","were","this","that","with","from","have",
         "has","you","your","they","their","what","when","where","which","would",
@@ -136,7 +133,6 @@ LangScore LangId::classify(const std::string& raw) const {
     LangScore s;
     if (raw.empty()) return s;
 
-    // fold for matching (أ/إ/آ -> ا etc.) so lexicon lookups are spelling-robust
     NormalizerConfig nc;
     nc.fold_letters = true;
     std::string text = Normalizer(nc).normalize(raw);
@@ -155,7 +151,7 @@ LangScore LangId::classify(const std::string& raw) const {
     size_t ar_words = 0, lt_words = 0;
 
     for (const auto& w : words) {
-        // classify the word's script from its first codepoint
+
         size_t p = 0;
         u32 c0 = utf8_decode(w, p);
         bool is_ar = is_arabic_letter(c0);
@@ -164,7 +160,7 @@ LangScore LangId::classify(const std::string& raw) const {
         if (is_ar) {
             if (lex_->darija_ar.count(w)) ++dar_ar;
             if (lex_->msa.count(w)) ++msa;
-            // Darija morphology: verbs prefixed by كا/كي/تا/غا, negation ما...ش
+
             if (w.size() >= 6) {
                 if (w.rfind("كي", 0) == 0 || w.rfind("كا", 0) == 0 ||
                     w.rfind("تا", 0) == 0 || w.rfind("غا", 0) == 0 || w.rfind("ما", 0) == 0) {
@@ -176,7 +172,7 @@ LangScore LangId::classify(const std::string& raw) const {
             if (lex_->darija_latn.count(w)) ++dar_lt;
             if (lex_->french.count(w)) ++fr;
             if (lex_->english.count(w)) ++en;
-            // arabizi: a digit used as a letter inside a Latin word
+
             bool has_letter = false, has_digit = false;
             size_t q = 0;
             while (q < w.size()) {
@@ -203,8 +199,6 @@ LangScore LangId::classify(const std::string& raw) const {
     const double fr_density     = static_cast<double>(fr) / ltw;
     const double en_density     = static_cast<double>(en) / ltw;
 
-    // Decide. Darija wins ties against MSA because Darija markers are high-precision
-    // while MSA markers (في, من, على) also occur inside Darija.
     const bool arabic_dominant = s.arabic_ratio > 0.6;
     const bool latin_dominant  = s.latin_ratio > 0.6;
     const bool mixed_script    = !arabic_dominant && !latin_dominant;
@@ -221,12 +215,7 @@ LangScore LangId::classify(const std::string& raw) const {
             s.confidence = 0.3;
         }
     } else if (latin_dominant) {
-        // Collision guard (Hermes lake): common English words overlap the
-        // Darija-Latin lexicon (had/hit/sir/fine...), so 2 stray collisions
-        // in clearly-English text used to hijack the tag. Each language wins
-        // only against weaker densities; ties keep the legacy Darija tag.
-        // EN threshold 0.08 (+count>=2 rescue): Hermes short answers
-        // ("A. It compensates...") have few markers but are English.
+
         const bool dar_hit = (dar_lt_density >= 0.08 || dar_lt + arabizi >= 2);
         const bool en_hit  = (en_density >= 0.08 || en >= 2);
         const bool fr_hit  = (fr_density >= 0.15);
@@ -247,7 +236,7 @@ LangScore LangId::classify(const std::string& raw) const {
             s.confidence = 0.2;
         }
     } else {
-        // both scripts present in quantity
+
         if (dar_ar + dar_lt + arabizi >= 1) {
             s.tag = LangTag::Mixed;
             s.confidence = 0.6;
@@ -263,7 +252,7 @@ LangScore LangId::classify(const std::string& raw) const {
 bool LangId::is_darija(const std::string& text, double min_conf) const {
     LangScore s = classify(text);
     if (s.is_darija() && s.confidence >= min_conf) return true;
-    // mixed content still counts as Darija if the markers are there
+
     return s.tag == LangTag::Mixed && s.darija_score > 0.05;
 }
 
@@ -271,9 +260,8 @@ double LangId::msa_ratio(const std::string& text) const {
     return classify(text).msa_score;
 }
 
-// ================================================================ style
 const std::vector<std::string>& robotic_phrases() {
-    // The exact register we must keep out of the training data.
+
     static const std::vector<std::string> p = {
         "بالتأكيد",
         "يمكنني مساعدتك",
@@ -332,7 +320,6 @@ StyleFlags check_assistant_style(const std::string& reply, const std::string& us
         }
     }
 
-    // bullet points
     size_t pos = 0;
     while ((pos = reply.find('\n', pos)) != std::string::npos) {
         size_t j = pos + 1;
@@ -351,12 +338,9 @@ StyleFlags check_assistant_style(const std::string& reply, const std::string& us
     size_t user_words = word_split(user_msg).size();
     size_t reply_words = word_split(reply).size();
 
-    // A short question deserves a short answer; long bulleted essays in reply to
-    // "chno khbark" are exactly the robotic failure mode.
     if (user_words <= 20 && f.bullet_count > 3) f.too_many_bullets = true;
     if (user_words <= 12 && reply_words > 80)   f.too_long = true;
 
-    // Darija turn drifting into MSA
     bool user_is_darija = lid.is_darija(user_msg, 0.3);
     if (user_is_darija && rs.tag == LangTag::MSA && rs.msa_score > 0.14) {
         f.excessive_msa = true;
@@ -364,8 +348,6 @@ StyleFlags check_assistant_style(const std::string& reply, const std::string& us
     return f;
 }
 
-// PRO-EN: hard disclosure phrases only (see langid.h). Case-insensitive,
-// normalized like check_assistant_style so "As an AI" matches "as an ai".
 bool has_hard_ai_boilerplate(const std::string& reply) {
     static const char* kHard[] = {
         "as an ai", "as a language model", "as an ai language model",
@@ -382,4 +364,4 @@ bool has_hard_ai_boilerplate(const std::string& reply) {
     return false;
 }
 
-} // namespace gai
+}

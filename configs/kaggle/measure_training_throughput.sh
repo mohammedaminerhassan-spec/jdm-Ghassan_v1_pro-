@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/measure_training_throughput.sh — measure the REAL speed of the flagship recipe, then
-# print the plan for every plausible session budget. Trains nothing.
-#
-# Why this is a cell of its own: every step-count estimate before this was
-# arithmetic on assumed T4 throughput. The pilot runs 20 steps of the ACTUAL
-# recipe (fp16 GEMMs on, activation checkpointing on, real 65,536-token steps,
-# real shards) and measures tok/s, which is the only number the budget maths is
-# allowed to trust. It also prints the host-RAM/disk guards so the numbers come
-# from the real 30 GB box, not from a formula.
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,6 +8,8 @@ BIN="${REPO_DIR}/build/bin"
 TOK="artifacts/tokenizer/english32k.gtok"
 SHARDS="artifacts/shards_en"
 CFG="configs/flash_480m_single.yaml"
+
+case "${CFG}" in *1b*) OUTPUT_BUDGET_MB=18432;; *) OUTPUT_BUDGET_MB=17408;; esac
 
 echo "=============================================================="
 echo "  CELL 8 — pilot: measure the real speed of ${CFG}"
@@ -41,7 +35,7 @@ P_START=$(date +%s)
     --data "${SHARDS}" --max-steps 20 --warmup 5 \
     --eval-every 20 --eval-batches 2 --save-every 20 --log-every 1 \
     --checkpoint-dir /tmp/ghassan_pilot_pilot --resume none \
-    --output-budget-mb 19456 2>&1 | tee /tmp/ghassan_pilot_pilot.log \
+    --output-budget-mb "${OUTPUT_BUDGET_MB}" 2>&1 | tee /tmp/ghassan_pilot_pilot.log \
     | grep -E "^\[info \] (step|  >> val)|host RAM|\[disk\]|\[quota\]|pretrain done|\[scaler\]|ckpt\] (saved|published)|OOM|guard"
 P_END=$(date +%s)
 ELAPSED=$(( P_END - P_START )); [[ "${ELAPSED}" -le 0 ]] && ELAPSED=1
@@ -55,10 +49,7 @@ grep -E "OOM guard|disk guard|host RAM guard|host RAM cannot|output quota guard"
 
 echo ""
 echo "----- [5/5] measured throughput -> honest plans -----"
-# ANCHORED greps. An unanchored 'seq_len:' also matches 'max_seq_len:' in the
-# model block ABOVE training.seq_len, so the pilot counted 4096 instead of
-# 1024 and promised 4x fewer steps than the session can actually run.
-# yget() below is the same anchored read the trainers use.
+
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 B=$(yget batch_size "${CFG}"); T=$(yget seq_len "${CFG}"); A=$(yget grad_accum "${CFG}")
 TOK_PER_STEP=$(( B * T * A ))
@@ -67,9 +58,8 @@ echo "  pilot     : 20 steps in ${ELAPSED}s (includes model load + arena + first
 LAST_TPS=$(grep -oE "[0-9.]+[KM]? tok/s" /tmp/ghassan_pilot_pilot.log | tail -1)
 echo "  steady    : ${LAST_TPS} (from the last step line, excludes startup)"
 echo "  budget    : ${TOK_PER_STEP} tokens/step (B=${B} T=${T} accum=${A})"
-# Corpus size is read from the shards themselves when possible, so the epoch
-# column cannot go stale the way a hardcoded 323.65M did.
-CORPUS_TOKENS=$(build/bin/data_pipeline inspect --shards "${SHARDS}" 2>/dev/null \
+
+CORPUS_TOKENS=$("${BIN}/data_pipeline" inspect --shards "${SHARDS}" 2>/dev/null \
     | awk '/^  total: /{v=$2;
            if (v ~ /K$/) m=1000; else if (v ~ /M$/) m=1000000;
            else if (v ~ /B$/) m=1000000000; else if (v ~ /T$/) m=1000000000000;

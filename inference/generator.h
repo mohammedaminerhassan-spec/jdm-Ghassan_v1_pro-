@@ -11,7 +11,7 @@ namespace gai {
 
 struct GenerationConfig {
     int  max_new_tokens = 256;
-    int  max_context    = 0;         // 0 = model max_seq_len
+    int  max_context    = 0;
     std::vector<i32>         stop_tokens{special::END, special::EOS};
     std::vector<std::string> stop_strings;
     bool echo_prompt = false;
@@ -28,30 +28,24 @@ struct GenerationStats {
     std::string summary() const;
 };
 
-// Autoregressive generator: prefill in one batched forward, then single-token
-// decode against the KV cache.
 class Generator {
 public:
     Generator(Model& model, const Tokenizer& tok, int max_context = 0);
 
-    using StreamFn = std::function<bool(const std::string& piece, i32 token)>;   // return false to stop
+    using StreamFn = std::function<bool(const std::string& piece, i32 token)>;
 
     void reset();
 
-    // Feeds tokens into the cache without sampling (prompt processing).
-    void prefill(const std::vector<i32>& tokens);
+    void prefill(const std::vector<i32>& tokens, int front_drop = 0);
 
-    // Continues from the current cache state.
     std::vector<i32> generate(const GenerationConfig& cfg, StreamFn on_token = nullptr);
 
-    // Convenience: full prompt -> text
     std::string complete(const std::string& prompt, const GenerationConfig& cfg,
                          StreamFn on_token = nullptr);
 
     std::string chat(const std::vector<Message>& msgs, const GenerationConfig& cfg,
                      StreamFn on_token = nullptr);
 
-    // Teacher-forced scoring, used by the evaluation harness.
     double score_tokens(const std::vector<i32>& tokens, const std::vector<u8>* mask = nullptr,
                         i64* out_ntok = nullptr,
                         const std::vector<i32>* segment_ids = nullptr);
@@ -61,19 +55,16 @@ public:
     int context_used() const { return cache_.length(); }
 
 private:
-    // one decode step; returns pointer to HOST logits row for sampling
+
     float* decode_step(i32 token, int position);
-    // same, but stops at the DEVICE logits (no D2H); fast-sampling path
-    // applies GPU penalties + top-k/argmax on top of this.
+
     float* decode_step_logits(i32 token, int position);
     void   forward_prefill(const std::vector<i32>& tokens, int start_pos);
 
-    // fast-sampling scratch (~1KB D2H/token instead of 128KB)
     static constexpr int FAST_TOPK_MAX = 128;
     static constexpr int FAST_HIST_MAX = 2048;
-    // history_ is capped: unbounded growth would raise RAM and slow penalties.
-    // 4096 keeps the full repetition window.
-    static constexpr size_t HIST_MAX = 4096;
+
+    static constexpr size_t HIST_MAX = 8192;
     void push_history(i32 tok) {
         if (history_.size() >= HIST_MAX)
             history_.erase(history_.begin(),
@@ -87,28 +78,19 @@ private:
     int              max_context_;
     Device           expected_device_ = Device::CPU;
 
-    // Absolute token position counter. After the KV ring wraps,
-    // cache_.length() stays capped, but the true RoPE coordinate of the next
-    // token must keep increasing monotonically. Using cache_.length() as
-    // position after eviction corrupts the relative positional distances
-    // between retained cached keys and the new query.
     int64_t          absolute_pos_ = 0;
 
-    // decode scratch (single token) on the MODEL device (CPU or CUDA).
-    // Using Tensors (not std::vector) fixes the latent CUDA bug where host
-    // pointers were passed to device kernels. Host staging is only for the
-    // token id, position, and final logits row consumed by the sampler.
     Tensor x_, xb_, q_, k_, v_, qkv_, attn_, proj_, gate_, up_, act_, logits_dev_, scores_;
     Tensor tok_dev_, pos_dev_;
-    Tensor hlast_;   // [d] last-row norm scratch for the prefill head
-    Tensor topk_vals_dev_, topk_ids_dev_;   // [FAST_TOPK_MAX] device candidates
-    std::vector<float> topk_vals_host_;     // [FAST_TOPK_MAX] copied per token
+    Tensor hlast_;
+    Tensor topk_vals_dev_, topk_ids_dev_;
+    std::vector<float> topk_vals_host_;
     std::vector<i32>   topk_ids_host_;
-    // MoE decode scratch: [K, E] slot buffers
+
     Tensor moe_gate_, moe_up_, moe_act_;
-    std::vector<float> logits_host_;   // [V] sampled on CPU
+    std::vector<float> logits_host_;
     std::vector<i32>   history_;
     GenerationStats    stats_;
 };
 
-} // namespace gai
+}

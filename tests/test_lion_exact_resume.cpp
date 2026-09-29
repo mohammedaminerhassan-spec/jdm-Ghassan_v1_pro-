@@ -1,11 +1,3 @@
-// P0-2 regression: exact resume of a genuine LION continuation must be
-// ACCEPTED. The scheduler gate used to compare the saved (effective Lion)
-// peak against raw learning_rate, so every exact Lion resume failed with a
-// bogus "scheduler recipe differs" mismatch (3e-5 vs 3e-4).
-//
-// Mirrors tests/test_trainer_ckpt_flow.cpp on CPU with a tiny model:
-// run 3 Lion steps -> exact-resume for 2 more -> the schedule continues.
-// Before the effective_peak_lr() fix, step 2 aborted here.
 #include "training/trainer.h"
 #include "training/checkpoint.h"
 
@@ -55,7 +47,7 @@ static TrainerConfig lion_cfg(const std::string& data_dir, const std::string& ck
     c.max_steps = 3;
     c.epochs = 0;
     c.warmup_steps = 1;
-    c.learning_rate = 3e-4f;   // Lion effective peak must be 3e-5, not 3e-4
+    c.learning_rate = 3e-4f;
     c.min_lr_ratio = 0.1f;
     c.scheduler = "wsd";
     c.optimizer = "lion";
@@ -101,7 +93,6 @@ int main() {
     }
     CHECK(fs::exists(root / "ckpt" / "last.ckpt", ec), "last.ckpt was published");
 
-    // The saved scheduler peak must be the EFFECTIVE Lion peak (0.1x).
     {
         ModelConfig ckpt_cfg;
         TrainState st;
@@ -111,7 +102,6 @@ int main() {
         CHECK(rel < 1e-4, "saved sched_peak is the Lion effective peak (3e-5)");
     }
 
-    // Exact resume of the genuine Lion continuation is accepted.
     {
         Model model(tiny_config(), Device::CPU);
         model.init_weights(1);

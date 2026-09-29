@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/setup.sh — Build Ghassan AI from source on a Kaggle GPU session.
-# Usage: bash configs/kaggle/setup.sh [--clean] [--skip-tests] [--skip-data] [--with-parquet]
-# ----------------------------------------------------------------
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -15,9 +13,7 @@ REQUIRE_GPU=0
 REQUIRE_NCCL=0
 WITH_PARQUET=OFF
 
-# Parse args (tests are SKIPPED by default to save Kaggle time; pass
-# --run-tests to execute the validation suite after the build)
-while [[ $# -gt 0 ]]; do
+while [[ $
     case "$1" in
         --clean)       DO_CLEAN=1;      shift ;;
         --run-tests)   SKIP_TESTS=0;    shift ;;
@@ -35,14 +31,12 @@ echo "============================================================"
 echo "  Ghassan v1 Flash (MoE) — Kaggle Build + Data Setup"
 echo "============================================================"
 
-# ---- 1. System info
 echo ""
 echo "[system] OS: $(uname -srm)"
 echo "[system] CPUs: $(nproc)"
 echo "[system] RAM: $(free -h | awk '/^Mem:/{print $2}')"
 echo "[system] Disk: $(df -h . | awk 'NR==2{print $4}') free"
 
-# ---- 2. GPU detection
 if [[ "${FORCE_CPU}" -eq 1 ]]; then
     echo ""
     echo "[GPU] Forced CPU-only build (--cpu-only)"
@@ -59,7 +53,7 @@ elif command -v nvidia-smi &>/dev/null; then
     CC_RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1)
     CC_CMAKE=$(echo "$CC_RAW" | tr -d '.' | tr -d ' ')
     if [[ -z "${CC_CMAKE}" ]]; then
-        # no compute capability reported: let CMake pick the default arches
+
         CUDA_ARCH_FLAG=""
         echo "  WARNING: compute_cap empty — using CMake default architectures"
     else
@@ -72,7 +66,6 @@ else
     CUDA_ARCH_FLAG=""
 fi
 
-# ---- 2b. GPU requirement gate (one-session mode: never train on CPU silently)
 if [[ "${REQUIRE_GPU}" -eq 1 ]] && [[ "${GPU_COUNT:-0}" -eq 0 ]]; then
     echo ""
     echo "[ERROR] --require-gpu was passed but no NVIDIA GPU was detected."
@@ -81,13 +74,11 @@ if [[ "${REQUIRE_GPU}" -eq 1 ]] && [[ "${GPU_COUNT:-0}" -eq 0 ]]; then
     exit 1
 fi
 
-# ---- 3. CUDA toolkit detection
 if command -v nvcc &>/dev/null && [[ "${FORCE_CPU}" -eq 0 ]]; then
     NVCC_VER=$(nvcc --version | grep 'release' | awk '{print $NF}')
     echo "[CUDA] nvcc: ${NVCC_VER}"
     HAVE_CUDA=ON
-    # Blackwell (sm_120, e.g. RTX 5060) needs CUDA >= 12.8: older nvcc cannot
-    # even parse the arch flag and fails cryptically halfway through the build.
+
     if [[ "${CC_CMAKE:-}" == 12* ]]; then
         NVCC_MAJOR=$(echo "${NVCC_VER}" | cut -d. -f1 | tr -d ' ')
         NVCC_MINOR=$(echo "${NVCC_VER}" | cut -d. -f2 | tr -d ' ,')
@@ -104,10 +95,8 @@ else
     HAVE_CUDA=OFF
 fi
 
-# ---- 4. Compiler check
 echo "[compiler] GCC  : $(g++ --version | head -1)"
-# cmake drives the whole build; without it every later line dies with a bare
-# "command not found" and no hint about which tool is missing.
+
 command -v cmake >/dev/null 2>&1 || {
     echo "[ERROR] cmake not found. Install it first:"
     echo "        sudo apt-get update && sudo apt-get install -y cmake"
@@ -115,15 +104,6 @@ command -v cmake >/dev/null 2>&1 || {
 }
 echo "[compiler] CMake: $(cmake --version | head -1)"
 
-# ---- 5b. Apache Arrow C++ (REQUIRED native parquet lake input).
-# The project is PARQUET-ONLY: the supplied english_parquet lake
-# (english_chat_part*.parquet + english_instruction_part*.parquet) is read
-# straight into .gbin shards.
-# libarrow-dev/libparquet-dev are NOT in Ubuntu's default repos, so the
-# official Apache Arrow apt repository is added first. A failure here is
-# FATAL when --with-parquet was requested (training is impossible without
-# the lake reader) — never a silent degrade.
-# Opt in: bash configs/kaggle/setup.sh --with-parquet
 if [[ "${WITH_PARQUET}" == "ON" ]]; then
     echo ""
     echo "[parquet] --with-parquet: installing Apache Arrow C++ (~2-4 min)..."
@@ -138,8 +118,7 @@ if [[ "${WITH_PARQUET}" == "ON" ]]; then
         apt-get install -y -qq /tmp/arrow-apt.deb
         sudo apt-get update -qq 2>/dev/null || apt-get update -qq
     fi
-    # NOTE: -qq (not -q) on purpose: apt's per-package Get: lines freeze the
-    # Kaggle browser tab on long installs. Errors still surface (set -e + tail).
+
     if sudo apt-get install -y -qq libarrow-dev libparquet-dev 2>/dev/null || \
        apt-get install -y -qq libarrow-dev libparquet-dev; then
         echo "[parquet] Arrow installed; CMake will enable the native lake route."
@@ -152,17 +131,15 @@ if [[ "${WITH_PARQUET}" == "ON" ]]; then
     fi
 fi
 
-# ---- 5. Clean if requested
 if [[ "${DO_CLEAN}" -eq 1 ]]; then
     echo ""
     echo "[build] Cleaning previous build..."
     rm -rf "${BUILD_DIR}"
 fi
 
-# ---- 6. Configure
 echo ""
 echo "[build] Configuring with CUDA=${HAVE_CUDA} PARQUET=${WITH_PARQUET}..."
-# PRO-HARDEN: ccache يسرع rebuilds الـKaggle (nvcc بطيء) بلا تكلفة.
+
 CCACHE_FLAGS=()
 if command -v ccache &>/dev/null; then
     CCACHE_FLAGS=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
@@ -179,8 +156,6 @@ cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
     "${CCACHE_FLAGS[@]}" \
     ${CUDA_ARCH_FLAG:-}
 
-# ---- 7. Build (CUDA required for training on GPU)
-# PRO-HARDEN: nproc الكامل (4x nvcc) يفجر 13GB RAM الـKaggle. نحدد JOBS<=2.
 JOBS=$(nproc --ignore=1 2>/dev/null || echo 2)
 if [[ "${JOBS}" -gt 2 ]]; then JOBS=2; fi
 if [[ "${JOBS}" -lt 1 ]]; then JOBS=1; fi
@@ -207,9 +182,6 @@ echo ""
 echo "[build] Build complete. Binaries:"
 ls -lh "${BUILD_DIR}/bin/"
 
-# ---- 7b. NCCL gate for the 2-GPU production path (P1).
-# Never spend a long build and discover at runtime that DDP was not compiled:
-# an explicit --require-nccl (used by train_2xt4.sh) fails here with the numbers.
 if [[ "${REQUIRE_NCCL}" -eq 1 ]]; then
     echo ""
     echo "[nccl] --require-nccl: verifying NCCL multi-GPU capability..."
@@ -228,7 +200,6 @@ if [[ "${REQUIRE_NCCL}" -eq 1 ]]; then
     fi
 fi
 
-# ---- 8. Run tests (unless skipped)
 if [[ "${SKIP_TESTS}" -eq 0 ]]; then
     echo ""
     echo "[tests] Running CTest suite..."
@@ -242,10 +213,6 @@ else
     echo "[tests] Full suite: SKIPPED (pass --run-tests to execute)"
 fi
 
-# ---- 8b. CUDA parity gate (always runs on GPU builds, even with --skip-tests)
-# This is the correctness gate for the MoE GPU kernels (cuda/moe.cu): tiny
-# config, a few seconds, compares CPU vs CUDA forward+backward. If the kernels
-# were broken, training would silently diverge — so this MUST pass.
 if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
     echo ""
     echo "[gate] CUDA parity gate (MoE kernel validation)..."
@@ -262,24 +229,14 @@ if [[ "${HAVE_CUDA}" == "ON" ]] && [[ "${GPU_COUNT:-0}" -gt 0 ]]; then
     fi
 fi
 
-# ---- 9. Tokenizer check (automatic training when missing)
-# PARQUET-ONLY English track: the BPE corpus comes from the Hermes lake
-# (english_chat_part*.parquet + english_instruction_part*.parquet) via
-# data_pipeline parquet-corpus, then train_tokenizer --keep-case builds
-# artifacts/tokenizer/english32k.gtok (vocab 32000, case preserved).
-# The old JSON dump-text route was REMOVED (no silent synth-only garbage).
 echo ""
 TOK_PATH="${REPO_DIR}/artifacts/tokenizer/darija32k.gtok"
 TOK_LEGACY="${REPO_DIR}/artifacts/tokenizer/darija.gtok"
 TOK_EN="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
-# ---- 9a. locate the English lake (same search as build_english_data.sh)
+
 find_english_lake() {
     local cand=""
-    # Order matters only for speed. dataset/english_parquet is where the lake
-    # actually ships in this checkout, so it must be searched here too —
-    # build_english_data.sh:53 already looks there, and the two scripts
-    # disagreeing meant setup.sh aborted with "No English lake found" on a
-    # machine whose data was sitting right there.
+
     for cand in "${EN_PARQUET_DIR:-}" "${REPO_DIR}/dataset/english_parquet" \
                 "${REPO_DIR}/english_parquet" \
                 "${REPO_DIR}/kaggle_upload/english_parquet"; do
@@ -290,10 +247,7 @@ find_english_lake() {
         fi
     done
     if [[ -d "/kaggle/input" ]]; then
-        # maxdepth 8: Kaggle dataset uploads can nest deeply, e.g.
-        #   /kaggle/input/datasets/<user>/<slug>/Users/<name>/Desktop/english_parquet/*.parquet
-        # (depth 8). The old maxdepth-4 loop missed that layout and failed the
-        # whole setup with "No English lake found" on a healthy machine.
+
         local hit=""
         hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
         if [[ -n "${hit}" ]]; then
@@ -316,8 +270,7 @@ if [[ "${SKIP_DATA}" -eq 1 ]]; then
         TOK_PATH=""
     fi
 elif [[ -f "${TOK_EN}" ]]; then
-    # English run with a shipped/prebuilt tokenizer: darija32k is not needed
-    # (flash_480m_single.yaml points at english32k). Skip BPE entirely.
+
     TOK_SIZE=$(du -h "${TOK_EN}" | cut -f1)
     echo "[tokenizer] Found: ${TOK_EN} (${TOK_SIZE})"
     TOK_PATH="${TOK_EN}"
@@ -349,8 +302,7 @@ elif [[ -n "${LAKE_DIR}" ]]; then
     if [[ -f "${TOK_EN}" ]]; then
         echo "[tokenizer] Trained: ${TOK_EN} ($(du -h "${TOK_EN}" | cut -f1))"
         TOK_PATH="${TOK_EN}"
-        # DISK FIT (19.5GB Kaggle): the corpus txt was only needed for BPE.
-        # Shards stream from parquet afterwards, so delete the dump now.
+
         echo "[cleanup] removing BPE corpus dump (shards stream from parquet)..."
         rm -rf "${REPO_DIR}/artifacts/corpus" 2>/dev/null || true
         df -h "${REPO_DIR}" | tail -n 1 || true
@@ -367,10 +319,6 @@ else
     exit 1
 fi
 
-# ---- 9b. Tokenizer vocab gate: prove the file is 32k (never assume it).
-# A legacy 16k file reaching shard building would silently waste half the
-# embeddings on every current recipe. Fail here, loudly, instead.
-# With --skip-data and no tokenizer yet, the gate is deferred to the data cell.
 if [[ "${SKIP_DATA}" -eq 1 && -z "${TOK_PATH}" ]]; then
     echo "[tokenizer] --skip-data: vocab gate deferred (no tokenizer yet, data cell will train it)"
 else
@@ -386,11 +334,6 @@ echo "[tokenizer] verified: ${TOK_PATH} (vocab 32000)"
 }
 fi
 
-# ---- 10. Lake verification (shards are built in the NEXT cell).
-# Shard building over the 1M-row lake is CPU-heavy and long, so it stays a
-# separate checkpointable cell (Save Version between steps). Here we only
-# prove the lake + Arrow backend + tokenizer are mutually consistent, so a
-# wrong recipe fails HERE in seconds instead of mid-shard-build.
 if [[ "${SKIP_DATA}" -eq 0 ]]; then
     echo ""
     echo "[data] Verifying English lake..."

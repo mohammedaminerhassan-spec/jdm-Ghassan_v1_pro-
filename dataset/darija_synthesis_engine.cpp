@@ -24,16 +24,13 @@ std::string SynthStats::summary() const {
                   human_count(rejected_entropy).c_str());
 }
 
-// ================================================================ transliteration
 namespace {
 
 struct Translit { const char* ar; const char* lat; const char* alt; };
 
-// Arabic -> Latin/Arabizi. `alt` is a common alternative spelling; picking
-// between them randomly is what teaches the model spelling invariance.
 const std::vector<Translit>& translit_table() {
     static const std::vector<Translit> t = {
-        // multi-char first (longest match wins)
+
         {"الله", "allah", "lah"},
         {"ش",  "ch", "sh"},
         {"خ",  "kh", "5"},
@@ -80,8 +77,6 @@ const std::vector<Translit>& translit_table() {
     return t;
 }
 
-// Frequent whole words get hand-written natural spellings; character-level
-// transliteration alone produces unnatural Arabizi.
 const std::unordered_map<std::string, std::vector<std::string>>& word_translit() {
     static const std::unordered_map<std::string, std::vector<std::string>> m = {
         {"شنو",   {"chno", "shnou", "chnou"}},
@@ -128,15 +123,12 @@ const std::unordered_map<std::string, std::vector<std::string>>& word_translit()
     return m;
 }
 
-// True when a string carries Latin letters but no Arabic ones (Arabizi,
-// French, English). Used to keep Arabic-script conversations single-script:
-// such rows are re-picked instead of leaking Latin turns into them.
 static bool is_latin_only(const std::string& text) {
     ScriptStats ss = script_stats(text);
     return ss.arabic == 0 && ss.latin > 0;
 }
 
-} // namespace
+}
 
 std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_digits) {
     const auto& wt = word_translit();
@@ -148,24 +140,36 @@ std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_di
 
     auto flush_word = [&]() {
         if (word.empty()) return;
-        // whole-word lookup, tolerating a definite article prefix
+
+        auto digitfold = [&](std::string s) {
+            if (heavy_digits) return s;
+            for (char& ch : s) {
+                if (ch == '3') ch = 'a';
+                else if (ch == '7') ch = 'h';
+                else if (ch == '9') ch = 'q';
+                else if (ch == '2') ch = 'a';
+                else if (ch == '5') ch = 'k';
+            }
+            return s;
+        };
+
         auto it = wt.find(word);
         if (it == wt.end() && word.size() > 4 && word.rfind("ال", 0) == 0) {
             it = wt.find(word.substr(4));
             if (it != wt.end()) {
                 const auto& opts = it->second;
-                out += "l" + opts[rng.below(opts.size())];
+                out += "l" + digitfold(opts[rng.below(opts.size())]);
                 word.clear();
                 return;
             }
         }
         if (it != wt.end()) {
             const auto& opts = it->second;
-            out += opts[rng.below(opts.size())];
+            out += digitfold(opts[rng.below(opts.size())]);
             word.clear();
             return;
         }
-        // character level
+
         size_t k = 0;
         while (k < word.size()) {
             bool matched = false;
@@ -175,11 +179,13 @@ std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_di
                     const char* pick = e.lat;
                     if (e.alt && e.alt[0] && rng.uniform() < 0.3) pick = e.alt;
                     if (!heavy_digits) {
-                        // prefer letter forms when digits are disabled
+
                         if (std::strcmp(e.ar, "ح") == 0) pick = "h";
                         else if (std::strcmp(e.ar, "ق") == 0) pick = "q";
                         else if (std::strcmp(e.ar, "خ") == 0) pick = "kh";
                         else if (std::strcmp(e.ar, "غ") == 0) pick = "gh";
+                        else if (std::strcmp(e.ar, "ع") == 0) pick = "a";
+                        else if (std::strcmp(e.ar, "ء") == 0) pick = "a";
                     }
                     out += pick;
                     k += el;
@@ -202,7 +208,7 @@ std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_di
         u32 cp = utf8_decode(arabic, i);
         if (is_arabic_letter(cp) || is_arabic_diacritic(cp)) {
             out.append(arabic, before, i - before);
-            // accumulate into `word` instead
+
             word.append(arabic, before, i - before);
             out.resize(out.size() - (i - before));
         } else {
@@ -222,7 +228,7 @@ std::string apply_orthographic_noise(const std::string& latin, Rng& rng) {
     out.reserve(latin.size());
     for (size_t i = 0; i < latin.size(); ++i) {
         char c = latin[i];
-        // realistic Moroccan Latin variation
+
         if (c == 'c' && i + 1 < latin.size() && latin[i + 1] == 'h' && rng.uniform() < 0.25) {
             out += "sh";
             ++i;
@@ -241,7 +247,6 @@ std::string apply_orthographic_noise(const std::string& latin, Rng& rng) {
     return out;
 }
 
-// ================================================================ generator
 struct SynthGenerator::Impl {
     Rng rng;
     Deduplicator dedup;
@@ -252,7 +257,7 @@ struct SynthGenerator::Impl {
 
     explicit Impl(u64 seed) : rng(seed) {
         Deduplicator::Config dc;
-        dc.jaccard_threshold = 0.80;   // stricter for synthetic data
+        dc.jaccard_threshold = 0.80;
         dedup = Deduplicator(dc);
     }
 };
@@ -268,7 +273,6 @@ const char* SynthGenerator::domain_name(int i) {
     return (i >= 0 && i < static_cast<int>(d.size())) ? d[static_cast<size_t>(i)].name : "?";
 }
 
-// picks a random element
 template <typename T>
 static const T& pick(const std::vector<T>& v, Rng& rng) {
     return v[rng.below(v.size())];
@@ -293,7 +297,6 @@ bool SynthGenerator::generate(Conversation& out) {
     const auto& D = domains[di];
     out.domain = D.name;
 
-    // choose surface script for the whole conversation
     double r = rng.uniform();
     Script script;
     bool msa_conv = false;
@@ -306,7 +309,7 @@ bool SynthGenerator::generate(Conversation& out) {
 
     auto surface = [&](const std::string& text) -> std::string {
         if (script != Script::Latin) return text;
-        // already-Latin authored strings pass through
+
         ScriptStats ss = script_stats(text);
         if (ss.arabic == 0) return apply_orthographic_noise(text, rng);
         std::string lat = arabic_to_arabizi(text, rng, heavy_digits);
@@ -314,6 +317,10 @@ bool SynthGenerator::generate(Conversation& out) {
     };
 
     out.messages.clear();
+
+    auto gated = [&](const std::string& u, const std::string& a) {
+        return script == Script::Latin || (!is_latin_only(u) && !is_latin_only(a));
+    };
 
     if (cfg_.include_system && rng.uniform() < cfg_.p_system) {
         out.messages.push_back({Role::System, pick(synth_data::system_prompts(), rng)});
@@ -324,26 +331,32 @@ bool SynthGenerator::generate(Conversation& out) {
 
     u64 tid = di * 1000003ull;
 
-    // optional greeting opener
     bool greeted = rng.uniform() < 0.30;
     if (greeted) {
-        std::string u = pick(synth_data::greetings_user(), rng);
-        std::string a = pick(synth_data::greetings_assistant(), rng);
-        out.messages.push_back({Role::User, surface(u)});
-        out.messages.push_back({Role::Assistant, surface(a)});
-        tid = tid * 31 + hash_string(u);
+        const auto& gu = synth_data::greetings_user();
+        const auto& ga = synth_data::greetings_assistant();
+        bool ok = false;
+        for (int t = 0; t < 8; ++t) {
+            const std::string u = pick(gu, rng);
+            const std::string a = pick(ga, rng);
+            if (gated(u, a)) {
+                out.messages.push_back({Role::User, surface(u)});
+                out.messages.push_back({Role::Assistant, surface(a)});
+                tid = tid * 31 + hash_string(u);
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) greeted = false;
     }
 
     int produced = greeted ? 1 : 0;
 
-    // main exchanges
     while (produced < turns) {
         double p = rng.uniform();
 
         if (msa_conv && rng.uniform() < 0.5 && !synth_data::msa_exchanges().empty()) {
-            // FIX P2 (script leak): MSA rows pushed raw with no surface()/
-            // script gate, leaking Latin into Arabic convos. Route via the
-            // same retry gate as governor/reasoning; skip the turn if none pass.
+
             const auto& pool = synth_data::msa_exchanges();
             const synth_data::Exchange* chosen = nullptr;
             for (int t = 0; t < 8; ++t) {
@@ -354,7 +367,7 @@ bool SynthGenerator::generate(Conversation& out) {
                     break;
                 }
             }
-            if (!chosen) continue;  // never accept-and-leak; skip the turn
+            if (!chosen) continue;
             out.messages.push_back({Role::User, surface(chosen->user)});
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
@@ -370,10 +383,7 @@ bool SynthGenerator::generate(Conversation& out) {
             tid = tid * 31 + hash_string(e.user);
         } else if (p < cfg_.p_correction + cfg_.p_misunderstand + cfg_.p_governor &&
                    !synth_data::governor_exchanges().empty()) {
-            // Governor turn: the controller data. Rows are authored
-            // single-script; the retry below keeps the whole conversation
-            // single-script too (Latin rows never leak into an Arabic-script
-            // conversation — that leak is what taught script-mixing before).
+
             const auto& pool = synth_data::governor_exchanges();
             const synth_data::Exchange* chosen = nullptr;
             for (int t = 0; t < 8; ++t) {
@@ -384,7 +394,7 @@ bool SynthGenerator::generate(Conversation& out) {
                     break;
                 }
             }
-            if (!chosen) continue;  // FIX: skip instead of accept-and-leak
+            if (!chosen) continue;
             out.messages.push_back({Role::User, surface(chosen->user)});
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
@@ -401,12 +411,12 @@ bool SynthGenerator::generate(Conversation& out) {
                     break;
                 }
             }
-            if (!chosen) continue;  // FIX: skip instead of accept-and-leak
+            if (!chosen) continue;
             out.messages.push_back({Role::User, surface(chosen->user)});
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
         } else if (rng.uniform() < 0.06) {
-            // FIX P2: identity rows also bypassed surface()/script gate.
+
             const auto& pool = synth_data::identity_questions();
             const synth_data::Exchange* chosen = nullptr;
             for (int t = 0; t < 8; ++t) {
@@ -422,27 +432,42 @@ bool SynthGenerator::generate(Conversation& out) {
             out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
             tid = tid * 31 + hash_string(chosen->user);
         } else if (produced > 0 && rng.uniform() < cfg_.p_followup && !D.followups.empty()) {
-            const auto& e = pick(D.followups, rng);
-            out.messages.push_back({Role::User, surface(e.user)});
-            out.messages.push_back({Role::Assistant, surface(e.assistant)});
-            tid = tid * 31 + hash_string(e.user);
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 8 && !chosen; ++t) {
+                const auto& cand = pick(D.followups, rng);
+                if (gated(cand.user, cand.assistant)) chosen = &cand;
+            }
+            if (!chosen) continue;
+            out.messages.push_back({Role::User, surface(chosen->user)});
+            out.messages.push_back({Role::Assistant, surface(chosen->assistant)});
+            tid = tid * 31 + hash_string(chosen->user);
         } else {
-            const auto& e = pick(D.openers, rng);
+            const synth_data::Exchange* chosen = nullptr;
+            for (int t = 0; t < 8 && !chosen; ++t) {
+                const auto& cand = pick(D.openers, rng);
+                if (gated(cand.user, cand.assistant)) chosen = &cand;
+            }
+            if (!chosen) continue;
+            const auto& e = *chosen;
             std::string user = e.user;
             std::string asst = e.assistant;
 
-            // French code-switch injection
-            if (rng.uniform() < cfg_.p_french_switch) {
+            if (script == Script::Latin && rng.uniform() < cfg_.p_french_switch) {
                 const auto& ft = synth_data::french_terms();
-                const auto& term = ft[rng.below(ft.size())];
-                size_t pos = asst.find(term.first);
-                if (pos != std::string::npos) {
-                    asst.replace(pos, std::strlen(term.first), term.second);
+
+                for (int attempt = 0; attempt < 8; ++attempt) {
+                    const auto& term = ft[rng.below(ft.size())];
+                    size_t pos = asst.find(term.first);
+                    if (pos != std::string::npos) {
+                        asst.replace(pos, std::strlen(term.first), term.second);
+                        break;
+                    }
                 }
             }
-            // filler word at the start of the assistant turn
+
             if (rng.uniform() < 0.22) {
-                asst = std::string(pick(synth_data::fillers(), rng)) + "، " + asst;
+                const std::string f = pick(synth_data::fillers(), rng);
+                if (gated(f, f)) asst = f + "، " + asst;
             }
             out.messages.push_back({Role::User, surface(user)});
             out.messages.push_back({Role::Assistant, surface(asst)});
@@ -451,24 +476,38 @@ bool SynthGenerator::generate(Conversation& out) {
 
         ++produced;
 
-        // occasional backchannel turn
         if (produced < turns && rng.uniform() < 0.18) {
-            std::string bc = pick(synth_data::backchannels_user(), rng);
-            const auto& e = D.followups.empty() ? pick(D.openers, rng) : pick(D.followups, rng);
-            out.messages.push_back({Role::User, surface(bc)});
-            out.messages.push_back({Role::Assistant, surface(e.assistant)});
-            ++produced;
+            const auto& bu = synth_data::backchannels_user();
+            bool ok = false;
+            for (int t = 0; t < 8 && !ok; ++t) {
+                std::string bc = pick(bu, rng);
+                const auto& e = D.followups.empty() ? pick(D.openers, rng) : pick(D.followups, rng);
+                if (gated(bc, e.assistant)) {
+                    out.messages.push_back({Role::User, surface(bc)});
+                    out.messages.push_back({Role::Assistant, surface(e.assistant)});
+                    ok = true;
+                }
+            }
+            if (ok) ++produced;
         }
     }
 
     if (rng.uniform() < 0.35) {
-        out.messages.push_back({Role::User, surface(pick(synth_data::closers_user(), rng))});
-        out.messages.push_back({Role::Assistant, surface(pick(synth_data::closers_assistant(), rng))});
+        const auto& cu = synth_data::closers_user();
+        const auto& ca = synth_data::closers_assistant();
+        for (int t = 0; t < 8; ++t) {
+            std::string u = pick(cu, rng);
+            std::string a = pick(ca, rng);
+            if (gated(u, a)) {
+                out.messages.push_back({Role::User, surface(u)});
+                out.messages.push_back({Role::Assistant, surface(a)});
+                break;
+            }
+        }
     }
 
     out.template_id = tid;
 
-    // ---------------- diversity + style filters ----------------
     if (++impl_->template_uses[tid] > cfg_.max_template_uses) {
         ++stats_.rejected_duplicate;
         return false;
@@ -485,7 +524,6 @@ bool SynthGenerator::generate(Conversation& out) {
         return false;
     }
 
-    // robotic-style guard: our own authored data must pass our own filter
     for (size_t i = 0; i < out.messages.size(); ++i) {
         if (out.messages[i].role != Role::Assistant) continue;
         std::string user_msg = (i > 0) ? out.messages[i - 1].content : "";
@@ -496,7 +534,6 @@ bool SynthGenerator::generate(Conversation& out) {
         }
     }
 
-    // first-token distribution flattening: prevents every reply starting the same way
     for (const auto& m : out.messages) {
         if (m.role != Role::Assistant) continue;
         std::string head = first_words(m.content, 2);
@@ -539,7 +576,6 @@ std::vector<Conversation> SynthGenerator::generate_many(int n) {
     return out;
 }
 
-// ================================================================ jsonl io
 static std::string json_escape(const std::string& s) {
     std::string o;
     o.reserve(s.size() + 8);
@@ -643,4 +679,4 @@ std::vector<Conversation> read_conversations_jsonl(const std::string& path) {
     return out;
 }
 
-} // namespace gai
+}

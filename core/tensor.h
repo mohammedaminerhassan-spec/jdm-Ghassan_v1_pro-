@@ -8,27 +8,15 @@
 
 namespace gai {
 
-// T4-ONLY: CPU for portable reference + CUDA sm_75 for Tesla T4 training/inference.
-// No other backends exist in this build by design (zero dead code paths).
 enum class Device : u32 { CPU = 0, CUDA = 1 };
 
 const char* device_name(Device d);
 
-// Raw device-agnostic buffer with refcounted ownership.
-//
-// Two flavors: OWNING (allocated via device_alloc, freed in ~Storage) and
-// EXTERNAL views (memory owned elsewhere, e.g. a MappedFile). External views
-// keep a shared_ptr owner token, so the backing allocation provably outlives
-// every Tensor built on it. External CPU views are READ-ONLY by contract
-// (file pages are mapped read-only; writes would fault) — Model::enable_grad
-// refuses models that contain them (see Tensor::is_external).
 class Storage {
 public:
     Storage() = default;
     Storage(size_t nbytes, Device dev, DType dt = DType::F32);
-    // External non-owning view. dev must be CPU (file/device memory the CPU
-    // can read directly). owner keeps the backing alive (may be null only
-    // when the caller guarantees a longer lifetime, e.g. static memory).
+
     Storage(void* ptr, size_t nbytes, Device dev, std::shared_ptr<void> owner);
     ~Storage();
 
@@ -47,12 +35,11 @@ private:
     Device device_ = Device::CPU;
     bool   owned_  = false;
     bool   external_ = false;
-    std::shared_ptr<void> owner_;   // non-null for external views
+    std::shared_ptr<void> owner_;
 };
 
 using StoragePtr = std::shared_ptr<Storage>;
 
-// Dense, contiguous, row-major tensor.
 class Tensor {
 public:
     Tensor() = default;
@@ -62,9 +49,7 @@ public:
 
     static Tensor zeros(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
     static Tensor empty(std::vector<i64> shape, DType dt = DType::F32, Device dev = Device::CPU);
-    // Non-owning view over external CPU memory (see Storage). nbytes must
-    // equal dtype_nbytes(dt, numel) exactly. The view is read-only by
-    // contract; check is_external() before writing or training with it.
+
     static Tensor wrap_external(std::vector<i64> shape, DType dt,
                                 void* ptr, size_t nbytes,
                                 std::shared_ptr<void> owner);
@@ -92,13 +77,12 @@ public:
     i32*         i32p()       { return ptr<i32>(); }
     const i32*   i32p() const { return ptr<i32>(); }
 
-    // Reshape keeps the same storage (must preserve numel).
     Tensor view(std::vector<i64> shape) const;
 
     Tensor to(Device dev) const;
     Tensor clone() const;
     void   zero_();
-    void   copy_from(const Tensor& src);      // same numel & dtype, any device pair
+    void   copy_from(const Tensor& src);
 
     std::string shape_str() const;
     std::string describe() const;
@@ -114,4 +98,4 @@ private:
 
 i64 numel_of(const std::vector<i64>& shape);
 
-} // namespace gai
+}

@@ -4,8 +4,6 @@
 #include <utility>
 #include <vector>
 
-// GPU implementations, mirroring core/ops_cpu.h exactly so core/ops.cpp can
-// dispatch with a single macro. All pointers are device pointers.
 namespace gai {
 namespace cuda_ops {
 
@@ -13,16 +11,12 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float alpha, const float* A, int lda, const float* B, int ldb,
           float beta, float* C, int ldc);
 
-// FP16 tensor-core GEMMs (large matrices only; see kernels.cu heuristic).
-// Master weights stay fp32 — conversion happens on the fly per call.
 void set_fp16_gemm(bool on);
 bool fp16_gemm_enabled();
 
-// BF16 tensor-core GEMMs (Ampere+, sm_80 and newer; T4/sm_75 has no BF16 cores)
 void set_bf16_gemm(bool on);
 bool bf16_gemm_enabled();
 
-// DeepSeek router jitter (host-side mirror; kernels take it as a param).
 void set_moe_jitter(float j);
 void set_moe_jitter_seed(u64 seed);
 
@@ -121,37 +115,23 @@ void attention_decode_ring(const float* q, const float* kcache, const float* vca
                            int pinned_prefix, int cur_len, int cache_max,
                            float scale, float* scratch, int window);
 
-// GPU load-balance fractions (no N*ne / N*K host roundtrip).
-// frac[ne] stays on device; h_frac/h_psum are optional tiny host copies
-// (pass nullptrs on the training hot path: zero syncs per layer).
-// d_raw_accum (from moe_aux_reset_raw) folds this layer's raw scalar on
-// device; read once per microbatch with moe_aux_read_raw (ONE sync).
 void moe_aux_frac_gpu(const float* probs, const i32* idx, float* frac,
                       float* h_frac, float* h_psum,
                       i64 N, int K, int ne, double* d_raw_accum = nullptr);
-double* moe_aux_begin();  // zero + return the persistent raw accumulator
-double moe_aux_end();     // single-sync read of the accumulator
+double* moe_aux_begin();
+double moe_aux_end();
 
 void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogits,
                            i64 n, int V, double* out_loss_sum, i64* out_count,
                            float z_scale = 0.0f);
 
-// Device-side loss/count accumulation (see core/ops.h). The accumulators
-// are persistent device memory (16 bytes, monotonic by design). accumulate()
-// folds one chunk with no host traffic; end() performs the single D2H.
 void sce_acc_begin();
 void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
                     i64 n, int V, float z_scale = 0.0f);
 void sce_acc_end(double* out_loss_sum, i64* out_count);
 
-// acc[e] += 1 per routed slot, atomic, on device. Called once per MoE
-// layer per microbatch into the model's persistent [L*ne] counter; the only
-// host traffic is the single [L*ne] read per optimizer step.
 void moe_count_slots(const i32* idx, float* acc, i64 NK, int ne);
 
-// ---- inference fast sampling. topk: exact top-K descending
-// (ties: lowest id). argmax: full-vocab first-max + single-int D2H.
-// penalties: in-place CTRL mirror (hist H2D is fire-and-forget, no stall).
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids);
 i32 argmax_token(const float* logits, int V);
 void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
@@ -166,26 +146,19 @@ void lion_step(float* w, const float* g, float* m, i64 n,
                float lr, float beta1, float beta2, float weight_decay,
                float grad_scale);
 
-// Scale gradients in-place by a constant factor (for distributed training)
 void scale_grad(float* g, i64 n, float scale);
 
 double global_sq_norm(const float* g, i64 n);
-// Fused multi-tensor norm: N kernels async + ONE D2H (was N syncs).
+
 double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& parts);
 
-// Scratch pools used by reduction/MoE kernels. Pools grow monotonically
-// during the run (by design, not a leak) and are released here / at shutdown.
-// reserve_workspaces() pre-sizes both pools from the configured recipe
-// BEFORE the first step, so the run never pays a cudaFree+cudaMalloc resize
-// stall (cudaFree can force a full device synchronization) mid-training.
-// Sizes come from Model::workspace_plan() (pure arithmetic, no allocation).
 void  free_workspace();
 void  moe_free_workspace();
 void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
 void  moe_reserve_workspace(size_t bytes);
-// Pool footprints for OOM diagnostics (monotonic by design).
+
 size_t pool_bytes();
 size_t moe_pool_bytes();
 
-} // namespace cuda_ops
-} // namespace gai
+}
+}

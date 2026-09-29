@@ -1,22 +1,3 @@
-# configs/kaggle/kaggle_data_workflow.py ÔÇö Kaggle data workflow, step 2 of 3 (run after cell 1)
-#
-# Turns the attached English parquet lake into .gbin shards, exactly the way
-# train_2xt4.sh expects to find them:
-#
-#   train_english_chat_*.gbin        multi-turn conversations
-#   train_english_instruction_*.gbin  instruction / QA
-#   train_english_behavior_*.gbin     authored persona + discipline
-#   val_<same three>_*                deterministic 0.5% hash split
-#
-# This is the longest CPU-only step of the session (it streams ~1M parquet rows
-# on 4 Kaggle cores). Save Version when it finishes so the shards survive into
-# the training cell.
-#
-# Optional environment (a cell above this one):
-#   EN_PARQUET_DIR  the dataset directory (cell 1 discovers it and writes it
-#                   into /kaggle/working/env.sh; this cell sources that file)
-#   BEHAVIOR_N      authored persona conversations to synthesise [15000]
-
 import os
 import re
 import glob
@@ -27,21 +8,17 @@ import time
 STEP = [0]
 FAILED = []
 
-
 def rule(title):
     STEP[0] += 1
     bar = "=" * 74
     print("\n" + bar + f"\n[{STEP[0]}] {title}\n" + bar, flush=True)
 
-
 def ok(m):
     print(f"  [ok]   {m}", flush=True)
-
 
 def bad(m):
     FAILED.append(m)
     print(f"  [FAIL] {m}", flush=True)
-
 
 def load_env(path):
     """Read the KEY="value" lines cell 1 wrote.
@@ -67,12 +44,10 @@ def load_env(path):
             env[k.strip()] = v.strip().strip('"').strip("'")
     return env
 
-
 def apply_env(path):
     for k, v in load_env(path).items():
         os.environ.setdefault(k, v)
     return os.environ
-
 
 def run(cmd, tail=30, log=None, env=None, cwd=None):
     t0 = time.time()
@@ -92,7 +67,6 @@ def run(cmd, tail=30, log=None, env=None, cwd=None):
     print(f"  -> rc={p.returncode}  ({time.time() - t0:.1f}s)", flush=True)
     return p.returncode, out
 
-
 def out_of(cmd, cwd=None, env=None):
     """stdout only, no decoration ÔÇö for parsing numbers."""
     e = dict(os.environ)
@@ -101,7 +75,6 @@ def out_of(cmd, cwd=None, env=None):
     p = subprocess.run(cmd, shell=True, cwd=cwd, env=e, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True, errors="replace")
     return p.stdout or ""
-
 
 def du_mb(path):
     """Directory size in MB, computed in python (a path with a space must never
@@ -117,13 +90,11 @@ def du_mb(path):
                 pass
     return tot // (1024 * 1024)
 
-
 ENV = "/kaggle/working/env.sh"
 for k, v in load_env(ENV).items():
     print(f"  {k} = {v}", flush=True)
 apply_env(ENV)
-# Self-locating: works from any clone path (cell 1's bootstrap uses /repo, the
-# clone URL's own name is the other common case), and env.sh wins if it exists.
+
 REPO_DIR = os.environ.get("REPO_DIR") or os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 EN_DIR = os.environ.get("EN_PARQUET_DIR", "")
@@ -134,12 +105,6 @@ for tool in ("build/bin/data_pipeline", "build/bin/gai_train", "kaggle/build_eng
     p = os.path.join(REPO_DIR, tool)
     ok(tool) if os.path.exists(p) else bad(f"missing {p} ÔÇö run cell 1 first")
 
-# Every path below is handled in PYTHON, never interpolated into a shell string.
-# The Kaggle dataset path contains a space (.../Users/Ghassan PC/Desktop/...),
-# and this cell has now been bitten by that three separate ways: a \S+ regex that
-# matched nothing, an unquoted `ls {EN_DIR}/...` that split at the space, and a
-# du that lost the first half of the path. glob/os.path take the path as a
-# value, so there is no shell left to re-interpret it.
 def find_lake():
     if EN_DIR and os.path.isdir(EN_DIR):
         return EN_DIR
@@ -182,10 +147,8 @@ if "vocab_size=32000" not in out:
     sys.exit(1)
 ok("tokenizer 32000 keep-case")
 
-# ---------------------------------------------------------------- build
 rule("BUILD SHARDS  (the long one ÔÇö Save Version when it finishes)")
-# EN_PARQUET_DIR goes through the environment, not through a quoted string in a
-# command line: a space in the value cannot break it.
+
 rc, out = run("bash configs/kaggle/build_english_data.sh", cwd=REPO_DIR,
               env={"EN_PARQUET_DIR": EN_DIR},
               log="/kaggle/working/_cell2_shards.log", tail=60)
@@ -196,7 +159,6 @@ if rc != 0:
             print("   | " + ln.rstrip())
     sys.exit(1)
 
-# ---------------------------------------------------------------- verify
 rule("VERIFY")
 rc, out = run("build/bin/data_pipeline inspect --shards artifacts/shards_en --tokenizer "
               + tok.replace(" ", "\\ "), cwd=REPO_DIR, log="/kaggle/working/_cell2_inspect.log",
@@ -228,20 +190,12 @@ if not all(os.path.exists(os.path.join(REPO_DIR, f"configs/{c}")) for c in
 
 run("du -sh artifacts/shards_en artifacts/tokenizer; df -h /kaggle/working | tail -1", tail=6)
 
-# ---- disk footprint --------------------------------------------------
-# /kaggle/working is ONE 20 GB filesystem. The build/ tree is excluded from
-# the trainer's saved-OUTPUT accounting but it still occupies that filesystem,
-# next to the shards and the checkpoints. Kaggle kills the session with ENOSPC,
-# and the trainer's own disk guard only fires once the trainer is constructed ÔÇö
-# i.e. after the pilot has already burned GPU minutes. Price it here instead.
 rule("DISK FOOTPRINT  (the 20 GB that has to hold everything)")
 free_mb = int(out_of("df -Pm /kaggle/working | tail -1 | awk '{print $4}'").strip() or 0)
 build_mb = du_mb(os.path.join(REPO_DIR, "build"))
 shards_mb = du_mb(os.path.join(REPO_DIR, "artifacts", "shards_en"))
 tok_mb = du_mb(os.path.join(REPO_DIR, "artifacts", "tokenizer"))
 
-# The checkpoint+GGUF projection comes from the same preflight arithmetic the
-# launcher gates on, so it cannot disagree with the run.
 proj_mb = 0
 for cfg in (os.environ.get("CONFIG_PT", "configs/flash_109m_compact_2xt4.yaml"),
             os.environ.get("CONFIG_SFT", "configs/sft_flash_109m_compact_2xt4.yaml")):
@@ -257,8 +211,6 @@ for cfg in (os.environ.get("CONFIG_PT", "configs/flash_109m_compact_2xt4.yaml"),
 if not proj_mb:
     info("could not read the checkpoint projection from --dry-run (non-fatal)")
 
-# proj_mb ALREADY covers the worst case (best.ckpt + last.ckpt + the GGUF), so
-# it is added once, not doubled.
 need_mb = build_mb + shards_mb + tok_mb + proj_mb
 print(f"  build/          {build_mb:>7d} MB   (excluded from saved output, but it"
       f" lives on the same 20 GB filesystem)")

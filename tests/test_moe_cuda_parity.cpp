@@ -1,16 +1,3 @@
-// GPU parity gate for the repair-prompt CUDA work (F-02, F-03, F-10).
-//
-// This test runs ONLY when built with CUDA (GAI_CUDA). On CPU-only builds it
-// prints SKIP and passes, so `ctest` stays green everywhere. On Kaggle/T4 it
-// compares the fused CUDA kernels against the CPU references:
-//
-//   F-03: cuda_ops::moe_forward (fused pack/swiglu/save/scatter) vs
-//         cpu::moe_forward (token-major reference) — 1e-4 relative.
-//   F-02: cuda_ops::moe_count_slots vs cpu::moe_count_slots — exact.
-//   F-10: cuda_ops::sce_accumulate + sce_acc_end vs cpu single-shot — 1e-6.
-//
-// A failure here means the CUDA translation diverged from the validated logic
-// and the run must NOT proceed to long training.
 #include "core/ops.h"
 #include "core/ops_cpu.h"
 #include "core/rng.h"
@@ -31,23 +18,6 @@ static int failures = 0;
 #include "cuda/cuda_ops.h"
 #include "core/device.h"
 
-// Parity criterion: |a-b| <= atol + rtol*|b|.
-//
-// A PURE relative error is the wrong test for a reduction. The gate gradient
-// sums hundreds of fp32 products, and the CUDA path sums them grouped by
-// expert while the CPU reference sums them token-major: a different summation
-// order of the same arithmetic. That is expected to differ in the last bits,
-// and near a cancellation (an element whose true value is ~0) the PURE
-// relative error explodes even when the absolute error is microscopic — which
-// is exactly what happened: "gate grad max rel err 1.48e-4" on an element
-// where the absolute difference was orders of magnitude below the tensor's
-// scale. The absolute floor is what a mixed criterion is for, and it is the
-// standard way libraries compare fp32 gradients.
-//
-// atol defaults to a fraction of the reference tensor's own magnitude, so it
-// scales with the data instead of being a magic constant. Real bugs (wrong
-// expert routing, a dropped term, a sign error) move values by O(1) relative
-// and still fail loudly.
 static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
                      double rtol, const char* what, double atol = 0.0) {
     if (a.size() != b.size()) {
@@ -79,7 +49,6 @@ static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
     return true;
 }
 
-// Copy a host vector to a CUDA tensor and back.
 static Tensor to_cuda(const std::vector<float>& h) {
     Tensor t = Tensor::empty({(i64)h.size()}, DType::F32, Device::CUDA);
     device_copy(t.data_ptr(), Device::CUDA, h.data(), Device::CPU,
@@ -115,7 +84,6 @@ static void test_moe_forward_parity() {
     const std::vector<float> ups = rnd((size_t)ne * E * d, 0.3f);
     const std::vector<float> downs = rnd((size_t)ne * d * E, 0.3f);
 
-    // CPU reference.
     std::vector<float> out_cpu((size_t)N * d, 0.0f);
     std::vector<float> probs((size_t)N * ne), w((size_t)NK);
     std::vector<i32> idx((size_t)NK);
@@ -125,7 +93,6 @@ static void test_moe_forward_parity() {
                      probs.data(), idx.data(), w.data(),
                      sg.data(), su.data(), sa.data(), N, d, E, ne, K);
 
-    // CUDA fused path (caches double as the routing I/O).
     Tensor dx = to_cuda(x), dr = to_cuda(router), dg = to_cuda(gates),
            du = to_cuda(ups), dd = to_cuda(downs);
     Tensor dout = Tensor::zeros({(i64)N * d}, DType::F32, Device::CUDA);
@@ -193,9 +160,6 @@ static void test_sce_acc_parity() {
     near_vec(dlogits_cpu, to_host(dd), 1e-5, "F-10: CUDA dlogits match CPU");
 }
 
-// Full MoE backward parity (P1-5): the most complex path (router GEMM grad,
-// per-expert weight grads, dx scatter, shared-expert recompute) must match
-// the serial CPU reference, or long training silently diverges.
 static void test_moe_backward_parity() {
     Rng rng;
     rng.seed_with(2025);
@@ -213,7 +177,6 @@ static void test_moe_backward_parity() {
     const std::vector<float> downs = rnd((size_t)ne * d * E, 0.3f);
     const std::vector<float> dout = rnd((size_t)N * d, 0.5f);
 
-    // Forward on CPU for the shared caches (probs/idx/w/s_*).
     std::vector<float> out_cpu((size_t)N * d, 0.0f);
     std::vector<float> probs((size_t)N * ne), w((size_t)NK);
     std::vector<i32> idx((size_t)NK);
@@ -223,7 +186,6 @@ static void test_moe_backward_parity() {
                      probs.data(), idx.data(), w.data(),
                      sg.data(), su.data(), sa.data(), N, d, E, ne, K);
 
-    // CPU backward reference.
     std::vector<float> dx_cpu((size_t)N * d, 0.0f);
     std::vector<float> dr_cpu((size_t)ne * d, 0.0f);
     std::vector<float> dg_cpu((size_t)ne * E * d, 0.0f);
@@ -239,7 +201,6 @@ static void test_moe_backward_parity() {
                       nullptr, nullptr, nullptr, s_dact_cpu.data(),
                       N, d, E, ne, K);
 
-    // CUDA backward on the same inputs.
     Tensor dx_ = to_cuda(x), dr_ = to_cuda(router), dg_ = to_cuda(gates),
            du_ = to_cuda(ups), dd_ = to_cuda(downs);
     Tensor dprobs = to_cuda(probs), didx = to_cuda_i32(idx), dw = to_cuda(w);
@@ -266,14 +227,7 @@ static void test_moe_backward_parity() {
     near_vec(du_cpu, to_host(gdu), 1e-3, "moe bwd up grad vs CPU");
     near_vec(dd_cpu, to_host(gdd), 1e-3, "moe bwd down grad vs CPU");
 }
-// Regression: every workspace sub-block used to be carved at FLOAT granularity,
-// so a block starting at a float offset that is not a multiple of 4 sat 8-byte
-// aligned and the vectorised float4 store faulted on sm_75 with
-// "Invalid __global__ write of size 16 bytes ... is misaligned".
-// moe_backward's Gblk starts at 6*N*E + NK floats, so ANY NK not divisible by
-// 4 triggered it. The shapes below are chosen so NK = 9*2 = 18, 7*2 = 14 and
-// 5*1 = 5, i.e. every layout that used to misalign, with E a multiple of 4 so
-// the scalar fallback is genuinely exercised rather than masked.
+
 static void test_unaligned_workspace_layouts() {
     struct Shape { int N, d, E, ne, K; };
     const Shape shapes[] = { {9, 16, 12, 4, 2}, {7, 16, 12, 4, 2}, {5, 16, 8, 4, 1} };
@@ -322,7 +276,6 @@ static void test_unaligned_workspace_layouts() {
         near_vec(out_cpu, to_host(dout_), 1e-4, tag);
         near_vec(sg, to_host(dsg), 1e-5, "unaligned-layout saved gate");
 
-        // Backward is the path that actually faulted (k_gather3_all float4).
         std::vector<float> dx_cpu((size_t)N * d, 0.0f);
         std::vector<float> dr_cpu((size_t)ne * d, 0.0f);
         std::vector<float> dg_cpu((size_t)ne * E * d, 0.0f);
@@ -361,7 +314,7 @@ static void test_unaligned_workspace_layouts() {
         near_vec(dd_cpu, to_host(gdd), 1e-3, "unaligned-layout down grad");
     }
 }
-#endif // GAI_CUDA
+#endif
 
 int main() {
 #ifdef GAI_CUDA

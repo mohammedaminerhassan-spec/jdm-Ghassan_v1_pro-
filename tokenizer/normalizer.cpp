@@ -2,7 +2,6 @@
 
 namespace gai {
 
-// ---------------------------------------------------------------- config bits
 u32 NormalizerConfig::pack() const {
     u32 b = 0;
     b |= strip_diacritics    ? 1u << 0  : 0u;
@@ -38,7 +37,6 @@ NormalizerConfig NormalizerConfig::unpack(u32 bits) {
     return c;
 }
 
-// ---------------------------------------------------------------- normalize
 std::string Normalizer::normalize(const std::string& text) const {
     std::vector<u32> in = utf8_to_codepoints(text);
     std::vector<u32> out;
@@ -50,7 +48,7 @@ std::string Normalizer::normalize(const std::string& text) const {
         if (cfg_.strip_control && is_control(cp)) continue;
 
         if (cfg_.strip_zero_width && is_zero_width(cp)) {
-            // keep ZWNJ (200C) only when it sits between two Arabic letters
+
             bool keep = false;
             if (cp == 0x200C && i > 0 && i + 1 < in.size()) {
                 keep = is_arabic_letter(in[i - 1]) && is_arabic_letter(in[i + 1]);
@@ -59,7 +57,7 @@ std::string Normalizer::normalize(const std::string& text) const {
         }
 
         if (cfg_.unify_presentation && cp >= 0xFE70 && cp <= 0xFEFF) {
-            if (cp >= 0xFEF5 && cp <= 0xFEFC) {          // lam-alef ligature -> lam + alef
+            if (cp >= 0xFEF5 && cp <= 0xFEFC) {
                 out.push_back(0x0644);
                 out.push_back(0x0627);
                 continue;
@@ -79,7 +77,7 @@ std::string Normalizer::normalize(const std::string& text) const {
             u32 ws = (cp == '\n') ? '\n' : ' ';
             if (cfg_.collapse_whitespace) {
                 if (!out.empty() && (out.back() == ' ' || out.back() == '\n')) {
-                    // a newline wins over a plain space
+
                     if (ws == '\n' && out.back() == ' ') out.back() = '\n';
                     continue;
                 }
@@ -99,7 +97,6 @@ std::string Normalizer::normalize(const std::string& text) const {
         out.push_back(cp);
     }
 
-    // trim
     size_t a = 0, b = out.size();
     while (a < b && (out[a] == ' ' || out[a] == '\n')) ++a;
     while (b > a && (out[b - 1] == ' ' || out[b - 1] == '\n')) --b;
@@ -111,9 +108,7 @@ std::string Normalizer::normalize(const std::string& text) const {
 }
 
 std::string Normalizer::canonical(const std::string& text) {
-    // max_repeat=1 would collapse distinct intensities (????/====/kkkk); 3 preserves هههه/====/kkkk to one char
-    // so distinct intensities hashed as duplicates. 3 preserves intensity
-    // classes while still normalizing runaway repeats.
+
     NormalizerConfig c;
     c.fold_letters = true;
     c.lowercase_latin = true;
@@ -122,7 +117,6 @@ std::string Normalizer::canonical(const std::string& text) {
     return Normalizer(c).normalize(text);
 }
 
-// ---------------------------------------------------------------- pre-tokenize
 static ChunkKind classify(u32 cp) {
     if (is_whitespace(cp))                                    return ChunkKind::Space;
     if (is_arabic_letter(cp) || is_arabic_diacritic(cp))      return ChunkKind::Arabic;
@@ -140,8 +134,7 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
     const size_t n = cps.size();
 
     while (i < n) {
-        // Leading whitespace: a single space is glued to the next word; newlines and
-        // longer runs become their own chunk so the model can learn layout.
+
         std::string prefix;
         if (is_whitespace(cps[i])) {
             size_t start = i;
@@ -164,8 +157,6 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
 
         ChunkKind kind = classify(cps[i]);
 
-        // Arabizi: a digit that starts a word ("3lach", "7it", "9rib") belongs to the
-        // Latin word that follows, not to a numeric chunk.
         if (kind == ChunkKind::Number && is_arabizi_digit(cps[i]) &&
             i + 1 < n && is_latin_letter(cps[i + 1])) {
             kind = ChunkKind::Latin;
@@ -185,17 +176,17 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
                 break;
             }
             case ChunkKind::Latin: {
-                // Latin word with embedded arabizi digits ("3lach", "kif7alk", "b9it")
+
                 bool started = false;
                 while (i < n) {
                     u32 cp = cps[i];
                     bool ok = is_latin_letter(cp);
                     if (!ok && (cp == '\'' || cp == 0x2019)) {
-                        // apostrophe only inside a word
+
                         ok = started && (i + 1 < n) && is_latin_letter(cps[i + 1]);
                     }
                     if (!ok && is_arabizi_digit(cp)) {
-                        // a digit belongs to the word if it continues one, or introduces one
+
                         bool next_word = (i + 1 < n) && (is_latin_letter(cps[i + 1]) ||
                                                          is_arabizi_digit(cps[i + 1]));
                         ok = started || next_word;
@@ -205,7 +196,7 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
                     ++i;
                     started = true;
                 }
-                if (!started) {   // safety: never emit an empty body
+                if (!started) {
                     utf8_encode(cps[i], c.text);
                     ++i;
                 }
@@ -242,4 +233,4 @@ std::vector<Chunk> pre_tokenize(const std::string& text) {
     return out;
 }
 
-} // namespace gai
+}

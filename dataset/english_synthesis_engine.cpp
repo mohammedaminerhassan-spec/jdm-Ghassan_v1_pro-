@@ -1,12 +1,3 @@
-// dataset/english_synthesis_engine.cpp — English dialogue-behavior synthesizer.
-//
-// Twin of the Darija SynthGenerator (dataset/darija_synthesis_engine.cpp), simplified: no
-// script/transliteration logic, no MSA/French branches. The composition rules
-// are the same (domain opener → followups → governor/correction/identity
-// seasoning → closer), and the diversity/style filters are the same shape:
-// template-use cap, exact+near dedup, first-token flattening. The assistant
-// style gate is english_style_policy::check_english_reply (answer discipline) instead
-// of the Darija anti-robotic gate.
 #include "dataset/english_synthesis_engine.h"
 #include "dataset/english_dialogue_content.h"
 #include "dataset/english_style_policy.h"
@@ -42,7 +33,7 @@ std::string first_words(const std::string& s, int n) {
     return o;
 }
 
-} // namespace
+}
 
 struct EnglishSynthGenerator::Impl {
     Rng rng;
@@ -121,11 +112,9 @@ bool EnglishSynthGenerator::generate(Conversation& out) {
             const auto& e = pick(ed::governor_exchanges(), rng);
             push_turn(e.user, e.assistant);
         } else if (p < cfg_.p_correction + cfg_.p_misunderstand + cfg_.p_governor +
-                          cfg_.p_reasoning &&
-                   !ed::reasoning_exchanges().empty()) {
-            const auto& e = pick(ed::reasoning_exchanges(), rng);
-            push_turn(e.user, e.assistant);
-        } else if (rng.uniform() < cfg_.p_identity && !ed::identity_questions().empty()) {
+                           cfg_.p_reasoning + cfg_.p_identity &&
+                   !ed::identity_questions().empty()) {
+
             const auto& e = pick(ed::identity_questions(), rng);
             push_turn(e.user, e.assistant);
         } else if (produced > 0 && rng.uniform() < cfg_.p_followup && !D.followups.empty()) {
@@ -142,8 +131,8 @@ bool EnglishSynthGenerator::generate(Conversation& out) {
         if (produced < turns && rng.uniform() < cfg_.p_backchannel && !ed::backchannels_user().empty()) {
             const std::string bc = pick(ed::backchannels_user(), rng);
             const auto& e = D.followups.empty() ? pick(D.openers, rng) : pick(D.followups, rng);
-            out.messages.push_back({Role::User, bc});
-            out.messages.push_back({Role::Assistant, e.assistant});
+
+            push_turn(bc.c_str(), e.assistant);
             ++produced;
         }
     }
@@ -171,10 +160,6 @@ bool EnglishSynthGenerator::generate(Conversation& out) {
         return false;
     }
 
-    // Answer-discipline gate: our own authored data must pass the same filter
-    // the pipeline applies to third-party assistant turns. A rejection here
-    // means the authored row contradicts english_logic — fix the DATA, because
-    // the gate is the contract the benchmark enforces.
     for (size_t i = 0; i < out.messages.size(); ++i) {
         if (out.messages[i].role != Role::Assistant) continue;
         const std::string user_msg = (i > 0) ? out.messages[i - 1].content : "";
@@ -227,5 +212,5 @@ std::vector<Conversation> EnglishSynthGenerator::generate_many(int n) {
     return out;
 }
 
-} // namespace english_synth
-} // namespace gai
+}
+}

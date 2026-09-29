@@ -40,8 +40,6 @@ void probe(DeviceInfo& info) {
         return;
     }
 
-    // DDP: each rank pins its own GPU via LOCAL_RANK (torchrun/Kaggle).
-    // Without it, every rank would pile onto the same device.
     int best = 0;
     size_t best_mem = 0;
     if (const char* lr = std::getenv("LOCAL_RANK")) {
@@ -55,7 +53,7 @@ void probe(DeviceInfo& info) {
         }
     }
     if (best_mem == 0) {
-        // pick the device with the most memory
+
         for (int i = 0; i < count; ++i) {
             cudaDeviceProp p{};
             if (cudaGetDeviceProperties(&p, i) != cudaSuccess) continue;
@@ -85,7 +83,7 @@ void probe(DeviceInfo& info) {
     info.total_mem      = totalm;
     info.free_mem       = freem;
     info.supports_fp16  = (prop.major > 5) || (prop.major == 5 && prop.minor >= 3);
-    info.supports_bf16  = (prop.major >= 8);          // Ampere and newer
+    info.supports_bf16  = (prop.major >= 8);
     info.supports_tf32  = (prop.major >= 8);
     g_initialized = true;
 }
@@ -97,7 +95,7 @@ void* malloc_device(size_t nbytes) {
 }
 
 void free_device(void* ptr) {
-    if (ptr) CUDA_CHECK(cudaFree(ptr));  // surface double-free instead of hiding it
+    if (ptr) CUDA_CHECK(cudaFree(ptr));
 }
 
 void memset_zero(void* ptr, size_t nbytes) {
@@ -107,7 +105,7 @@ void memset_zero(void* ptr, size_t nbytes) {
 bool is_device_memory(const void* ptr) {
     cudaPointerAttributes attr{};
     if (cudaPointerGetAttributes(&attr, const_cast<void*>(ptr)) != cudaSuccess) {
-        cudaGetLastError();  // clear the sticky-free query error
+        cudaGetLastError();
         return false;
     }
     return attr.type == cudaMemoryTypeDevice;
@@ -133,7 +131,7 @@ size_t free_bytes_live() {
 
 void check_free_vram(size_t need, const char* what) {
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return; // probe failed; cudaMalloc will catch it
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
     if (need > free_b) {
         GAI_FAIL(strfmt("CUDA OOM: %s needs %s but only %s free of %s total",
                         what ? what : "allocation",
@@ -146,13 +144,9 @@ void check_free_vram(size_t need, const char* what) {
 void* cublas_handle() {
     if (!g_cublas) {
         check_blas(cublasCreate(&g_cublas), "cublasCreate");
-        // Pin the creation device: every later GEMM verifies it is still
-        // current, so a 2-GPU device slip becomes a named error, not a bare
-        // CUBLAS_STATUS_NOT_INITIALIZED deep inside training.
+
         if (cudaGetDevice(&g_cublas_dev) != cudaSuccess) g_cublas_dev = -1;
-        // TF32 is a large free speedup on Ampere+ and is numerically fine for
-        // this model size; explicitly opt in unless GAI_TF32=0 (bit-exact fp32).
-        // Auto-detect: TF32 only on sm>=80, otherwise DEFAULT_MATH.
+
         const char* tf = std::getenv("GAI_TF32");
         bool want_tf32 = true;
         if (tf && (tf[0] == '0' || tf[0] == 'n' || tf[0] == 'N')) want_tf32 = false;
@@ -160,7 +154,7 @@ void* cublas_handle() {
         cudaDeviceProp prop{};
         if (cudaGetDevice(&dev) == cudaSuccess &&
             cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        if (prop.major < 8) want_tf32 = false; // Turing/Pascal: no TF32
+        if (prop.major < 8) want_tf32 = false;
         }
         check_blas(cublasSetMathMode(g_cublas, want_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH
                                                         : CUBLAS_DEFAULT_MATH),
@@ -179,8 +173,7 @@ void shutdown() {
     cuda_ops::free_workspace();
     cuda_ops::free_sampling_workspace();
     cuda_ops::moe_free_workspace();
-    // No cudaDeviceReset here: it would invalidate every live Tensor.
-    // Synchronize only; full reset stays behind GAI_CUDA_RESET for tests.
+
     if (g_initialized) {
         cudaDeviceSynchronize();
         const char* r = std::getenv("GAI_CUDA_RESET");
@@ -189,5 +182,5 @@ void shutdown() {
     g_initialized = false;
 }
 
-} // namespace cuda
-} // namespace gai
+}
+}

@@ -8,7 +8,6 @@
 
 namespace gai {
 
-// The 14 evaluation categories from the design doc.
 enum class EvalCategory : u8 {
     BasicConversation = 0,
     DarijaComprehension,
@@ -33,12 +32,12 @@ EvalCategory category_from_name(const std::string& s);
 struct EvalItem {
     EvalCategory              category = EvalCategory::BasicConversation;
     std::string               id;
-    std::vector<Message>      context;      // multi-turn prompt
-    std::string               prompt;       // final user turn
-    std::vector<std::string>  expect_any;   // acceptable substrings (fuzzy match)
-    std::vector<std::string>  forbid;       // substrings that must NOT appear
-    std::string               expect_lang;  // "ar-MA-arab" | "ar-MA-latn" | "ar-MSA" | ""
-    int                       max_words = 0;// 0 = no constraint
+    std::vector<Message>      context;
+    std::string               prompt;
+    std::vector<std::string>  expect_any;
+    std::vector<std::string>  forbid;
+    std::string               expect_lang;
+    int                       max_words = 0;
     std::string               note;
 };
 
@@ -50,6 +49,9 @@ struct ItemResult {
     bool         matched = false;
     bool         forbidden_hit = false;
     bool         lang_ok = true;
+
+    bool         has_lang_gate = false;
+    bool         has_discipline = false;
     bool         length_ok = true;
     bool         robotic = false;
     bool         toxic = false;
@@ -59,8 +61,8 @@ struct ItemResult {
     double       darija_ratio = 0, msa_ratio = 0;
     int          words = 0;
     double       seconds = 0;
-    double       score = 0;   // 0..1 automatic score
-    double       tokens_per_sec = 0;  // estimated from word count
+    double       score = 0;
+    double       tokens_per_sec = 0;
 };
 
 struct CategoryScore {
@@ -76,6 +78,9 @@ struct BenchmarkReport {
     std::map<std::string, CategoryScore> by_category;
     double overall = 0;
     double robotic_rate = 0, toxicity_rate = 0, repetition_rate = 0, discipline_rate = 0;
+
+    double lang_ok_rate = 0;
+    int n_lang_gated = 0, n_discipline_gated = 0;
     double avg_distinct1 = 0, avg_distinct2 = 0;
     double avg_darija_ratio = 0, avg_msa_leak = 0;
     double avg_words = 0, tokens_per_sec = 0;
@@ -83,13 +88,13 @@ struct BenchmarkReport {
 
     std::string to_string() const;
     void        write_jsonl(const std::string& path) const;
-    std::string human_eval_sheet() const;   // blank rating form for human raters
+    std::string human_eval_sheet() const;
 };
 
 struct BenchmarkConfig {
     std::string      suite_dir = "evaluation/datasets";
-    std::string      categories;         // comma-separated filter, empty = all
-    int              max_prompts = 0;    // 0 = all
+    std::string      categories;
+    int              max_prompts = 0;
     bool             verbose = false;
     std::string      output_path;
     GenerationConfig gen;
@@ -101,10 +106,6 @@ public:
 
     BenchmarkReport run();
 
-    // Loads .jsonl suites from a directory; falls back to the built-in suite.
-    // PARQUET-ONLY EN: builtin_suite() is Darija; builtin_suite_en() is the
-    // Hermes English suite (40 items: conversation, instruction, reasoning,
-    // coding, hallucination, toxicity). Use --suite-en or categories filter.
     static std::vector<EvalItem> load_suite(const std::string& dir);
     static std::vector<EvalItem> builtin_suite();
     static std::vector<EvalItem> builtin_suite_en();
@@ -119,9 +120,8 @@ private:
     LangId          lid_;
 };
 
-// text metrics reused by the report
 double distinct_n(const std::string& text, int n);
 int    max_ngram_repeat(const std::string& text, int n);
 double darija_marker_ratio(const std::string& text, const LangId& lid);
 
-} // namespace gai
+}

@@ -11,39 +11,29 @@ struct DeviceInfo;
 
 namespace cuda {
 
-// Called by core/device.cpp. Fills the CUDA fields, leaves them false if no
-// usable device exists (driver missing, no GPU, etc.) — never throws.
 void probe(DeviceInfo& info);
 
 void* malloc_device(size_t nbytes);
 void  free_device(void* ptr);
 void  memset_zero(void* ptr, size_t nbytes);
-// True only if ptr is live device memory on the current device. Lives here (in
-// the .cu) so core/device.cpp never needs the CUDA runtime headers.
+
 bool  is_device_memory(const void* ptr);
 void  copy(void* dst, bool dst_is_device, const void* src, bool src_is_device, size_t nbytes);
 void  synchronize();
-    // Live free-VRAM query for the device.cpp OOM guard. Returns 0 if unavailable.
+
     size_t free_bytes_live();
-    // Check that at least `need` bytes of VRAM are free; GAI_FAIL with a clear
-    // message if not. Call before large workspace allocations for better
-    // diagnostics than a raw cudaMalloc failure.
+
     void check_free_vram(size_t need, const char* what);
 
-// cuBLAS handle, created lazily on first use.
 void* cublas_handle();
-// Device the cuBLAS handle was created on (-1 if not created yet). GEMM
-// entry points compare it against the current device so a handle/device
-// mismatch fails loudly with both ids instead of a bare cuBLAS error.
+
 int   cublas_device();
 void  shutdown();
 
 const char* last_error();
 
 #ifdef __CUDACC__
-// ---- RAII wrappers for CUDA resources (leak-safe on exceptions) ----
-// Constructors fail loudly on cudaStreamCreate/EventCreate errors instead of
-// building objects around invalid handles.
+
 class CudaStream {
     cudaStream_t stream_ = nullptr;
     bool own_ = true;
@@ -90,7 +80,6 @@ public:
     }
 };
 
-// Scoped device setter (RAII for cudaSetDevice)
 class ScopedDevice {
     int prev_ = -1;
 public:
@@ -99,7 +88,7 @@ public:
     ScopedDevice(const ScopedDevice&) = delete;
     ScopedDevice& operator=(const ScopedDevice&) = delete;
 };
-#endif // __CUDACC__
+#endif
 
-} // namespace cuda
-} // namespace gai
+}
+}

@@ -1,4 +1,3 @@
-# kaggle/package.ps1 — Windows PowerShell packaging for Kaggle upload
 param(
     [string]$OutFile = "ghassan-pro-src.zip"
 )
@@ -14,12 +13,6 @@ if (Test-Path $OutPath) {
 
 Write-Host "Creating Kaggle package: $OutFile ..." -ForegroundColor Cyan
 
-# Files and directories to exclude.
-# Paths here use FORWARD slashes; $rel is normalized to forward slashes too,
-# because Get-ChildItem hands back backslash paths and `-like "artifacts/x*"`
-# never matched `artifacts\x`. That silently packed the whole 1 GB parquet lake
-# plus every checkpoint into the zip (and the `.git` pattern stripped
-# .gitattributes, which is what keeps the .sh files LF on Linux).
 $ExcludePatterns = @(
     "build",
     "build_test",
@@ -29,6 +22,7 @@ $ExcludePatterns = @(
     "artifacts/checkpoints",
     "artifacts/*.gguf",
     "artifacts/synth",
+    "artifacts/synth_legacy",
     "artifacts/corpus",
     "dataset/english_parquet",
     "dataset/qa_darija",
@@ -38,6 +32,7 @@ $ExcludePatterns = @(
     "english_parquet",
     "kaggle_upload",
     "*.parquet",
+    "*.log",
     ".git",
     ".vscode",
     "*.obj",
@@ -51,13 +46,12 @@ $TempDir = Join-Path $env:TEMP ("ghassan_pkg_" + [System.Guid]::NewGuid().ToStri
 New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 
 try {
-    # Copy files while skipping excluded patterns
+
     Get-ChildItem -Path $RepoDir -Recurse -Force | ForEach-Object {
         $rel = $_.FullName.Substring($RepoDir.Length + 1) -replace '\\','/'
         $skip = $false
         foreach ($pat in $ExcludePatterns) {
-            # A directory pattern matches the entry itself and everything under
-            # it; a wildcard pattern is a plain -like test.
+
             if ($rel -eq $pat -or $rel -like "$pat/*" -or $rel -like $pat) {
                 $skip = $true
                 break
@@ -81,9 +75,6 @@ try {
     Write-Host ("[package] staged {0} files, {1:N1} MB" -f `
                 $kept.Count, ($kept.Sum / 1MB))
 
-    # Create zip with FORWARD-slash entry names. Compress-Archive on Windows
-    # PowerShell 5.1 stores backslashes, which is legal in a zip but means
-    # `unzip` on Linux produces one odd file name instead of a directory tree.
     if (Get-Command Compress-Archive -ErrorAction SilentlyContinue) {
         Add-Type -AssemblyName System.IO.Compression | Out-Null
         Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null

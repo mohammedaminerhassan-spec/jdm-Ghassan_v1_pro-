@@ -6,8 +6,6 @@
 
 using namespace gai;
 
-// P0-3: restored safety net. Covers config-path happy paths that the old
-// fossils asserted via log text, plus the new strict gates.
 static int failures = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; ++failures; } \
@@ -69,7 +67,7 @@ static void test_strict_getters() {
 }
 
 static void test_ckpt_version_gate() {
-    // P0-1 regression: only version < 5 is legacy. v9 must restore moments.
+
     auto is_legacy_fixed = [](unsigned v) { return v < 5u; };
     CHECK(!is_legacy_fixed(9u), "v9 not legacy");
     CHECK(!is_legacy_fixed(8u), "v8 not legacy");
@@ -80,23 +78,18 @@ static void test_ckpt_version_gate() {
 
 static void test_check_known() {
     Config c = Config::from_string("training:\n  max_steps: 10\n  typo_lr: 5\n");
-    // NOTE: prefix "training." would mark typo_lr as known; use exact-only
-    // so the typo is really caught (mirrors --strict-config typo catcher).
+
     size_t n = c.check_known({"training.max_steps"}, {}, false);
     CHECK(n >= 1, "typo key detected");
 }
 
-// P0 SFT parity: pretrain and SFT configs must define the SAME model
-// function. Training-only fields (lr/batch/optimizer/stage) are ignored.
-// A mismatch (e.g. missing use_qk_norm or z_loss_scale) must be caught here,
-// never after GPU hours burn.
 static ModelConfig model_from_file(const std::string& path) {
     Config c = Config::from_file(path);
     return ModelConfig::from_config(c, "model");
 }
 
 static void test_arch_parity() {
-    // Flagship pairs must match exactly (init_std excluded by design).
+
     const std::vector<std::pair<std::string, std::string>> pairs = {
         {"configs/flash_480m_single.yaml", "configs/sft_flash_480m_single.yaml"},
         {"configs/flash_480m_single.yaml", "configs/sft_flash_480m_4xt4.yaml"},
@@ -121,7 +114,7 @@ static void test_arch_parity() {
             CHECK(false, std::string("parity exception ") + a_path + " vs " + b_path + ": " + e.what());
         }
     }
-    // Negative control: flipping one model-function field must be detected.
+
     {
         ModelConfig a = model_from_file("configs/flash_480m_single.yaml");
         ModelConfig b = a;
@@ -134,7 +127,7 @@ static void test_arch_parity() {
         b = a;
         b.rope_type = (a.rope_type == 0) ? 1 : 0;
         CHECK(!a.same_architecture_as(b, &why), "rope_type flip detected: " + why);
-        // init_std must NOT affect identity (same function, different init).
+
         b = a;
         b.init_std = a.init_std * 2.0f;
         CHECK(a.arch_identity() == b.arch_identity() || a.same_architecture_as(b, nullptr),
@@ -143,9 +136,7 @@ static void test_arch_parity() {
 }
 
 static void test_ddp_global_batch() {
-    // DDP contract: global = B * T * accum * world. 2xT4 recipes preserve the
-    // single-GPU global by halving accum (per-GPU B/T envelope unchanged, LR
-    // NOT scaled with world size).
+
     TrainerConfig single;
     single.batch_size = 2; single.seq_len = 1024; single.grad_accum = 32;
     CHECK(single.tokens_per_step() == 65536, "single per-rank 65536");
@@ -154,7 +145,7 @@ static void test_ddp_global_batch() {
     TrainerConfig two;
     two.batch_size = 2; two.seq_len = 1024; two.grad_accum = 16;
     CHECK(two.tokens_per_step_global(2) == 65536, "2xT4 accum=16 preserves 65536 global");
-    // SFT pair: single accum=16 (32768) vs 2xT4 accum=8 (32768 global).
+
     TrainerConfig sft1;
     sft1.batch_size = 2; sft1.seq_len = 1024; sft1.grad_accum = 16;
     TrainerConfig sft2;
@@ -166,7 +157,7 @@ static void test_ddp_global_batch() {
 int main() {
     test_shard_globs_honored();
     test_legacy_datadir_warn();
-    // exercise all four glob/legacy combinations the old log showed
+
     test_shard_globs_honored();
     test_legacy_datadir_warn();
     test_shard_globs_honored();

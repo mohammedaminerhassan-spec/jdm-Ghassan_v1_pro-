@@ -1,13 +1,3 @@
-// loss_scale_max regression: the scaler must never grow past the configured
-// ceiling (T4 recipes pin 8192 because 16384 overflows there). Two short CPU
-// runs with window=1: uncapped grows 100->200, capped at 150 stops at 150.
-// Read back via peek (same reader the resume gate uses).
-//
-// CPU harness note: the Trainer parks the scaler when the FP16 tensor-core
-// path is off (CPU math is always fp32), so the test arms the flag manually
-// AFTER construction — exactly the lines under test (scaler_for_step,
-// scaler_update, loss_scale_cap) then run unmodified. CPU GEMMs ignore the
-// flag, so numerics stay fp32-exact and growth is deterministic.
 #include "training/trainer.h"
 #include "training/checkpoint.h"
 #include "core/config.h"
@@ -70,9 +60,9 @@ static TrainerConfig scaler_cfg(const std::string& data_dir, const std::string& 
     c.checkpoint_dir = ckpt_dir;
     c.device = "cpu";
     c.seed = 5;
-    c.gemm_fp16 = true;        // arm the scaler path (CPU math stays fp32)
+    c.gemm_fp16 = true;
     c.loss_scale_init = 100.0;
-    c.loss_scale_window = 1;   // grow after every clean step
+    c.loss_scale_window = 1;
     c.loss_scale_max = max_scale;
     c.stage = "pretrain";
     return c;
@@ -85,9 +75,9 @@ static double run_and_read(const std::string& data_dir, const std::string& ckpt_
     model.enable_grad(true);
     TrainerConfig cfg = scaler_cfg(data_dir, ckpt_dir, max_scale);
     Trainer trainer(model, cfg);
-    ops::set_gemm_fp16(true);   // arm the scaler path (see header note)
+    ops::set_gemm_fp16(true);
     trainer.run();
-    ops::set_gemm_fp16(false);  // leave global state as found
+    ops::set_gemm_fp16(false);
     ModelConfig ckpt_cfg;
     TrainState st;
     if (!Checkpoint::peek(ckpt_dir + "/last.ckpt", ckpt_cfg, st)) return -1.0;

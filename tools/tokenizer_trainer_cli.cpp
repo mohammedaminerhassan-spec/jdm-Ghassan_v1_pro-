@@ -1,6 +1,3 @@
-// train_tokenizer - builds the Arabic/Darija BPE tokenizer and (optionally) runs
-// the vocabulary-size study described in docs/DESIGN.md section 4.
-
 #include "tools/cli_common.h"
 #include "tokenizer/bpe_trainer.h"
 #include "dataset/darija_synthesis_engine.h"
@@ -66,7 +63,6 @@ static std::vector<std::string> read_lines(const std::string& path, size_t limit
     return out;
 }
 
-// Representative evaluation slices, used to pick the vocabulary size.
 struct Slice { const char* name; std::vector<std::string> lines; };
 
 static std::vector<Slice> default_slices() {
@@ -127,11 +123,9 @@ int main(int argc, char** argv) {
         NormalizerConfig ncfg;
         if (args.flag("keep-diacritics")) ncfg.strip_diacritics = false;
         if (args.flag("fold-letters")) ncfg.fold_letters = true;
-        // PRO-EN: English needs case preserved (default lowercases Latin for
-        // Darija sparsity). Stored in .gtok -> shards + inference follow it.
+
         if (args.flag("keep-case")) ncfg.lowercase_latin = false;
 
-        // ---------------- gather corpus
         std::vector<std::string> corpus_lines;
         for (const auto& f : collect_inputs(args.str("input"))) {
             auto l = read_lines(f);
@@ -146,7 +140,7 @@ int main(int argc, char** argv) {
                             nsynth));
             SynthConfig sc;
             sc.num_conversations = nsynth;
-            sc.max_template_uses = 100000;   // tokenizer wants coverage, not novelty
+            sc.max_template_uses = 100000;
             SynthGenerator gen(sc);
             auto convs = gen.generate_many(nsynth);
             for (const auto& c : convs)
@@ -158,7 +152,6 @@ int main(int argc, char** argv) {
                   "no corpus data. use --input <path> and/or --synth <n>");
         log_info(strfmt("[corpus] total %s lines", human_count(corpus_lines.size()).c_str()));
 
-        // ---------------- evaluation slices
         std::vector<Slice> slices = default_slices();
         if (args.has("eval")) {
             slices.push_back({"held-out", read_lines(args.str("eval"), 20000)});
@@ -177,7 +170,6 @@ int main(int argc, char** argv) {
                             "corpus", all.tokens_per_word, all.bytes_per_token));
         };
 
-        // ---------------- study mode
         if (args.flag("study")) {
             log_info("================ vocabulary size study ================");
             struct Result { int vocab; double darija_ar; double darija_lt; double arabizi; double msa; };
@@ -220,7 +212,7 @@ int main(int argc, char** argv) {
                                 r.vocab / 1000, r.darija_ar, r.darija_lt, r.arabizi, r.msa,
                                 human_count(static_cast<u64>(r.vocab) * 768).c_str()));
             }
-            // selection rule from the design doc
+
             double best = 1e9;
             for (const auto& r : results) best = std::min(best, r.darija_ar);
             int chosen = results.empty() ? 16000 : results.back().vocab;
@@ -232,7 +224,6 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // ---------------- normal training
         BpeTrainerConfig cfg;
         cfg.vocab_size = args.num_int("vocab", 32000);
         cfg.min_frequency = args.num_int("min-freq", 2);
@@ -256,7 +247,6 @@ int main(int argc, char** argv) {
         tk.save(out);
         log_info("[bpe] saved " + out);
 
-        // round-trip sanity on real English
         const char* probes[] = {
             "How are you today?", "Write a Python function that counts vowels",
             "Explain why the sky is blue", "Pick one:\nA. Red\nB. Blue",

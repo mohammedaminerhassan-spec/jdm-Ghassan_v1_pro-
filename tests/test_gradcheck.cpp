@@ -12,15 +12,13 @@ static int failures = 0;
     if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; ++failures; } \
 } while (0)
 
-// P0-3: gradient safety net referenced by CMakeLists.txt:213 but never
-// committed. Finite-difference checks on CPU so Kaggle T4 math is trusted.
 static void test_rmsnorm_grad() {
     const int rows = 4, dim = 8;
     std::vector<float> x(rows * dim), w(dim, 1.0f);
     for (int i = 0; i < rows * dim; ++i) x[i] = 0.1f * (float)(i % 7) - 0.3f;
     std::vector<float> out(rows * dim), rrms(rows);
     ops::rmsnorm_forward(Device::CPU, x.data(), w.data(), out.data(), rrms.data(), rows, dim, 1e-5f);
-    // numerical check: ||out|| should be ~ sqrt(rows*dim) for unit-gain norm
+
     double s = 0.0;
     for (float v : out) s += (double)v * v;
     double got = std::sqrt(s);
@@ -29,16 +27,15 @@ static void test_rmsnorm_grad() {
 }
 
 static void test_softmax_swa_invariant() {
-    // P0-2 regression model: softmax denominator must equal the plain sum,
-    // never 32x. Pure-CPU reference of the fixed CUDA kernel logic.
+
     const float scores[4] = {1.0f, 2.0f, 3.0f, 0.5f};
     float mx = scores[0];
     for (int i = 1; i < 4; ++i) mx = std::max(mx, scores[i]);
     float sum = 0.0f;
     for (int i = 0; i < 4; ++i) sum += std::exp(scores[i] - mx);
-    // OLD BUG would compute sum_then_reduce = sum * 32
+
     float buggy = sum * 32.0f;
-    // exp(-2)+exp(-1)+exp(0)+exp(-2.5) ≈ 1.585
+
     CHECK(sum > 1.0f && sum < 3.0f, "softmax sum sane");
     CHECK(buggy / sum > 31.0f, "bug model really is 32x (guard)");
     float inv = 1.0f / sum;
@@ -105,41 +102,29 @@ static void test_model_validate() {
     try { mc.validate(); } catch (...) { ok = false; }
     CHECK(ok, "tiny dense config validates");
     ModelConfig bad = mc;
-    bad.num_heads = 7; bad.hidden_size = 64;  // 64 % 7 != 0
+    bad.num_heads = 7; bad.hidden_size = 64;
     bool threw = false;
     try { bad.validate(); } catch (...) { threw = true; }
     CHECK(threw, "bad head split fails fast");
 }
 
-// DDP gradient correctness: verify token-weighted gradient scaling math.
-// This is a pure-CPU reference of the DDP gradient sync logic.
 static void test_ddp_gradient_math() {
-    // Simulate 2 ranks with different token counts (SFT masks)
-    // Rank 0: 100 tokens, Rank 0: 50 tokens
-    // Global ntok = 150
-    // Each rank computes SUM grads (mean * ntok)
-    // After all-reduce: sum of both ranks' SUM grads
-    // Final: divide by global ntok
-    float rank0_grad = 2.0f;  // mean grad on rank 0
-    float rank1_grad = 4.0f;  // mean grad on rank 1
+
+    float rank0_grad = 2.0f;
+    float rank1_grad = 4.0f;
     int ntok0 = 100, ntok1 = 50;
     int ntok_global = ntok0 + ntok1;
 
-    // SUM grads per rank (mean * ntok)
     float sum0 = rank0_grad * ntok0;
     float sum1 = rank1_grad * ntok1;
 
-    // All-reduce SUM
     float total = sum0 + sum1;
 
-    // Divide by global ntok
     float final_grad = total / ntok_global;
 
-    // Expected: (2*100 + 4*50) / 150 = 400/150 = 2.6667
     float expected = (rank0_grad * ntok0 + rank1_grad * ntok1) / (float)ntok_global;
     CHECK(std::fabs(final_grad - expected) < 1e-5f, "DDP token-weighted grad math");
 
-    // Verify: if both ranks had same ntok, result should be mean of means
     int ntok_equal = 100;
     float sum0_eq = rank0_grad * ntok_equal;
     float sum1_eq = rank1_grad * ntok_equal;
@@ -148,8 +133,6 @@ static void test_ddp_gradient_math() {
     float expected_eq = (rank0_grad + rank1_grad) / 2.0f;
     CHECK(std::fabs(final_eq - expected_eq) < 1e-5f, "DDP equal-ntok grad math");
 
-    // Verify: all-masked step (ntok=0) should skip optimizer
-    // (this is handled in trainer, not in the math, but we verify the logic)
     int ntok_zero = 0;
     bool skip = (ntok_zero == 0);
     CHECK(skip, "DDP all-masked step skips optimizer");

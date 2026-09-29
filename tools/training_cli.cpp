@@ -1,5 +1,3 @@
-// gai_train - the training entry point (pretrain / cpt / sft stages).
-
 #include "tools/cli_common.h"
 #include "training/trainer.h"
 #include "core/device.h"
@@ -21,10 +19,6 @@
 namespace fs = std::filesystem;
 using namespace gai;
 
-// When an exception escapes a worker thread (or any noexcept frame) the
-// default handler reports only the type: "terminate called after throwing an
-// instance of 'gai::Error'" with no message, which makes the crash
-// unactionable. Re-throw inside the handler to recover the real text.
 static void gai_verbose_terminate() {
     try {
         if (auto p = std::current_exception()) std::rethrow_exception(p);
@@ -85,9 +79,6 @@ int main(int argc, char** argv) {
         ModelConfig mcfg = ModelConfig::from_config(cfg, "model");
         TrainerConfig tcfg = TrainerConfig::from_config(cfg, args.flag("strict-config", false));
 
-        // P2-5: tokenizer.* is now live. tokenizer.path backs the export
-        // --tokenizer CLI (explicit CLI still wins); a tokenizer.vocab_size
-        // that disagrees with the model is called out before GPU hours burn.
         if (cfg.has("tokenizer.vocab_size")) {
             const int tv = static_cast<int>(cfg.get_int("tokenizer.vocab_size", mcfg.vocab_size));
             if (tv != mcfg.vocab_size) {
@@ -97,7 +88,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- CLI overrides (--strict-args fails fast instead of warn+default).
         const bool strict_args = args.flag("strict-args", false);
         if (args.has("data"))            tcfg.data_dir = args.str("data");
         if (args.has("checkpoint-dir"))  tcfg.checkpoint_dir = args.str("checkpoint-dir");
@@ -110,15 +100,7 @@ if (args.has("resume-mode")) {
     tcfg.resume_mode = rm;
 }
         if (args.has("output-budget-mb")) tcfg.output_budget_mb = args.num_strict("output-budget-mb");
-        // ---- tokenizer identity (v11): fingerprint the .gtok we will train
-        // with, so a later resume can refuse a different BPE with the same
-        // vocab_size. CLI --tokenizer wins over tokenizer.path (same rule the
-        // export uses). An explicit training.tok_fingerprint in the yaml wins
-        // over both (lets a recipe pin the fingerprint it was validated with).
-        // Path resolution mirrors the loader below (yaml-relative paths resolve
-        // against the CONFIG FILE's directory first): fingerprinting the raw
-        // relative path while CWD differs would hash nothing (fp=0) even though
-        // the load succeeds, permanently disabling resume verification.
+
         {
             const std::string tok_cli = args.str("tokenizer", "");
             const std::string tok_yaml = cfg.get_str("tokenizer.path", "");
@@ -141,8 +123,7 @@ if (args.has("resume-mode")) {
         if (args.has("batch-size"))      tcfg.batch_size = strict_args ? args.num_int_strict("batch-size") : args.num_int("batch-size");
         if (args.has("seq-len"))         tcfg.seq_len = strict_args ? args.num_int_strict("seq-len") : args.num_int("seq-len");
         if (args.has("grad-accum"))      tcfg.grad_accum = strict_args ? args.num_int_strict("grad-accum") : args.num_int("grad-accum");
-        // CLI --max-steps wins over the yaml schedule: it forces steps mode
-        // (epochs cleared) so scripted time budgets can't silently mix modes.
+
         if (args.has("max-steps")) {
             tcfg.max_steps = strict_args ? args.num_strict("max-steps") : args.num("max-steps");
             if (tcfg.epochs > 0)
@@ -156,9 +137,7 @@ if (args.has("resume-mode")) {
             tcfg.optimizer = args.str("optimizer");
             if (tcfg.optimizer != "adamw" && tcfg.optimizer != "lion" && tcfg.optimizer != "muon")
                 GAI_FAIL("unknown --optimizer (adamw|lion|muon)");
-            // DeepSeek CLI rule: mirror TrainerConfig heuristic — only switch
-            // beta2 0.95->0.99 when it still holds the AdamW default. An
-            // explicit yaml beta2 always wins (no silent clobber).
+
             if (tcfg.optimizer == "lion" && tcfg.beta2 == 0.95f) tcfg.beta2 = 0.99f;
         }
         if (args.has("scheduler")) {
@@ -185,14 +164,11 @@ if (args.has("resume-mode")) {
         if (args.has("vocab"))           mcfg.vocab_size = strict_args ? args.num_int_strict("vocab") : args.num_int("vocab");
         if (args.has("layers"))          mcfg.num_layers = strict_args ? args.num_int_strict("layers") : args.num_int("layers");
         if (args.has("hidden"))          mcfg.hidden_size = strict_args ? args.num_int_strict("hidden") : args.num_int("hidden");
-        // Tiny-smoke overrides (verify_fixes.sh --ddp shrinks the model; the
-        // head counts must shrink with hidden_size or validate() correctly
-        // refuses hidden % heads != 0 — that refusal is what caught the smoke
-        // script passing --hidden 128 against num_heads=12 on Kaggle).
+
         if (args.has("heads"))           mcfg.num_heads = strict_args ? args.num_int_strict("heads") : args.num_int("heads");
         if (args.has("kv-heads"))        mcfg.num_kv_heads = strict_args ? args.num_int_strict("kv-heads") : args.num_int("kv-heads");
         mcfg.validate();
-        // Echo resolved overrides so pilot math never plans from truncated ints.
+
         if (strict_args || args.flag("verbose", false))
             log_info(strfmt("[cfg ] overrides: B=%d T=%d accum=%d steps=%lld lr=%.6g opt=%s",
                             tcfg.batch_size, tcfg.seq_len, tcfg.grad_accum,
@@ -201,36 +177,38 @@ if (args.has("resume-mode")) {
 
 print_device_report();
 
-         // Validate tokenizer if path provided (config tokenizer.path or CLI --tokenizer)
          std::string tok_path = "";
          if (args.has("tokenizer")) {
              tok_path = args.str("tokenizer");
          } else if (cfg.has("tokenizer.path")) {
              tok_path = cfg.get_str("tokenizer.path", "");
-              // Resolve a relative YAML tokenizer path against the config file's
-              // directory first (same behavior as data_pipeline).
+
              if (!tok_path.empty() && !fs::path(tok_path).is_absolute()) {
                  fs::path cfg_dir = fs::path(cfg_path).parent_path();
                  fs::path cand = cfg_dir / tok_path;
-                 // scneario Kaggle: الrepo قد يكون cwd نفسه؛ جرب الاثنين.
+
                  if (fs::exists(cand)) tok_path = cand.string();
              }
          }
          if (!tok_path.empty()) {
              if (args.flag("dry-run")) {
-                 // F-23: a memory/schedule estimate tokenizes nothing, so do
-                 // not make it depend on a 32k tokenizer being present. The
-                 // vocab gate still runs on the real (non-dry) path below.
+
                  log_info(strfmt("[tok ] dry-run: skipping tokenizer load (%s)", tok_path.c_str()));
-             } else {
-                 Tokenizer tok;
-                 GAI_CHECK(tok.load(tok_path), "cannot load tokenizer: " + tok_path);
-                 GAI_CHECK(tok.vocab_size() == mcfg.vocab_size,
-                           strfmt("tokenizer vocab_size %d != model.vocab_size %d "
-                                  "(training would produce corrupt embeddings)",
-                                  tok.vocab_size(), mcfg.vocab_size));
-                 log_info(strfmt("[tok ] validated %s (vocab=%d matches model)", tok_path.c_str(), tok.vocab_size()));
-             }
+              } else {
+                  Tokenizer tok;
+                  GAI_CHECK(tok.load(tok_path), "cannot load tokenizer: " + tok_path);
+                  GAI_CHECK(tok.vocab_size() == mcfg.vocab_size,
+                            strfmt("tokenizer vocab_size %d != model.vocab_size %d "
+                                   "(training would produce corrupt embeddings)",
+                                   tok.vocab_size(), mcfg.vocab_size));
+
+                  const NormalizerConfig& ncfg = tok.normalizer_config();
+                  log_info(strfmt("[tok ] validated %s (vocab=%d matches model; norm: lowercase=%d fold=%d strip_diacritics=%d)",
+                                  tok_path.c_str(), tok.vocab_size(),
+                                  ncfg.lowercase_latin ? 1 : 0,
+                                  ncfg.fold_letters ? 1 : 0,
+                                  ncfg.strip_diacritics ? 1 : 0));
+              }
          }
 
          Device dev = Device::CPU;
@@ -242,8 +220,7 @@ print_device_report();
         } else if (tcfg.device == "auto") {
             dev = best_device();
         }
-        // DDP order: pin the correct GPU BEFORE any cudaMalloc (model
-        // weights allocate on construction).
+
 #ifdef GAI_CUDA
         if (dev == Device::CUDA) {
             int want = 0;
@@ -258,20 +235,12 @@ print_device_report();
 #endif
         log_info(strfmt("[dev ] using %s", device_name(dev)));
 
-        // T4-ONLY precision: fp32 masters + FP16 tensor-core GEMMs (Turing has
-        // FP16 cores, no BF16 cores). No TPU/bf16 path exists in this build.
         log_info(strfmt("[prec] compute precision: %s", tcfg.precision_name().c_str()));
 
         if (args.flag("dry-run")) {
-            // F-23: ARITHMETIC ONLY. The old dry-run constructed the Model
-            // first, so a 1B CPU dry-run exhausted host RAM (exit 137) before
-            // printing the estimate it exists to print. Nothing is allocated
-            // here. price_recipe() (training/trainer.cpp) is the single source
-            // of truth and is shared with tests/test_recipe_gates.cpp, so the
-            // preflight gate and the unit test can never disagree about a
-            // recipe's cost.
+
             const Model::MemoryPlan plan = Model::plan_memory(
-                mcfg, tcfg.batch_size, tcfg.seq_len, /*with_grad=*/true, tcfg.ce_chunks,
+                mcfg, tcfg.batch_size, tcfg.seq_len, true, tcfg.ce_chunks,
                 tcfg.fp16_weight_cache);
             const RecipeCost cost = price_recipe(mcfg, tcfg);
             const u64   params    = cost.params;
@@ -321,10 +290,6 @@ print_device_report();
                 log_info(strfmt("  schedule            : epochs mode (%d epochs; steps from data size)",
                                 tcfg.epochs));
 
-            // T4 pre-flight gate (acceptance criterion 10): a pilot must fail
-            // BEFORE burning GPU hours if the predicted peak leaves too little
-            // headroom. The trainer repeats a live check, but only after the
-            // model is already resident.
             if (args.has("max-vram-mb")) {
                 const i64 budget_mb = args.num_int("max-vram-mb", 0);
                 if (budget_mb <= 0) GAI_FAIL("--max-vram-mb needs a positive MiB value");
@@ -346,25 +311,13 @@ print_device_report();
                                     human_bytes(total).c_str(), margin_pct,
                                     human_bytes(budget).c_str()));
             }
-            // Output-quota projection (Kaggle /kaggle/working 20GB cap).
-            // Snapshot = weights (params*4) + optimizer moments (opt_b).
-            // NO grads: checkpoints never store grads (480M-AdamW measures
-            // exactly 12B/param = 4 + 8). best+last are 2 files when they are
-            // different steps (hardlink-shared when same step), so project
-            // the 2-snapshot worst case + GGUF Q4 ~0.6GB.
-            // The floor MUST match the live guard (trainer.cpp:839-842)
-            // exactly, or a green preflight turns into a constructor failure
-            // after the whole setup has run.
+
             {
                 const i64 out_mb = args.has("output-budget-mb")
                     ? args.num_int("output-budget-mb", 0) : tcfg.output_budget_mb;
                 if (out_mb > 0) {
                     const size_t per_snap = cost.snapshot;
-                    // Identical to the live guard (trainer.cpp quota block):
-                    // 2 snapshots (best+last published at different steps) +
-                    // GGUF (params bytes + 1/8 snapshot). All three figures
-                    // come from price_recipe so the preflight and the runtime
-                    // guard cannot drift apart.
+
                     const size_t proj = cost.output_projection;
                     const size_t budget = static_cast<size_t>(out_mb) * 1024u * 1024u;
                     const size_t headroom = (budget > proj) ? budget - proj : 0;
@@ -389,10 +342,7 @@ print_device_report();
         model.enable_grad(true);
 
         Trainer trainer(model, tcfg);
-        // Report the failure BEFORE unwinding: ~Trainer joins the prefetch and
-        // checkpoint-writer threads, and a throw from that cleanup (or any other
-        // destructor) would turn a plain error into std::terminate, hiding both
-        // the message and the call site. Log first, then let main() exit(1).
+
         try {
             trainer.run();
         } catch (const std::exception& e) {
@@ -400,18 +350,6 @@ print_device_report();
             return 1;
         }
 
-        // optional export after training — produces a self-contained .gguf file
-        // (tokenizer embedded; no sidecar needed). --compat llama gives a
-        // dense-only file loadable by llama.cpp / ollama / LM Studio.
-        //
-        // DDP GUARD: only rank 0 writes. The export opens the target path with
-        // truncate and streams every tensor into it, so two ranks exporting to
-        // the SAME path interleave their writes and leave a truncated/corrupt
-        // file. kaggle/train_2xt4.sh only passes --export to rank 0, but that
-        // is an external convention; the guard belongs here so a direct
-        // `RANK=1 gai_train --export ...` cannot corrupt the artifact.
-        // Safe to return early: trainer.run() has returned, so every collective
-        // this rank was going to enter has already been entered.
         if (args.has("export")) {
             int my_rank = 0;
             if (const char* rank_env = std::getenv("RANK")) {
@@ -423,7 +361,7 @@ print_device_report();
                          ": skipping GGUF export (rank 0 owns the artifact)");
             } else {
                 std::string prof = args.str("export-profile", "fp16");
-                // P2-5: tokenizer.path from the yaml backs --tokenizer (CLI wins).
+
                 std::string tok_path = args.str("tokenizer", cfg.get_str("tokenizer.path", ""));
                 if (!args.has("tokenizer") && !tok_path.empty())
                     log_info("[cfg ] using tokenizer.path from yaml: " + tok_path);
@@ -434,11 +372,7 @@ print_device_report();
                                   args.str("compat", "native"));
             }
         }
-        // GPU LEAK GUARANTEE: release monotonic CUDA workspaces (kernels/moe
-        // pools grow to max-needed then reuse by design, not a leak) + cuBLAS
-        // handle before exit so nvidia-smi shows 0 lingering usage and
-        // multi-session Kaggle reuse never accumulates. Tensors/NCCL already
-        // free via RAII (Storage + DistributedContext::~finalize).
+
 #ifdef GAI_CUDA
         if (model.device() == Device::CUDA) {
             cuda_ops::free_workspace();

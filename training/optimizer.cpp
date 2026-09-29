@@ -15,28 +15,18 @@
 namespace gai {
 
 namespace {
-// Acceptance criterion 9: times an optimizer step() on every exit path,
-// including the non-finite-norm early return. Declared once per step(), so a
-// future early-return cannot silently drop the telemetry.
+
 struct OptStepTimer {
     Timer t;
     ~OptStepTimer() { ops::perf_note_opt_step(t.elapsed_us()); }
 };
-} // namespace
+}
 
 static Tensor snapshot_tensor(const Tensor& src) {
     if (!src.defined()) return {};
     return src.device() == Device::CPU ? src.clone() : src.to(Device::CPU);
 }
 
-// Moment tables are index-aligned with model_.parameters() BY CONSTRUCTION
-// (one entry per parameter, an undefined placeholder for frozen ones). Any
-// drift — a freeze flag flipped after the optimizer was built, parameters
-// added later, a restore that resized the table — makes the update kernel
-// write `p->numel()` floats into a null or smaller buffer. On CUDA that is an
-// "illegal memory access" that names neither the parameter nor the cause; on
-// CPU it silently corrupts neighbouring memory. Verify on the host, serially,
-// BEFORE launching a single kernel.
 static void validate_moment_table(const char* kind,
                                   const std::vector<Parameter*>& params,
                                   const std::vector<Tensor>& m,
@@ -77,10 +67,7 @@ AdamW::AdamW(Model& model, AdamWConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "AdamW requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
     v_.reserve(model_.parameters().size());
-    // Frozen parameters never receive updates, so they get no moments
-    // (undefined placeholder keeps indices aligned with model_.parameters()).
-    // With freeze_embeddings this saves the full embedding m+v (196MB at
-    // V=32000,d=768). Requires freeze flags set BEFORE construction.
+
     for (Parameter* p : model_.parameters()) {
         if (p->frozen) {
             m_.emplace_back();
@@ -99,7 +86,6 @@ double AdamW::step(float lr, float grad_scale) {
     auto& params = model_.parameters();
     validate_moment_table("adamw", params, m_, v_);
 
-    // ---- global grad norm (fused: 1 sync, was ~200). DeepSeek-style.
     std::vector<std::pair<const float*, i64>> parts;
     parts.reserve(params.size());
     for (Parameter* p : params) {
@@ -118,7 +104,6 @@ double AdamW::step(float lr, float grad_scale) {
     }
     const float effective_scale = grad_scale * clip_scale;
 
-    // Skip the update on a non-finite gradient (fp16 overflow, bad batch).
     if (!std::isfinite(gnorm)) {
         log_warn(strfmt("adamw: non-finite grad norm at step %lld, update skipped",
                         static_cast<long long>(t_)));
@@ -129,20 +114,12 @@ double AdamW::step(float lr, float grad_scale) {
     const float bc1 = 1.0f - std::pow(cfg_.beta1, static_cast<float>(t_));
     const float bc2 = 1.0f - std::pow(cfg_.beta2, static_cast<float>(t_));
 
-    // PERF: the per-parameter updates are independent (disjoint w/g/m/v), so
-    // they used to be threaded with OpenMP. That bought nothing (the kernels
-    // are async, so the host pipeline is already saturated) and it was a
-    // correctness hazard: a device error inside a parallel region is UB and
-    // escaped as std::terminate, hiding the real message. Serial host loop.
     for (long long i = 0; i < static_cast<long long>(params.size()); ++i) {
         Parameter* p = params[static_cast<size_t>(i)];
         if (!p->g.defined()) continue;
-        if (p->frozen) continue;   // frozen params receive no update at all
+        if (p->frozen) continue;
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
-        // Last breadcrumb before the kernel: on an illegal access this line is
-        // the one that names the guilty parameter.
-        // PERF: vsnprintf+alloc per param (~200/step) even when debug is off.
-        // Guard so the hot path pays nothing unless debug logging is enabled.
+
         if (log_level() <= LogLevel::Debug)
             log_debug(strfmt("[opt] adamw '%s' numel=%lld w=%p g=%p m=%p v=%p",
                              p->name.c_str(), static_cast<long long>(p->numel()),
@@ -176,10 +153,6 @@ OptimizerStateSnapshot AdamW::snapshot_state() const {
     return s;
 }
 
-// v1 layout is [count][t][u8 fmt=1][6 field-wise f32]
-// [per param: u8 has, then ne + m + v iff has]. Field-wise (never a raw
-// struct) is padding- and compiler-independent; the presence flag lets frozen
-// parameters store nothing while staying stream-aligned.
 static void wr_f32(std::ostream& os, float v) {
     os.write(reinterpret_cast<const char*>(&v), 4);
 }
@@ -226,9 +199,7 @@ bool AdamW::load_state(std::istream& is, int state_version) {
         if (!rd_f32(is, lr) || !rd_f32(is, b1) || !rd_f32(is, b2) ||
             !rd_f32(is, eps) || !rd_f32(is, wd) || !rd_f32(is, clip))
             return false;
-        // The recipe on disk wins for beta/eps (they define the moment
-        // semantics); lr and clipping come from the live config so a run can
-        // be re-tuned on resume (same policy as the legacy layout).
+
         cfg_.beta1 = b1;
         cfg_.beta2 = b2;
         cfg_.eps   = eps;
@@ -248,17 +219,16 @@ bool AdamW::load_state(std::istream& is, int state_version) {
                 if (!is.read(reinterpret_cast<char*>(vc.data_ptr()),
                              static_cast<std::streamsize>(vc.nbytes())))
                     return false;
-                // File holds moments we no longer want (now frozen): consume
-                // and discard. Our own moments stay undefined (zero bytes).
+
                 if (!m_[i].defined()) continue;
                 m_[i].copy_from(mc);
                 v_[i].copy_from(vc);
             }
-            // else: file holds nothing; live moments stay as constructed.
+
         }
         return true;
     }
-    // Legacy v0 layout: raw config struct + moments for every parameter.
+
     AdamWConfig saved{};
     if (!is.read(reinterpret_cast<char*>(&saved), sizeof(AdamWConfig))) return false;
     cfg_.beta1 = saved.beta1;
@@ -273,58 +243,51 @@ bool AdamW::load_state(std::istream& is, int state_version) {
         Tensor vc(params[i]->shape, DType::F32, Device::CPU);
         if (!is.read(reinterpret_cast<char*>(mc.data_ptr()), static_cast<std::streamsize>(mc.nbytes()))) return false;
         if (!is.read(reinterpret_cast<char*>(vc.data_ptr()), static_cast<std::streamsize>(vc.nbytes()))) return false;
-        if (!m_[i].defined()) continue; // now frozen: consume and discard
+        if (!m_[i].defined()) continue;
         m_[i].copy_from(mc);
         v_[i].copy_from(vc);
     }
     return true;
 }
 
-// ---------------------------------------------------------------- Muon
-// Newton-Schulz orthogonalization of G (rows x cols) into O (same shape).
-// Uses the RIGHT-multiplied cubic X <- 1.5*X - 0.5*(X(X^TX)): for G = U S V^T
-// this maps every singular value s -> ~1, giving the same orthogonal factor
-// as the left form while work buffers stay c-by-c (small side for [out,in]
-// weights). Fixes s=1 (1.5-0.5=1, enforced in the ctor) and converges for
-// all s in (0, sqrt(3)); the frob-normalized input always has s<=1.
-// Textbook (Higham): no magic constants, 2 GEMMs per iteration.
-// All math goes through ops:: (CPU + CUDA backends). T/A live in persistent
-// scratch_ regions (grown once at construction): a step performs zero allocs.
 namespace {
 constexpr float kNSa = 1.5f, kNSb = -0.5f;
-} // namespace
+}
 
 void Muon::orthogonalize(const float* G, float* O, int rows, int cols) {
     Device dev = model_.device();
+    GAI_CHECK(rows > 0 && cols > 0, "orthogonalize: empty shape");
+    GAI_CHECK(G != nullptr && O != nullptr, "orthogonalize: null pointer");
+    GAI_CHECK(scratch_.defined(),
+              "orthogonalize: scratch workspace is not allocated");
     const i64 rc = static_cast<i64>(rows) * cols;
+    const i64 cc = static_cast<i64>(cols) * cols;
+
+    GAI_CHECK(rc <= omax_rc_ && cc <= amax_cc_,
+              "orthogonalize: shape exceeds the construction-time workspace "
+              "(rebuild Muon with a larger min_ns_dim coverage)");
     Timer ns_t;
     int iters_done = 0;
-    // Telemetry reports even the degenerate early return, so "NS cost 0"
-    // is distinguishable from "NS never ran".
+
     auto note = [&]() { ops::perf_note_muon_ns(iters_done, ns_t.elapsed_us()); };
-    // Layout [O|T|A]: O is caller-owned output (step() passes the scratch O
-    // region, tests pass their own vector); T/A are scratch-internal. O never
-    // aliases T/A by construction.
+
     float* base = scratch_.f32();
     float* T = base + omax_rc_;
     float* A = base + omax_rc_ * 2;
 
     ops::copy(dev, O, G, rc);
-    // Normalize: NS converges from X0 = G / ||G||_F (scale-invariant update).
+
     const double frob = std::sqrt(ops::global_sq_norm(dev, O, rc));
-    if (!std::isfinite(frob) || frob < 1e-12) { note(); return; } // degenerate: keep copy
+    if (!std::isfinite(frob) || frob < 1e-12) { note(); return; }
     ops::scale_inplace(dev, O, static_cast<float>(1.0 / frob), rc);
 
-    // PRECISION: Newton-Schulz needs fp32 (fp16 rounding stalls
-    // orthogonalization at 768x768: mnk~453M exceeds the fp16 threshold).
-    // Force fp32 for the 2 GEMMs/iter, then restore the previous threshold.
     const i64 saved_thr = ops::gemm_fp16_mnk_threshold();
     ops::set_gemm_fp16_mnk_threshold((i64)1 << 60);
     for (int it = 0; it < cfg_.ns_steps; ++it) {
-        // A = X^T X [c,c], then T = X A [r,c].
+
         ops::gemm(dev, true, false, cols, cols, rows, 1.0f, O, cols, O, cols, 0.0f, A, cols);
         ops::gemm(dev, false, false, rows, cols, cols, 1.0f, O, cols, A, cols, 0.0f, T, cols);
-        // X = aX + bT via scale/add (no axpy primitive in ops::).
+
         ops::scale_inplace(dev, O, kNSa, rc);
         ops::scale_inplace(dev, T, kNSb, rc);
         ops::add_inplace(dev, O, T, rc);
@@ -338,7 +301,7 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "Muon requires enable_grad(true)");
     if (cfg_.ns_steps < 1) cfg_.ns_steps = 1;
     if (cfg_.ns_steps > 10) cfg_.ns_steps = 10;
-    // NS math check (fail fast, not silently): cubic must fix 1.0.
+
     {
         const double f1 = static_cast<double>(kNSa) + static_cast<double>(kNSb);
         GAI_CHECK(std::fabs(f1 - 1.0) < 1e-6, "Muon NS coefficients must fix 1.0");
@@ -348,17 +311,13 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
     i64 max_rc = 0, max_cc = 0;
     i64 ns_matrices = 0;
     for (Parameter* p : model_.parameters()) {
-        // Frozen params carry no moments (placeholders keep indices).
+
         if (p->frozen) {
             m_.emplace_back();
             v_.emplace_back();
             continue;
         }
-        // NOTE: shape is first bound to a named local (not passed as
-        // p->shape directly into the by-value factory parameter). This is
-        // deliberate hardening: some GCC 14 configurations diagnose the
-        // direct member-to-value-parameter vector copy under -Werror, which
-        // would block the official Linux/Kaggle build for no runtime reason.
+
         const std::vector<i64> shape = p->shape;
         m_.push_back(Tensor::zeros(shape, DType::F32, model_.device()));
         const bool is_ns = uses_ns(p);
@@ -372,10 +331,7 @@ Muon::Muon(Model& model, MuonConfig cfg) : model_(model), cfg_(cfg) {
             max_cc = std::max(max_cc, c * c);
         }
     }
-    // Scratch [O|T|A]: O/T need max rc, A needs max cc. step() stages the
-    // momentum combine and the NS output in O; orthogonalize() uses only
-    // T/A internally, so output never aliases temps. No trainable matrices
-    // leave scratch undefined and orthogonalize() is then unreachable.
+
     omax_rc_ = max_rc;
     amax_cc_ = max_cc;
     const i64 need = max_rc * 2 + max_cc;
@@ -394,7 +350,6 @@ double Muon::step(float lr, float grad_scale) {
     Device dev = model_.device();
     auto& params = model_.parameters();
 
-    // Fused global norm (same 1-sync pattern as AdamW/Lion).
     std::vector<std::pair<const float*, i64>> parts;
     parts.reserve(params.size());
     for (Parameter* p : params) {
@@ -420,35 +375,21 @@ double Muon::step(float lr, float grad_scale) {
         return gnorm;
     }
 
-    // Bias corrections for the AdamW-lite vector path (mirrors AdamW::step).
     const float bc1 = 1.0f - std::pow(cfg_.beta1, static_cast<float>(t_));
     const float bc2 = 1.0f - std::pow(cfg_.beta2, static_cast<float>(t_));
     const float vec_lr = lr * cfg_.vec_lr_ratio;
 
-    // O staging for matrix updates reuses the scratch T region (free outside
-    // orthogonalize, which uses all regions only within its own call).
     float* Ostage = scratch_.defined() ? scratch_.f32() : nullptr;
 
     for (size_t i = 0; i < params.size(); ++i) {
         Parameter* p = params[i];
         if (!p->g.defined()) continue;
         if (p->frozen) continue;
-        // The NS gate lives in uses_ns() (shared with the ctor), so a
-        // matrix excluded here also has no scratch sized for it — and a matrix
-        // below min_ns_dim takes the cheap Lion branch instead of 5 NS GEMM
-        // passes. Shape routing is what keeps this compatible with the
-        // embedding (2D, decay=false) and norm (1D) branches below.
+
         const bool is_mat = uses_ns(p);
         float wd = p->decay ? cfg_.weight_decay : 0.0f;
         if (is_mat) {
-            // Momentum combine into O staging: O = (1-b1)*g, m = b1*m, m += O.
-            // ARCHITECTURE CONTRACT: Grad scale + clip scale (effective_scale) is applied
-            // to incoming gradient `p->g` before momentum accumulation:
-            //   m = beta1 * m + (1 - beta1) * (effective_scale * g)
-            // This ensures the momentum direction ratio between historical m and new g
-            // is strictly invariant to gradient accumulation and token batch size.
-            // Newton-Schulz then orthogonalizes m to unit scale, and the parameter update
-            // is applied as w -= lr * O (plus decoupled weight decay).
+
             GAI_CHECK(Ostage != nullptr, "muon: missing scratch for matrix update");
             ops::copy(dev, Ostage, p->g.f32(), p->numel());
             ops::scale_inplace(dev, Ostage, effective_scale * (1.0f - cfg_.beta1), p->numel());
@@ -457,19 +398,17 @@ double Muon::step(float lr, float grad_scale) {
             const int rows = static_cast<int>(p->shape[0]);
             const int cols = static_cast<int>(p->shape[1]);
             orthogonalize(m_[i].f32(), Ostage, rows, cols);
-            // Decoupled update: w -= lr * O, then decoupled decay.
+
             ops::scale_inplace(dev, Ostage, -lr, p->numel());
             ops::add_inplace(dev, p->w.f32(), Ostage, p->numel());
             if (wd != 0.0f) ops::scale_inplace(dev, p->w.f32(), 1.0f - lr * wd, p->numel());
         } else if (p->shape.size() == 1) {
-            // 1D norms: AdamW-lite with own m/v at vec_lr.
+
             ops::adamw_step(dev, p->w.f32(), p->g.f32(), m_[i].f32(), v_[i].f32(),
                             p->numel(), vec_lr, cfg_.beta1, cfg_.beta2, cfg_.eps, wd,
                             bc1, bc2, effective_scale);
         } else {
-            // Embeddings and other 2D non-matrices: Lion-style sign momentum
-            // (m only) at vec_lr — the tested rule for non-matrix params
-            // (beta2 = 0.99 mirrors Lion exactly).
+
             ops::lion_step(dev, p->w.f32(), p->g.f32(), m_[i].f32(),
                            p->numel(), vec_lr, cfg_.beta1, 0.99f, wd, effective_scale);
         }
@@ -478,8 +417,7 @@ double Muon::step(float lr, float grad_scale) {
 }
 
 size_t Muon::state_bytes() const {
-    // Moments + persistent NS scratch (the scratch is live optimizer memory
-    // the T4 guard must account for, though it is never checkpointed).
+
     size_t n = 0;
     for (const auto& t : m_) n += t.nbytes();
     for (const auto& t : v_) n += t.nbytes();
@@ -519,8 +457,8 @@ void Muon::save_state(std::ostream& os) const {
     auto& params = model_.parameters();
     for (size_t i = 0; i < m_.size(); ++i) {
         u8 mask = 0;
-        if (m_[i].defined() && !params[i]->frozen) mask |= 1u; // m
-        if (v_[i].defined() && !params[i]->frozen) mask |= 2u; // v
+        if (m_[i].defined() && !params[i]->frozen) mask |= 1u;
+        if (v_[i].defined() && !params[i]->frozen) mask |= 2u;
         os.write(reinterpret_cast<const char*>(&mask), 1);
         if (mask & 1u) {
             Tensor mc = m_[i].to(Device::CPU);
@@ -547,13 +485,13 @@ static bool rd_muon_moments(std::istream& is, const std::vector<i64>& shape, Ten
     if (!is.read(reinterpret_cast<char*>(tmp.data_ptr()),
                  static_cast<std::streamsize>(tmp.nbytes())))
         return false;
-    if (!dst.defined()) return true; // now frozen: consume and discard
+    if (!dst.defined()) return true;
     dst.copy_from(tmp);
     return true;
 }
 
 bool Muon::load_state(std::istream& is, int state_version) {
-    if (state_version < OPT_STATE_CURRENT) return false; // Muon is new: no legacy
+    if (state_version < OPT_STATE_CURRENT) return false;
     u64 count = 0;
     if (!is.read(reinterpret_cast<char*>(&count), 8)) return false;
     if (count != m_.size()) return false;
@@ -566,13 +504,11 @@ bool Muon::load_state(std::istream& is, int state_version) {
         !rd_f32(is, eps) || !rd_f32(is, wd) || !rd_f32(is, clip))
         return false;
     if (!is.read(reinterpret_cast<char*>(&ns), 4)) return false;
-    // Moment semantics come from disk; step-size policy stays live (same rule
-    // as AdamW/Lion: lr/wd/clip/ns are re-tunable on resume — recipe on disk
-    // must NOT silently override --weight-decay on resume).
+
     cfg_.beta1 = b1;
     cfg_.beta2 = b2;
     cfg_.eps = eps;
-    (void)wd;  // intentionally ignored: keep live weight_decay like AdamW/Lion
+    (void)wd;
     auto& params = model_.parameters();
     for (size_t i = 0; i < m_.size(); ++i) {
         u8 mask = 0;
@@ -587,12 +523,11 @@ bool Muon::load_state(std::istream& is, int state_version) {
     return true;
 }
 
-// ---------------------------------------------------------------- Lion
 Lion::Lion(Model& model, LionConfig cfg) : model_(model), cfg_(cfg) {
     GAI_CHECK(model.grad_enabled(), "Lion requires enable_grad(true)");
     m_.reserve(model_.parameters().size());
     for (Parameter* p : model_.parameters()) {
-        // See AdamW ctor (frozen params carry no moments).
+
         if (p->frozen) {
             m_.emplace_back();
             continue;
@@ -607,7 +542,6 @@ double Lion::step(float lr, float grad_scale) {
     Device dev = model_.device();
     auto& params = model_.parameters();
 
-    // Fused norm (same as AdamW above): 1 D2H instead of ~200.
     std::vector<std::pair<const float*, i64>> parts;
     parts.reserve(params.size());
     for (Parameter* p : params) {
@@ -633,8 +567,6 @@ double Lion::step(float lr, float grad_scale) {
         return gnorm;
     }
 
-    // PERF: same reasoning as AdamW — serial host loop, no OpenMP region (see
-    // the note there: a device error inside a parallel region is UB).
     validate_moment_table("lion", params, m_, {});
     for (long long i = 0; i < static_cast<long long>(params.size()); ++i) {
         Parameter* p = params[static_cast<size_t>(i)];
@@ -713,13 +645,13 @@ bool Lion::load_state(std::istream& is, int state_version) {
                 if (!is.read(reinterpret_cast<char*>(mc.data_ptr()),
                              static_cast<std::streamsize>(mc.nbytes())))
                     return false;
-                if (!m_[i].defined()) continue; // now frozen: consume, discard
+                if (!m_[i].defined()) continue;
                 m_[i].copy_from(mc);
             }
         }
         return true;
     }
-    // Legacy v0 layout (see AdamW above).
+
     LionConfig saved{};
     if (!is.read(reinterpret_cast<char*>(&saved), sizeof(LionConfig))) return false;
     cfg_.beta1 = saved.beta1;
@@ -736,4 +668,4 @@ bool Lion::load_state(std::istream& is, int state_version) {
     return true;
 }
 
-} // namespace gai
+}

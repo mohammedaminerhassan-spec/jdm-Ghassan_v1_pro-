@@ -1,7 +1,3 @@
-// DType registry regression: every enumerator must survive the name
-// round-trip and report the correct element size. Added for I64 (exact DDP
-// counters), which broke the CUDA build because the enumerator did not exist
-// while the CPU-only build never compiled the #ifdef GAI_CUDA user.
 #include "core/dtype.h"
 
 #include <iostream>

@@ -1,14 +1,3 @@
-// Causal grouped-query attention on the GPU.
-//
-//  * prefill  : flash-style tiled kernel with online softmax. K/V tiles live in
-//               shared memory and the [T,T] score matrix is never materialised,
-//               so memory is O(T) per query row instead of O(T^2).
-//               When `probs` is requested (training) the row is written out, which
-//               is the only case that costs O(T^2) memory.
-//  * backward : one block per (batch, kv-head, query-tile); dk/dv accumulate via
-//               atomics restricted to the block's own kv head.
-//  * decode   : split over heads, one block per head, warp-parallel over KV length.
-
 #include "cuda/cuda_ops.h"
 
 #include <cuda_runtime.h>
@@ -21,8 +10,11 @@ namespace cuda_ops {
     GAI_FAIL(std::string("CUDA ") + #x + ": " + cudaGetErrorString(_e)); } while (0)
 
 static constexpr int WARP_A = 32;
-static constexpr int KV_TILE = 64;      // KV positions processed per shared-memory tile
-static constexpr int MAX_HD  = 128;     // head_dim upper bound (ours is 64)
+static constexpr int KV_TILE = 64;
+static constexpr int MAX_HD  = 128;
+
+static constexpr int DECODE_BLOCK = 128;
+static constexpr size_t DECODE_SHMEM_FLOATS = 40;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     #pragma unroll
@@ -30,11 +22,6 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
-// ---------------------------------------------------------------- forward
-// grid  = (T, H, B) ; block = 32 threads (one warp per query position).
-// Shared layout: sQ[hd] | sK[KV_TILE*hd] | sV[KV_TILE*hd] | sS[KV_TILE] | sAcc[hd]
-// Everything that must be shared across lanes lives in shared memory, so register
-// pressure stays flat regardless of head_dim.
 __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict__ k,
                            const float* __restrict__ v, float* __restrict__ out,
                            float* __restrict__ probs, const i32* __restrict__ segment_ids,
@@ -77,7 +64,6 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
         }
         __syncwarp();
 
-        // scores for this tile
         float tmax = -FLT_MAX;
         for (int j = lane; j < tile; j += WARP_A) {
             int pos = base + j;
@@ -93,8 +79,7 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
             }
             sS[j] = s;
             tmax = fmaxf(tmax, s);
-            // Raw scores are cached; the row is exponentiated and normalised once at
-            // the end, because the running max is only final after the last tile.
+
             if (probs) probs[((size_t(b) * H + h) * T + t) * T + pos] = s;
         }
         #pragma unroll
@@ -118,7 +103,6 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
         run_sum = run_sum * rescale + tsum;
         run_max = new_max;
 
-        // rescale the running accumulator and add this tile's contribution
         for (int c = lane; c < hd; c += WARP_A) {
             float a = sAcc[c] * rescale;
             for (int j = 0; j < tile; ++j) a += sS[j] * sV[j * hd + c];
@@ -148,17 +132,13 @@ void attention_forward(const float* q, const float* k, const float* v,
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_forward: H must be a multiple of KV");
     dim3 grid(T, H, B);
-    // Shared layout: sQ[hd] | sK[KV_TILE*hd] | sV[KV_TILE*hd] | sS[KV_TILE] | sAcc[hd]
-    // T4 has 48KB shared/block: hd=64 -> ~33KB ok, hd=128 -> ~66KB OOM.
-    // Fail fast with a clear message instead of illegal launch.
+
     size_t sh = sizeof(float) * (size_t(hd) + size_t(KV_TILE) * hd * 2 + KV_TILE + size_t(hd));
     GAI_CHECK(sh <= 48 * 1024, "cuda attention_forward: shared memory over T4 limit (use smaller head_dim)");
     k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, nullptr, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
 }
 
-// SWA (Mistral-style sliding window): simple correct kernel for window>0.
-// window==0 delegates to the flash tiled path above (zero regression risk).
 __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restrict__ k,
                                const float* __restrict__ v, float* __restrict__ out,
                                float* __restrict__ probs, const i32* __restrict__ segment_ids,
@@ -175,9 +155,7 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
     float* o = out + size_t(b) * qs + (size_t(t) * H + h) * hd;
     int j0 = (window > 0 && t + 1 > window) ? t + 1 - window : 0;
-    // scores in global probs row scratch (probs required for SWA training path;
-    // inference prefill passes probs=null and uses registers only via swa path below).
-    // To keep this kernel simple it recomputes per lane with warp reductions.
+
     __shared__ float sAcc[128];
     for (int c = lane; c < hd; c += WARP_A) sAcc[c] = 0.0f;
     __syncwarp();
@@ -194,8 +172,7 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
 #pragma unroll
     for (int o2 = WARP_A / 2; o2 > 0; o2 >>= 1)
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o2));
-    // Every lane computes the same full sum (j loop not strided, sAcc
-    // partitioned over c not j): use it directly, no warp reduction.
+
     float sum = 0.0f;
     for (int j = j0; j <= t; ++j) {
         i32 seg_j = segment_ids ? segment_ids[size_t(b) * T + j] : 0;
@@ -213,7 +190,7 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
         for (int c = lane; c < hd; c += WARP_A) sAcc[c] += p * vh[c];
         if (probs) probs[((size_t(b) * H + h) * T + t) * T + j] = p;
     }
-    __syncwarp();  // ensure all sAcc partitions visible before normalize
+    __syncwarp();
     float inv = 1.0f / sum;
     for (int c = lane; c < hd; c += WARP_A) o[c] = sAcc[c] * inv;
     if (probs) {
@@ -246,15 +223,6 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
 }
 
-// ---------------------------------------------------------------- backward
-// Requires the cached probs (training path).
-// Grid = (T, KV, B), block = 32 (one warp per query position).
-// Each block owns ALL query heads of one KV group, so same-KV writes from
-// different query heads never race across blocks. Inside the block the KV
-// row range is processed in KV_TILE-sized tiles that always fit in shared
-// memory (no overflow for any T), and dk/dv hit global memory with exactly
-// one atomicAdd per element per block. dq rows are exclusive per (t, head),
-// written with plain adds. Global head indices (gh) are used everywhere.
 __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict__ k,
                            const float* __restrict__ v, const float* __restrict__ probs,
                            const float* __restrict__ dout,
@@ -272,11 +240,10 @@ __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict_
     const int len = t + 1;
 
     extern __shared__ float shmem[];
-    float* s_dk  = shmem;                        // [KV_TILE * hd] tile scratch
-    float* s_dv  = shmem + KV_TILE * hd;         // [KV_TILE * hd] tile scratch
-    float* s_dot = shmem + 2 * KV_TILE * hd;     // [group] row sums, lane 0 writes
+    float* s_dk  = shmem;
+    float* s_dv  = shmem + KV_TILE * hd;
+    float* s_dot = shmem + 2 * KV_TILE * hd;
 
-    // Phase 1: dot_pg[h] = sum_j p_j * dot(go, v_j) over the FULL row.
     for (int h = 0; h < group; ++h) {
         const int gh = kvh * group + h;
         const float* pr = probs + ((size_t(b) * H + gh) * T + t) * T;
@@ -296,9 +263,6 @@ __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict_
     }
     __syncthreads();
 
-    // Phase 2: tiled accumulation. Within a tile, (j, c) pairs are owned by
-    // exactly one thread (j strided by lane, c looped fully), so plain +=
-    // into shared memory is race-free. dq uses per-thread registers.
     for (int base = 0; base < len; base += KV_TILE) {
         const int tile = min(KV_TILE, len - base);
         for (int idx = lane; idx < tile * hd; idx += WARP_A) {
@@ -334,7 +298,7 @@ __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict_
                     }
                 }
             }
-            // dq row (b,t,gh) is exclusive to this block: plain add, lane 0.
+
             float* dqh = dq + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             for (int c = 0; c < hd; ++c) {
                 const float s = warp_reduce_sum(dqacc[c]);
@@ -343,7 +307,6 @@ __global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict_
         }
         __syncthreads();
 
-        // Flush this tile to global dk/dv (one atomic per element per block).
         for (int j = lane; j < tile; j += WARP_A) {
             const int jj = base + j;
             float* dvh = dv + size_t(b) * kvs + (size_t(jj) * KV + kvh) * hd;
@@ -368,8 +331,7 @@ void attention_backward(const float* q, const float* k, const float* v,
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_backward: H must be a multiple of KV");
     dim3 grid(T, KV, B);
-    // Shared: s_dk[KV_TILE*hd] + s_dv[KV_TILE*hd] + s_dot[group].
-    // hd=64, group=3 -> ~32KB, fits the 48KB T4 limit for any T.
+
     const int group = H / KV;
     const size_t shmem = sizeof(float) * (size_t(2) * KV_TILE * hd + group);
     GAI_CHECK(shmem <= 48 * 1024, "cuda attention_backward: shared memory over T4 limit");
@@ -377,8 +339,6 @@ void attention_backward(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
 }
 
-// ---------------------------------------------------------------- decode
-// One block per query head, 128 threads striding over the KV length.
 __global__ void k_attn_decode(const float* __restrict__ q, const float* __restrict__ kc,
                               const float* __restrict__ vc, float* __restrict__ out,
                               int H, int KV, int hd, int cur_len, float scale,
@@ -390,7 +350,6 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
     const float* qh = q + size_t(h) * hd;
     float* s = scratch + size_t(h) * cur_len;
 
-    // scores
     float local_max = -FLT_MAX;
     for (int j = threadIdx.x; j < cur_len; j += blockDim.x) {
         const float* kh = kc + (size_t(j) * KV + kvh) * hd;
@@ -401,7 +360,7 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
         s[j] = d;
         local_max = fmaxf(local_max, d);
     }
-    // block max
+
     int lane = threadIdx.x % WARP_A, wid = threadIdx.x / WARP_A;
     #pragma unroll
     for (int o = WARP_A / 2; o > 0; o >>= 1)
@@ -446,13 +405,17 @@ __global__ void k_attn_decode(const float* __restrict__ q, const float* __restri
 void attention_decode(const float* q, const float* kc, const float* vc,
                       float* out, int H, int KV, int hd, int cur_len, int max_len,
                       float scale, float* scratch) {
-    // cur_len must fit the KV allocation (max_len); fail fast otherwise.
+
     GAI_CHECK(cur_len <= max_len,
               "cuda attention_decode: cur_len exceeds KV cache max_len (increase max_context)");
     GAI_CHECK(cur_len >= 0 && max_len >= 0, "cuda attention_decode: negative length");
+    GAI_CHECK(H % KV == 0, "cuda attention_decode: H must be a multiple of KV");
+    GAI_CHECK(scratch != nullptr, "cuda attention_decode: null scratch (need H*cur_len floats)");
     if (H <= 0 || cur_len <= 0) return;
-    int block = 128;
-    size_t sh = sizeof(float) * 40;
+    int block = DECODE_BLOCK;
+    GAI_CHECK((block + WARP_A - 1) / WARP_A + 2 <= (int)DECODE_SHMEM_FLOATS,
+              "cuda attention_decode: block exceeds shared-memory budget");
+    size_t sh = sizeof(float) * DECODE_SHMEM_FLOATS;
     k_attn_decode<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, scale, scratch);
     CU_CHECK2(cudaGetLastError());
 }
@@ -461,9 +424,7 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
                            const float* probs, const float* dout,
                            float* dq, float* dk, float* dv,
                            int B, int T, int H, int KV, int hd, float scale, int window) {
-    // SWA forward_ex already zeroed probs outside the window, so the standard
-    // tiled backward (which multiplies by pr[j]) naturally respects the mask.
-    // Delegate directly — no separate kernel, zero regression risk.
+
     (void)window;
     attention_backward(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale);
 }
@@ -609,11 +570,15 @@ void attention_decode_ex(const float* q, const float* kc, const float* vc,
     GAI_CHECK(cur_len <= max_len,
               "cuda attention_decode_ex: cur_len exceeds KV cache max_len (increase max_context)");
     GAI_CHECK(cur_len >= 0 && max_len >= 0, "cuda attention_decode_ex: negative length");
+    GAI_CHECK(H % KV == 0, "cuda attention_decode_ex: H must be a multiple of KV");
+    GAI_CHECK(scratch != nullptr, "cuda attention_decode_ex: null scratch (need H*cur_len floats)");
     if (H <= 0 || cur_len <= 0) return;
     if (window <= 0) { attention_decode(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch); return; }
     int j0 = (cur_len > window) ? cur_len - window : 0;
-    int block = 128;
-    size_t sh = sizeof(float) * 40;
+    int block = DECODE_BLOCK;
+    GAI_CHECK((block + WARP_A - 1) / WARP_A + 2 <= (int)DECODE_SHMEM_FLOATS,
+              "cuda attention_decode_ex: block exceeds shared-memory budget");
+    size_t sh = sizeof(float) * DECODE_SHMEM_FLOATS;
     k_attn_decode_ex<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, scale, scratch, j0);
     CU_CHECK2(cudaGetLastError());
 }
@@ -636,12 +601,14 @@ void attention_decode_ring(const float* q, const float* kc, const float* vc,
     }
     if (H <= 0 || cur_len <= 0) return;
     int j0 = (window > 0 && cur_len > window) ? cur_len - window : 0;
-    int block = 128;
-    size_t sh = sizeof(float) * 40;
+    int block = DECODE_BLOCK;
+    GAI_CHECK((block + WARP_A - 1) / WARP_A + 2 <= (int)DECODE_SHMEM_FLOATS,
+              "cuda attention_decode_ring: block exceeds shared-memory budget");
+    size_t sh = sizeof(float) * DECODE_SHMEM_FLOATS;
     k_attn_decode_ring<<<H, block, sh>>>(q, kc, vc, out, H, KV, hd, cur_len, ring_start,
                                          pinned_prefix, ring_capacity, scale, scratch, j0);
     CU_CHECK2(cudaGetLastError());
 }
 
-} // namespace cuda_ops
-} // namespace gai
+}
+}

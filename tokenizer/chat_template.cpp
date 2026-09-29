@@ -4,30 +4,21 @@
 namespace gai {
 
 const char* ChatTemplate::default_system() {
-    // Darija system prompt: sets the persona and the anti-robotic style contract.
+
     return "نتا غسان، مساعد ذكي مغربي. هضر بالدارجة بشكل طبيعي وقصير، "
            "بحال شي صاحب كيهضر مع صاحبو. ماتكترش الكلام، وماتستعملش عبارات رسمية زايدة. "
            "جاوب غير بالحروف العربية، ممنوع تكتب حتى كلمة وحدة بالحروف اللاتينية.";
 }
 
 const char* ChatTemplate::default_system_latin() {
-    // Same persona as default_system(), Latin letters only. Used when the user
-    // writes in Arabizi so the reply stays single-script (never mixed).
+
     return "nta Ghassan, mosa3id dakiy maghribi. hder b Darija b chakl tabi3i w 9sir, "
            "bhal chi sa7eb kayhder m3a sa7bo. matketrch lklam, w matsta3melch 3ibarat rasmiya zayda. "
            "jaweb ghir b lhorof llatiniya, mamno3 tekteb 7ta kelma we7da b lhorof l3arabiya.";
 }
 
 const char* ChatTemplate::default_system_english() {
-    // PRO-EN persona for the English-Pro model (Ghassan v1 English).
-    // This is the inference-time twin of the SFT behavior data in
-    // dataset/english_dialogue_content.cpp: same contract, enforced at runtime.
-    // Fast, direct, genuinely helpful: answers first, explains after.
-    // Never breaks character with AI-disclosure boilerplate, never pads with
-    // empty politeness, and says "I don't know" honestly when unsure.
-    // Concise by default; expands when the question calls for depth.
-    // Declines harmful requests calmly and offers an alternative; stays
-    // neutral on politics and religion and defers rulings to qualified humans.
+
     return "You are Ghassan, a fast and capable English assistant. Answer directly "
            "and helpfully: lead with the answer, then explain briefly. Be concise by "
            "default and expand when the question needs depth. Be accurate over verbose; "
@@ -52,9 +43,7 @@ const char* ChatTemplate::script_directive(ReplyScript s) {
 
 ReplyScript ChatTemplate::detect_script(const std::string& user_message) {
     ScriptStats st = script_stats(user_message);
-    // Arabic-letter majority wins; everything else (Arabizi, French, English,
-    // digits, emoji-only) expects a Latin-letter reply. Empty input keeps the
-    // current persona (Arabic default) instead of flipping randomly.
+
     if (st.arabic == 0 && st.latin == 0) return ReplyScript::Arabic;
     return (st.arabic >= st.latin) ? ReplyScript::Arabic : ReplyScript::Latin;
 }
@@ -108,7 +97,7 @@ std::vector<i32> ChatTemplate::encode(const Tokenizer& tk,
         std::vector<i32> body = tk.encode(m.content, false, false);
         const u8 lm = (m.role == Role::Assistant) ? 1 : 0;
         for (i32 id : body) push(id, lm);
-        // <|end|> is supervised for assistant turns so the model learns to stop
+
         push(special::END, lm);
     }
 
@@ -118,4 +107,4 @@ std::vector<i32> ChatTemplate::encode(const Tokenizer& tk,
     return ids;
 }
 
-} // namespace gai
+}

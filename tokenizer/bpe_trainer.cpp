@@ -10,9 +10,7 @@
 namespace gai {
 
 void BpeTrainer::add_chunk_counts(const std::string& chunk, u64 count) {
-    // DeepSeek trainer rule: raw-chunk injection bypassed normalize+pre_tokenize
-    // that add_text applies, so train-vs-encode diverged (public trap).
-    // Canonicalize here: normalize + pre-tokenize, distribute count to pieces.
+
     if (chunk.empty() || count == 0) return;
     Normalizer norm(cfg_.normalizer);
     std::string n = norm.normalize(chunk);
@@ -23,8 +21,7 @@ void BpeTrainer::add_chunk_counts(const std::string& chunk, u64 count) {
         total_ += count;
         any = true;
     }
-    // Fallback: if pre-tokenizer yields nothing (e.g. whitespace-only),
-    // keep the normalized chunk itself so counts are never silently dropped.
+
     if (!any && !n.empty()) {
         counts_[n] += count;
         total_ += count;
@@ -56,12 +53,11 @@ void BpeTrainer::add_file(const std::string& path) {
     }
 }
 
-// ---------------------------------------------------------------- training
 namespace {
 
 struct Word {
-    std::vector<i32> syms;    // current symbol ids
-    std::vector<int> prev;    // doubly linked list over live positions
+    std::vector<i32> syms;
+    std::vector<int> prev;
     std::vector<int> next;
     std::vector<u8>  alive;
     u64  freq = 0;
@@ -84,12 +80,12 @@ struct HeapItem {
     i64 count;
     u64 pair;
     bool operator<(const HeapItem& o) const {
-        if (count != o.count) return count < o.count;      // max-heap on count
-        return pair > o.pair;                              // deterministic tie-break
+        if (count != o.count) return count < o.count;
+        return pair > o.pair;
     }
 };
 
-} // namespace
+}
 
 Tokenizer BpeTrainer::train() {
     GAI_CHECK(!counts_.empty(), "BPE trainer has no data");
@@ -98,18 +94,17 @@ Tokenizer BpeTrainer::train() {
     const int reserved  = n_special + n_base;
     GAI_CHECK(cfg_.vocab_size > reserved + 100, "vocab_size too small");
 
-    // ---- vocabulary seeded with specials + all 256 bytes
     std::vector<std::string> vocab;
     vocab.reserve(static_cast<size_t>(cfg_.vocab_size));
     for (const auto& s : special_token_strings()) vocab.push_back(s);
     for (int b = 0; b < 256; ++b) vocab.push_back(std::string(1, static_cast<char>(b)));
 
-    // ---- build word list
     std::vector<Word> words;
     words.reserve(counts_.size());
     for (const auto& [chunk, freq] : counts_) {
         if (freq < static_cast<u64>(cfg_.min_frequency)) continue;
-        if (chunk.size() < 2) continue;   // single bytes need no merges
+
+        if (utf8_length(chunk) < 2) continue;
         Word w;
         w.freq = freq;
         w.syms.reserve(chunk.size());
@@ -130,7 +125,6 @@ Tokenizer BpeTrainer::train() {
                         human_count(words.size()).c_str()));
     }
 
-    // ---- initial pair statistics + occurrence index
     std::unordered_map<PairKey, i64, PairHash> pair_count;
     std::unordered_map<PairKey, std::unordered_set<u32>, PairHash> pair_words;
     pair_count.reserve(1u << 20);
@@ -158,7 +152,7 @@ Tokenizer BpeTrainer::train() {
         HeapItem top = heap.top();
         heap.pop();
         auto pit = pair_count.find(PairKey{top.pair});
-        if (pit == pair_count.end() || pit->second != top.count) continue;   // stale
+        if (pit == pair_count.end() || pit->second != top.count) continue;
         if (top.count < static_cast<i64>(cfg_.min_frequency)) break;
 
         i32 a = static_cast<i32>(top.pair >> 32);
@@ -167,10 +161,6 @@ Tokenizer BpeTrainer::train() {
         const std::string& sb = vocab[static_cast<size_t>(b)];
         std::string merged = sa + sb;
 
-        // DeepSeek multilingual rule: max_token_bytes counted BYTES penalizes
-        // Arabic (~2B/codepoint) vs Latin (1B) — 32B = 32 Latin chars but ~16
-        // Arabic chars, biasing fertility studies. Count codepoints instead
-        // (same limit value now means 32 chars in any script).
         if (static_cast<int>(utf8_length(merged)) > cfg_.max_token_bytes) {
             pair_count.erase(pit);
             pair_words.erase(PairKey{top.pair});
@@ -182,7 +172,6 @@ Tokenizer BpeTrainer::train() {
         merges.emplace_back(sa, sb);
         ++done;
 
-        // ---- apply the merge to every word that contains this pair
         auto wsit = pair_words.find(PairKey{top.pair});
         std::unordered_set<u32> affected;
         if (wsit != pair_words.end()) affected = std::move(wsit->second);
@@ -206,7 +195,6 @@ Tokenizer BpeTrainer::train() {
                 int p = w.prev[static_cast<size_t>(i)];
                 int q = w.next[static_cast<size_t>(j)];
 
-                // remove the pairs that disappear
                 if (p >= 0) {
                     u64 lp = mk_pair(w.syms[static_cast<size_t>(p)], a);
                     pair_count[PairKey{lp}] -= f;
@@ -218,13 +206,11 @@ Tokenizer BpeTrainer::train() {
                     touched.insert(rp);
                 }
 
-                // merge j into i
                 w.syms[static_cast<size_t>(i)] = new_id;
                 w.alive[static_cast<size_t>(j)] = 0;
                 w.next[static_cast<size_t>(i)] = q;
                 if (q >= 0) w.prev[static_cast<size_t>(q)] = i;
 
-                // add the new pairs
                 if (p >= 0) {
                     u64 lp2 = mk_pair(w.syms[static_cast<size_t>(p)], new_id);
                     pair_count[PairKey{lp2}] += f;
@@ -238,8 +224,6 @@ Tokenizer BpeTrainer::train() {
                     touched.insert(rp2);
                 }
 
-                // continue scanning after the merged symbol (handles "aaa" correctly:
-                // the merged node can pair with the following symbol on the next round)
                 i = q;
             }
         }
@@ -262,8 +246,6 @@ Tokenizer BpeTrainer::train() {
         }
     }
 
-    // The model's embedding matrix has a fixed width, so the vocabulary must hit the
-    // requested size exactly even when the corpus runs out of useful merges.
     if (static_cast<int>(vocab.size()) < cfg_.vocab_size) {
         int pad = cfg_.vocab_size - static_cast<int>(vocab.size());
         if (cfg_.verbose) {
@@ -282,4 +264,4 @@ Tokenizer BpeTrainer::train() {
     return tk;
 }
 
-} // namespace gai
+}

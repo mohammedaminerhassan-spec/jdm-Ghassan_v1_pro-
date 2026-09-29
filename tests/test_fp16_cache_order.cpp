@@ -1,6 +1,3 @@
-// F-13 regression: with the persistent fp16 weight cache enabled, the fused QKV
-// activation scratch MUST exist, otherwise the forward silently falls back to
-// three separate projections per layer.
 #include "model/model.h"
 #include <iostream>
 using namespace gai;
@@ -14,11 +11,11 @@ static ModelConfig cfg_of(bool qk) {
 int main(){
   for (int qk=0; qk<2; ++qk) {
     ModelConfig cfg = cfg_of(qk!=0);
-    // cache OFF -> no fused qkv scratch by design
+
     { Model m(cfg, Device::CPU); m.init_weights(1);
       Activations a = m.make_activations(1, 8, true, 1);
       CHECK(!a.qkv.defined(), "no fused qkv scratch when the fp16 cache is off"); }
-    // cache ON -> fused qkv scratch present (this is what F-13 was losing)
+
     { Model m(cfg, Device::CPU); m.init_weights(1);
       m.enable_fp16_weight_cache(true);
       CHECK(m.fp16_weight_cache_enabled(), "fp16 weight cache reports enabled");
@@ -26,7 +23,7 @@ int main(){
       CHECK(m.fp16_weight_cache_bytes() > 0, "fp16 cache has a non-zero footprint");
       Activations a = m.make_activations(1, 8, true, 1);
       CHECK(a.qkv.defined(), "F-13: fused qkv scratch is allocated when the cache is on");
-      // and the forward must run through it
+
       m.enable_grad(true);
       std::vector<i32> ids(8), tgt(8, -100);
       for (int i=0;i<8;++i){ ids[i]=i+1; if(i+1<8) tgt[i]=ids[i+1]; }

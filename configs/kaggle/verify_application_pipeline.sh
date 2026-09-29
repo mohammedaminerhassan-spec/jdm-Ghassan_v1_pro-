@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/verify_application_pipeline.sh — full application-usage gate on a real T4.
-#
-# Proves the whole user-facing path with the REAL tokenizer (vocab 32000) and
-# the REAL English shards:
-#   train (6 steps) -> loss goes down -> export GGUF (fp16 + q4_0) -> info
-#   -> tokenize round-trip -> generate -> chat -> bench -> perplexity(val)
-#   -> quantize -> logits -> devices
-# Every step is fail-fast with a named marker, so a break names itself.
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

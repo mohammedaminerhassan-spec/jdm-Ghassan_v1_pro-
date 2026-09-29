@@ -1,62 +1,23 @@
-# Ghassan v1 Pro — English PRETRAIN recipe (flagship single-T4 run).
-# Architecture: fast MoE, ~480M total / ~204M active per token:
-#   26 layers, 12 heads, 4 KV heads (GQA), 8 experts top-2 + shared, QK-Norm.
-# Why this size: 204M active experts + full attention responds FAST on T4
-# (single-token decode is memory-bound), while 480M total trains in one
-# Kaggle session budget. For maximum strength, see configs/pro_1b_single.yaml (1B).
-# T4 fit: fp32 masters + Lion/AdamW below, B=2/T=1024/accum=32
-# (65,536 tokens/step, ~11.8GB measured envelope).
-#
-# DATA (Parquet-only, English Hermes lake — Kaggle):
-#   EN_PARQUET_DIR=<lake> bash configs/kaggle/build_english_data.sh
-#     == data_pipeline parquet --mode chat --lake <lake> --match english_chat ...
-#        --tokenizer artifacts/tokenizer/english32k.gtok --expect-vocab 32000
-#        --style-mode en --keep-case --seq-len 1024 --domain english_chat
-#     (+ same for --match english_instruction --domain english_instruction)
-#   output: artifacts/shards_en/train_english_{chat,instruction}_*.gbin
-# Tokenizer (keep-case English BPE, vocab 32000):
-#   artifacts/tokenizer/english32k.gtok (trained by setup.sh from the lake).
-#   Shards MUST be built with --style-mode en --keep-case --expect-vocab 32000
-#   or casing/filters silently disagree between train and inference.
-#
-# CONTEXT WINDOW (controllable):
-#   - model.max_seq_len below is the HARD maximum (KV cache is sized from it).
-#   - training.seq_len (1024) is the window the model trains on (<= max_seq_len).
-#   - inference: ghassan-ai generate/chat --ctx N with N <= max_seq_len.
-#   - presets: 2048 = fastest, long chats stay coherent; 4096 = default;
-#     8192 needs rope_scale 2.0 (approximate NTK extrapolation, validate ppl).
-#   - memory remembers the window via the KV cache; older turns slide out
-#     (Generator keeps BOS + recent turns, evicting the front past the budget).
-#
-# TRAIN (single T4, timeboxed by pilot-measured tok/s, NOT by epochs):
-#   TOK=artifacts/tokenizer/english32k.gtok \
-#   CONFIG_PT=configs/flash_480m_single.yaml CONFIG_SFT=configs/sft_flash_480m_single.yaml \
-#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
-#   CKPT_PT=artifacts/checkpoints/flash_480m_single CKPT_SFT=artifacts/checkpoints/flash_480m_single_sft \
-#   GGUF_OUT=artifacts/ghassan-v1-pro_q4_0.gguf \
-#   bash configs/kaggle/train_1b.sh --time-budget-min 540 --export-profile q4_0
-# Chat: ghassan-ai chat --model artifacts/ghassan-v1-pro_q4_0.gguf --persona en
-
 model:
-  vocab_size: 32000        # english32k.gtok (keep-case)
+  vocab_size: 32000
   hidden_size: 768
   num_layers: 26
   num_heads: 12
-  num_kv_heads: 4          # GQA: 3x smaller KV cache than MHA
-  intermediate_size: 2240  # dense fallback only (unused when use_moe=true)
+  num_kv_heads: 4
+  intermediate_size: 2240
   max_seq_len: 4096
   rope_theta: 10000.0
   rms_eps: 1.0e-5
   tie_embeddings: true
   init_std: 0.02
   use_moe: true
-  num_experts: 8           # routed experts per layer (DeepSeek-style)
-  moe_top_k: 2             # active experts per token
-  moe_expert_dim: 768      # SwiGLU hidden size per expert
-  moe_shared: true         # +1 always-on shared expert
+  num_experts: 8
+  moe_top_k: 2
+  moe_expert_dim: 768
+  moe_shared: true
   moe_aux_scale: 0.01
-  moe_aux_free: false       # Pro: classic aux loss (true needs aux_scale 0.0)
-  moe_jitter: 0.01         # DeepSeek-V2 router exploration (train-only)
+  moe_aux_free: false
+  moe_jitter: 0.01
   z_loss_scale: 0.0001
   use_qk_norm: true
   rope_scale: 1.0
@@ -65,7 +26,6 @@ model:
   rope_yarn_high: 32.0
   sliding_window: 0
   rope_type: 0
-  # => ~480M total, ~204M active per token (+3k QK-Norm params)
 
 tokenizer:
   path: artifacts/tokenizer/english32k.gtok
@@ -77,12 +37,12 @@ training:
   precision: fp32
   gemm_fp16: true
   fp16_weight_cache: true
-  loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
-  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  loss_scale_init: 8192
+  loss_scale_max: 8192
   loss_scale_window: 2000
   batch_size: 2
   seq_len: 1024
-  grad_accum: 32           # effective 2*1024*32 = 65,536 tokens/step (~11.8GB)
+  grad_accum: 32
   max_steps: 0
   epochs: 2
   learning_rate: 3.0e-4
@@ -107,14 +67,12 @@ training:
   activation_checkpointing: true
   ckpt_segments: 2
   pack_sequences: true
+  output_budget_mb: 17408
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin
   val_glob: artifacts/shards_en/val_*.gbin
-  # ACTIVE MIX (must equal what build_english_data.sh materializes —
-  # every domain below is built there with --domain, so preflight passes).
-  #   english_chat:        multi-turn chit-chat (logic, humor, daily life)
-  #   english_instruction: instruction-following turns (task obedience)
+
   mix:
     english_chat: 0.80
     english_instruction: 0.20

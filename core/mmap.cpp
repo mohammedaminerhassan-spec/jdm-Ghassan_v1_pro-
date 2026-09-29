@@ -62,12 +62,9 @@ bool MappedFile::open(const std::string& path) {
     close();
     if (path.empty()) return false;
 #ifdef _WIN32
-    // FILE_SHARE_DELETE is essential, not generous: without it, any live
-    // mapping (even our own process retraining over the file) makes a later
-    // remove/rename fail with Permission denied. The mapping keeps serving
-    // the OLD bytes, which is exactly the correct semantics.
+
     HANDLE f = CreateFileA(path.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER sz{};
@@ -80,8 +77,7 @@ bool MappedFile::open(const std::string& path) {
         CloseHandle(f);
         return false;
     }
-    // Whole-file read-only view; OS pages it on demand, shares between
-    // processes, and may evict clean pages under pressure (the weak-PC win).
+
     void* base = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     if (base == nullptr) {
         CloseHandle(m);
@@ -104,8 +100,7 @@ bool MappedFile::open(const std::string& path) {
     }
     void* base = ::mmap(nullptr, static_cast<size_t>(st.st_size),
                         PROT_READ, MAP_PRIVATE, fd, 0);
-    // The fd may be closed right after a successful mmap (POSIX-legal);
-    // the mapping itself keeps the pages alive.
+
     ::close(fd);
     if (base == MAP_FAILED) return false;
     fd_   = -1;
@@ -119,7 +114,7 @@ bool MappedFile::open(const std::string& path) {
 void MappedFile::close() {
     if (base_ == nullptr) {
 #ifdef _WIN32
-        // Defensive: never leak handles even on a moved-from/partial state.
+
         if (map_ != nullptr) {
             CloseHandle(static_cast<HANDLE>(map_));
             map_ = nullptr;
@@ -135,6 +130,7 @@ void MappedFile::close() {
         }
 #endif
         size_ = 0;
+        path_.clear();
         return;
     }
 #ifdef _WIN32
@@ -144,11 +140,12 @@ void MappedFile::close() {
     map_  = nullptr;
     file_ = nullptr;
 #else
-    ::munmap(base_, static_cast<size_t>(size_));
-    // fd_ is already -1 here (closed in open()), kept only for clarity.
+    if (size_ > 0) ::munmap(base_, static_cast<size_t>(size_));
+
 #endif
     base_ = nullptr;
     size_ = 0;
+    path_.clear();
 }
 
-} // namespace gai
+}

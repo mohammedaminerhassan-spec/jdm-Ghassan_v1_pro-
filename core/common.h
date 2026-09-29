@@ -19,7 +19,6 @@ using u32 = std::uint32_t;
 using i64 = std::int64_t;
 using u64 = std::uint64_t;
 
-// ------------------------------------------------------------------ errors
 class Error : public std::runtime_error {
 public:
     explicit Error(const std::string& what) : std::runtime_error(what) {}
@@ -31,7 +30,6 @@ public:
 #define GAI_CHECK(cond, msg) \
     do { if (!(cond)) ::gai::fail(std::string("check failed: " #cond " : ") + (msg), __FILE__, __LINE__); } while (0)
 
-// ------------------------------------------------------------------ logging
 enum class LogLevel { Debug = 0, Info = 1, Warn = 2, ErrorL = 3, Silent = 4 };
 
 void set_log_level(LogLevel lvl);
@@ -43,10 +41,8 @@ void log_info(const std::string& m);
 void log_warn(const std::string& m);
 void log_error(const std::string& m);
 
-// printf-style helper
 std::string strfmt(const char* fmt, ...);
 
-// ------------------------------------------------------------------ timing
 class Timer {
 public:
     Timer() { reset(); }
@@ -55,7 +51,7 @@ public:
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
     }
     double ms() const { return seconds() * 1000.0; }
-    // Whole microseconds, for the relaxed-atomic perf counters (ops layer).
+
     u64 elapsed_us() const {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0_).count());
@@ -64,19 +60,14 @@ private:
     std::chrono::steady_clock::time_point t0_;
 };
 
-// ------------------------------------------------------------------ misc
 std::string human_bytes(u64 n);
 std::string human_count(u64 n);
 std::string human_duration(double seconds);
 
-// Stable 64-bit content fingerprint (FNV-1a) of a file, 0 if unreadable.
-// Used to pin the TOKENIZER identity inside checkpoints: a resume with a
-// different .gtok (same vocab_size, different merges) would silently train
-// on different token ids and corrupt every embedding row.
 u64 fingerprint_file(const std::string& path);
 std::string fingerprint_hex(u64 fp);
 
 int  num_threads();
 void set_num_threads(int n);
 
-} // namespace gai
+}

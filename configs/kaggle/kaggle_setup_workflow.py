@@ -1,26 +1,3 @@
-# configs/kaggle/kaggle_setup_workflow.py ÔÇö Kaggle setup workflow, step 1 of 3 (run this FIRST)
-#
-# One cell, no arguments, no choices:
-#   1. clone (or update) the project from GitHub
-#   2. build the C++ + CUDA binaries (sm_75 = the Kaggle T4)
-#   3. prove the build is correct: CUDA/CPU MoE parity + the whole test suite
-#   4. print exactly one PASS/FAIL verdict and the command for the next cell
-#
-# ------------------------------------------------------------------
-# PASTE THIS INTO THE KAGGLE CELL (5 lines, no placeholders):
-#
-#     !git clone --depth 1 https://github.com/mohammedaminerhassan-spec/jdm-Ghassan_v1_pro-.git /kaggle/working/repo 2>/dev/null || (cd /kaggle/working/repo && git fetch --all && git reset --hard origin/HEAD)
-#     !cd /kaggle/working/repo && git pull --ff-only 2>/dev/null || true
-#     %run /kaggle/working/repo/configs/kaggle/kaggle_setup_workflow.py
-#
-# Re-run those three lines after every `git push`: the cell always pulls the
-# newest code first, so the notebook never runs a stale commit.
-# ------------------------------------------------------------------
-# Optional environment (a cell above this one, or just edit REPO_URL here):
-#   REPO_URL   = a different repo/branch
-#   SKIP_TESTS = 1 to skip the test suite (not recommended)
-#   CLEAN      = 1 to wipe build/ first
-
 import glob
 import os
 import re
@@ -43,7 +20,6 @@ DO_CLEAN = os.environ.get("CLEAN", "0") == "1"
 STEP = [0]
 FAILED = []
 
-
 def rule(title=""):
     STEP[0] += 1
     bar = "=" * 74
@@ -51,15 +27,12 @@ def rule(title=""):
     print(f"[{STEP[0]}] {title}" if title else bar)
     print(bar, flush=True)
 
-
 def ok(msg):
     print(f"  [ok]   {msg}", flush=True)
-
 
 def bad(msg):
     FAILED.append(msg)
     print(f"  [FAIL] {msg}", flush=True)
-
 
 def run(cmd, cwd=None, log=None, tail=40, env=None):
     """Run a shell command, tee to `log`, and return (rc, full_output)."""
@@ -89,7 +62,6 @@ def run(cmd, cwd=None, log=None, tail=40, env=None):
     print(f"  -> rc={p.returncode}  ({time.time() - t0:.1f}s)", flush=True)
     return p.returncode, out
 
-
 def section(out, pattern, label):
     """Pull the interesting lines out of a long build log."""
     hits = [ln.rstrip() for ln in out.splitlines() if re.search(pattern, ln)]
@@ -100,15 +72,12 @@ def section(out, pattern, label):
         print(f"  {label} (not found in the log)")
     return hits
 
-
 def out_of(cmd, cwd=None):
     """stdout only, no decoration ÔÇö for parsing counts."""
     p = subprocess.run(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True, errors="replace")
     return p.stdout or ""
 
-
-# ---------------------------------------------------------------- 0. session
 rule("SESSION")
 run("date; echo; nvidia-smi --query-gpu=index,name,memory.total,driver_version "
     "--format=csv,noheader; echo; free -g | head -2; echo; df -h /kaggle/working | tail -1; "
@@ -116,12 +85,10 @@ run("date; echo; nvidia-smi --query-gpu=index,name,memory.total,driver_version "
 run("python -c \"import sys; print('python', sys.version.split()[0])\"; "
     "cmake --version | head -1; g++ --version | head -1; nvcc --version | tail -2", tail=10)
 
-# ---------------------------------------------------------------- 1. clone
 rule("CLONE / UPDATE")
-# Self-locating: this file can be run from a clone that already exists (the
-# tiny bootstrap cell clones first, then %run's this), or it clones by itself.
-_here = os.path.dirname(os.path.abspath(__file__))          # <repo>/configs/kaggle
-_cand = os.path.dirname(os.path.dirname(_here))            # <repo>
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_cand = os.path.dirname(os.path.dirname(_here))
 if os.path.isdir(os.path.join(_cand, "configs", "kaggle")) and os.path.exists(
         os.path.join(_cand, "CMakeLists.txt")):
     REPO_DIR = _cand
@@ -136,7 +103,7 @@ else:
         shutil.rmtree(REPO_DIR, ignore_errors=True)
     rc, out = run(f"git clone --depth 1 {REPO_URL} {REPO_DIR}", tail=25)
     if rc != 0:
-        # A trailing '-' in a repo name is easy to get wrong; try without it.
+
         alt = REPO_URL[:-5] if REPO_URL.endswith("-.git") else REPO_URL + "-.git"
         print(f"  retrying with {alt}")
         rc, out = run(f"git clone --depth 1 {alt} {REPO_DIR}", tail=25)
@@ -155,7 +122,6 @@ for need in ("CMakeLists.txt", "configs/kaggle/setup.sh", "configs/kaggle/train_
     p = os.path.join(REPO_DIR, need)
     ok(need) if os.path.exists(p) else bad(f"MISSING {need} ÔÇö the clone is incomplete")
 
-# ---------------------------------------------------------------- 2. build
 rule("BUILD  (C++ + CUDA sm_75 + NCCL + Arrow)")
 if DO_CLEAN:
     run(f"rm -rf {REPO_DIR}/build", tail=5)
@@ -164,7 +130,7 @@ setup = os.path.join(REPO_DIR, "configs", "kaggle", "setup.sh")
 if not os.path.exists(setup):
     bad("configs/kaggle/setup.sh missing")
     sys.exit(1)
-# --skip-tests: we run the suite ourselves below with full output.
+
 rc, out = run("bash configs/kaggle/setup.sh --with-parquet --require-nccl --skip-tests",
               cwd=REPO_DIR, log="/kaggle/working/_cell1_setup.log", tail=60)
 if rc != 0:
@@ -175,10 +141,7 @@ if rc != 0:
     sys.exit(1)
 
 cache = os.path.join(REPO_DIR, "build", "CMakeCache.txt")
-# The build's OWN status lines are the source of truth. GAI_HAVE_CUDA and
-# GAI_HAVE_PARQUET are plain (non-cached) variables in CMakeLists.txt, so they
-# never appear in CMakeCache.txt at all ÔÇö only GAI_HAVE_NCCL is a CACHE var.
-# Reading the cache for those two reported a working CUDA build as broken.
+
 want = {
     "cuda":    r"\[ghassan-ai\]\s+cuda\s*:\s*ON",
     "nccl":    r"\[ghassan-ai\]\s+nccl\s*:\s*ON",
@@ -204,9 +167,6 @@ if os.path.exists(cache):
 else:
     bad("build/CMakeCache.txt missing ÔÇö the build did not configure")
 
-# Compiler warnings only. A bare \bwarning\b also matches apt/dpkg noise
-# ("rehash: warning: skipping ca-certificates.crt"), which is not the build's
-# fault and would cry wolf on every Kaggle run.
 warn = [ln for ln in out.splitlines()
         if re.search(r"\bwarning\b", ln)
         and re.search(r"\.(c|cc|cpp|cu|h|hpp)\b|warning:.*-W|\[-W", ln)]
@@ -223,7 +183,6 @@ for b in bins:
     ok(f"build/bin/{b}") if os.path.exists(p) else bad(f"missing binary {b}")
 section(out, r"\[ghassan-ai\] (cuda|nccl|parquet|build type)", "")
 
-# ---------------------------------------------------------------- 3. tests
 rule("TESTS  (CUDA/CPU MoE parity + unit suite)")
 if SKIP_TESTS:
     print("  SKIP_TESTS=1 ÔÇö skipped on purpose")
@@ -238,7 +197,7 @@ else:
         for ln in tout.splitlines():
             if re.search(r"FAIL|Failed|error", ln):
                 print("   | " + ln.rstrip())
-    # The two gates that protect a 2xT4 run specifically.
+
     for name, why in (("test_recipe_gates", "every shipped config passes the VRAM/output preflight"),
                       ("test_configs", "pretrain/SFT architecture parity"),
                       ("test_memory_plan", "the VRAM estimate matches a real Model"),
@@ -248,14 +207,8 @@ else:
                       tail=18)
         ok(f"{name} ÔÇö {why}") if rc2 == 0 else bad(f"{name} FAILED ÔÇö {why}")
 
-# ---------------------------------------------------------------- 4. data
 rule("DATA  (English parquet lake)")
-# Discovery in python, not in the shell. The Kaggle dataset path contains a
-# SPACE (.../Users/Ghassan PC/Desktop/english_parquet), and this cell has now
-# been bitten by that in three separate ways: a \S+ regex that matched nothing,
-# an unquoted `ls {EN_DIR}/...` that split at the space, and a du that lost
-# the first half of the path. os.walk/glob take the path as a value, so there
-# is no shell left to re-interpret it.
+
 def find_lake():
     for root, dirs, files in os.walk("/kaggle/input"):
         if root[len("/kaggle/input"):].count(os.sep) > 8:
@@ -271,10 +224,7 @@ print(f"  parquet files attached: "
       f"{len(glob.glob('/kaggle/input/**/*.parquet', recursive=True))}")
 if lake:
     ok(f"lake: {lake}")
-    # Python, not the shell: the Kaggle dataset path contains a space
-    # (.../Users/Ghassan PC/Desktop/english_parquet) and this cell has been
-    # bitten by that in three different ways already. glob() takes the path as
-    # a value, so there is nothing left to re-split it.
+
     parts = glob.glob(os.path.join(lake, "*.parquet"))
     n_chat = [f for f in parts if os.path.basename(f).startswith("english_chat_part")]
     n_inst = [f for f in parts if os.path.basename(f).startswith("english_instruction_part")]
@@ -283,7 +233,7 @@ if lake:
           f"{len(parts)} parquet files | {lake_mb} MB")
     if not n_chat or not n_inst:
         bad("the attached dataset is missing english_chat/ or english_instruction parts")
-    # This is the value cell 2 needs. Quoted, because of the space.
+
     with open("/kaggle/working/env.sh", "w", encoding="utf-8") as fh:
         fh.write(f'export EN_PARQUET_DIR="{lake}"\n')
         fh.write(f'export REPO_DIR="{REPO_DIR}"\n')
@@ -297,8 +247,8 @@ else:
 tok = os.path.join(REPO_DIR, "artifacts", "tokenizer", "english32k.gtok")
 rule("TOKENIZER")
 if os.path.exists(tok):
-    run(f"ls -lh {tok}", tail=3)
-    rc, out = run(f"build/bin/data_pipeline tok-info --tokenizer {tok}", cwd=REPO_DIR, tail=6)
+    run(f"ls -lh '{tok}'", tail=3)
+    rc, out = run(f"build/bin/data_pipeline tok-info --tokenizer '{tok}'", cwd=REPO_DIR, tail=6)
     if "vocab_size=32000" not in out:
         bad("tokenizer vocab is not 32000")
     else:
@@ -307,7 +257,6 @@ else:
     print("  not built yet ÔÇö setup.sh builds it on the first run that has the lake")
     print("  attached. Re-run this cell if it is still missing after the build.")
 
-# ---------------------------------------------------------------- verdict
 rule("VERDICT")
 if FAILED:
     print(f"  {len(FAILED)} PROBLEM(S):\n")

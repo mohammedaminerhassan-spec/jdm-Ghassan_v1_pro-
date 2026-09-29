@@ -1,5 +1,3 @@
-// ghassan-ai - the main CLI: chat, generate, info, quantize, bench, tokenize, eval.
-
 #include "tools/cli_common.h"
 #include "core/device.h"
 #include "core/ops.h"
@@ -16,10 +14,24 @@
 #include <fstream>
 #include <filesystem>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace gai;
+
+static unsigned long long this_pid() {
+#ifdef _WIN32
+    return static_cast<unsigned long long>(_getpid());
+#else
+    return static_cast<unsigned long long>(::getpid());
+#endif
+}
 
 static void usage() {
     std::cout <<
@@ -64,7 +76,6 @@ static void usage() {
     "  --retrieve-augment       inject hit as context instead of direct answer\n";
 }
 
-// ---------------------------------------------------------------- helpers
 struct LoadedModel {
     std::unique_ptr<Model> model;
     Tokenizer tokenizer;
@@ -107,9 +118,7 @@ static Device pick_device(const Args& a) {
         GAI_CHECK(cuda_available(), "--device cuda requested but no CUDA device is available (use --device cpu)");
         return Device::CUDA;
     }
-    // Portable fallback: Metal (macOS), Vulkan and TPU have no native backend
-    // in this engine — run on the portable CPU backend instead of failing.
-    // (--device auto already does this silently; explicit flags warn once.)
+
     if (d == "metal" || d == "vulkan" || d == "tpu") {
         log_warn("--device " + d + " has no native backend; falling back to CPU "
                  "(portable OpenMP kernels; use --device cuda on NVIDIA GPUs)");
@@ -125,7 +134,6 @@ static LoadedModel load_model(const Args& args) {
     GAI_CHECK(!path.empty(), "--model is required");
     GAI_CHECK(fs::exists(path), "model file not found: " + path);
 
-    // ---- format detection: GGUF magic ("GGUF") vs .gai magic
     std::ifstream probe(path, std::ios::binary);
     u32 magic = 0;
     probe.read(reinterpret_cast<char*>(&magic), 4);
@@ -133,9 +141,6 @@ static LoadedModel load_model(const Args& args) {
 
     Device dev = pick_device(args);
 
-    // P3-6: inference GEMM precision used to be invisible (fp16 tensor cores
-    // whenever CUDA was present, no log, no opt-out). Now logged once here
-    // and overridable via --gemm-fp16 0 (pure fp32, e.g. quality A/B).
     if (args.has("gemm-fp16")) {
         const bool want = args.num("gemm-fp16", 1) != 0;
         ops::set_gemm_fp16(want);
@@ -152,14 +157,11 @@ static LoadedModel load_model(const Args& args) {
         GGUFReader r;
         GAI_CHECK(r.open(path), "not a valid .gguf model file: " + path);
         lm.cfg = r.model_config();
-        // Profile label: current key first, older key as fallback.
+
         lm.quant = r.get_string("ghassan.quantization.profile",
                      r.get_string("general.quantization_version", "fp16"));
         lm.file_bytes = r.file_size();
 
-        // Self-contained GGUF: the tokenizer rides INSIDE the file
-        // (tokenizer.ggml.* + exact ghassan.tokenizer.gtok image).
-        // Priority: explicit --tokenizer > embedded > legacy sidecar.
         if (args.has("tokenizer")) {
             GAI_CHECK(lm.tokenizer.load(args.str("tokenizer")),
                       "cannot load tokenizer: " + args.str("tokenizer"));
@@ -168,7 +170,7 @@ static LoadedModel load_model(const Args& args) {
                       "GGUF tokenizer payload is corrupt; pass --tokenizer explicitly");
             log_info("[load] using tokenizer embedded in GGUF (no sidecar needed)");
         } else {
-            // Legacy files (pre-embedding export): sidecar .gtok next to model.
+
             std::string def = (fs::path(path).parent_path() / "tokenizer" / "english32k.gtok").string();
             if (!fs::exists(def)) def = "artifacts/tokenizer/english32k.gtok";
             if (!fs::exists(def)) def = "artifacts/tokenizer/darija32k.gtok";
@@ -218,9 +220,7 @@ static LoadedModel load_model(const Args& args) {
     lm.model = std::make_unique<Model>(lm.cfg, dev);
     bool use_mmap = args.flag("mmap", false);
     if (use_mmap && dev != Device::CPU) {
-        // CUDA kernels need device memory; a host mapping would only add a
-        // copy per use. Keep the normal device load on GPU (mmap is a CPU
-        // weak-PC feature, where it matters).
+
         log_warn("--mmap is CPU-inference only; loading normally for CUDA");
         use_mmap = false;
     }
@@ -269,7 +269,6 @@ static GenerationConfig make_gen_config(const Args& a) {
     return g;
 }
 
-// ---------------------------------------------------------------- commands
 static int cmd_chat(const Args& args) {
     LoadedModel lm = load_model(args);
     ChatOptions opts;
@@ -281,8 +280,7 @@ static int cmd_chat(const Args& args) {
     opts.stream = !args.flag("no-stream");
     opts.show_stats = args.flag("stats");
     if (args.has("system")) opts.system = args.str("system");
-    // PRO-EN: --persona en selects the English system persona (ChatSession);
-    // default darija keeps the legacy ScriptRouter behavior unchanged.
+
     if (args.has("persona")) opts.persona = args.str("persona");
     if (args.has("retrieve-index")) opts.retrieve_index = args.str("retrieve-index");
     if (args.has("retrieve-threshold")) opts.retrieve_threshold = args.real("retrieve-threshold", 3.0);
@@ -294,7 +292,7 @@ static int cmd_chat(const Args& args) {
 }
 
 static int cmd_generate(const Args& args) {
-    // RAG single-turn: same paraphrase logic as chat, but without REPL
+
     if (args.has("retrieve-index")) {
         std::string idx_path = args.str("retrieve-index");
         double thr = args.real("retrieve-threshold", 3.0);
@@ -316,7 +314,7 @@ static int cmd_generate(const Args& args) {
                 }
             }
         }
-        // no hit -> fall through to generative path
+
     }
     LoadedModel lm = load_model(args);
     GenerationConfig g = make_gen_config(args);
@@ -334,23 +332,20 @@ static int cmd_generate(const Args& args) {
 
     std::string out;
     if (args.flag("raw")) {
-        // raw completion, no chat template
+
         out = gen.complete(prompt, g, stream ? Generator::StreamFn([](const std::string& p, i32) {
             std::cout << p << std::flush;
             return true;
         }) : nullptr);
     } else {
         std::vector<Message> msgs;
-        // ScriptRouter (single-turn): default persona follows the prompt's
-        // script; an explicit --system is kept + given a script directive.
-        // PRO-EN: --persona en forces the English persona (script-independent).
+
         std::string persona = args.str("persona", "darija");
         std::string sys = args.str("system", "");
         if (sys.empty()) {
             sys = ChatTemplate::system_for_persona(persona, ChatTemplate::detect_script(prompt));
         } else if (persona == "en" || persona == "english") {
-            // custom system + English persona: keep it verbatim, no Darija
-            // script directive appended.
+
         } else {
             sys += std::string("\n") + ChatTemplate::script_directive(
                 ChatTemplate::detect_script(prompt));
@@ -388,7 +383,7 @@ static int cmd_info(const Args& args) {
         std::cout << r.model_config().summary() << "\n";
 
         std::cout << "\n  -- tensors (" << r.tensors().size() << ") --\n";
-        std::map<std::string, std::pair<u64, u64>> by_dtype;   // dtype -> (count, bytes)
+        std::map<std::string, std::pair<u64, u64>> by_dtype;
         u64 total_bytes = 0, total_params = 0;
         for (const auto& e : r.tensors()) {
             i64 n = 1;
@@ -438,7 +433,7 @@ static int cmd_info(const Args& args) {
     for (const auto& [k, v] : r.meta()) std::cout << strfmt("    %-20s %s\n", k.c_str(), v.c_str());
 
     std::cout << "\n  -- tensors (" << r.tensors().size() << ") --\n";
-    std::map<std::string, std::pair<u64, u64>> by_dtype;   // dtype -> (count, bytes)
+    std::map<std::string, std::pair<u64, u64>> by_dtype;
     u64 total_bytes = 0, total_params = 0;
     for (const auto& e : r.tensors()) {
         i64 n = 1;
@@ -477,7 +472,7 @@ static int cmd_info(const Args& args) {
 static int cmd_quantize(const Args& args) {
     std::string in = args.str("model");
     std::string out = args.str("out");
-    // GGUF-only profiles: fp32|fp16|q8_k|q4_0 (+ K aliases q4_k_m/q6_k, see gguf_profile_for).
+
     std::string prof = args.str("profile", "q4_0");
     GAI_CHECK(!in.empty() && !out.empty(), "--model and --out are required");
 
@@ -489,14 +484,16 @@ static int cmd_quantize(const Args& args) {
         GGUFReader r;
         GAI_CHECK(r.open(in), "not a valid .gguf file: " + in);
         cfg = r.model_config();
-        // Re-embed exact tokenizer: prefer explicit --tokenizer, else GGUF blob.
+
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             GAI_CHECK(r.load_tokenizer(tk), "GGUF tokenizer payload corrupt; pass --tokenizer");
-            // Unique per-process temp name (two concurrent quantize runs).
-            static std::atomic<unsigned> quant_tmp_ctr{0};
+
+            static std::atomic<unsigned long long> quant_tmp_ctr{0};
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
             std::string uniq = "gguf_requant_" +
-                std::to_string((unsigned long long)::rand() ^ (unsigned long long)quant_tmp_ctr++) + ".gtok";
+                std::to_string(this_pid() + (unsigned long long)now +
+                               quant_tmp_ctr++) + ".gtok";
             fs::path tmp = fs::temp_directory_path() / uniq;
             tk.save(tmp.string());
             tmp_tok = tmp.string();
@@ -510,9 +507,11 @@ static int cmd_quantize(const Args& args) {
         if (tok_path.empty() && r.has_tokenizer()) {
             Tokenizer tk;
             if (r.load_tokenizer(tk)) {
-                static std::atomic<unsigned> gai_tmp_ctr{0};
+                static std::atomic<unsigned long long> gai_tmp_ctr{0};
+                const auto now2 = std::chrono::steady_clock::now().time_since_epoch().count();
                 std::string uniq = "gai_to_gguf_" +
-                    std::to_string((unsigned long long)::rand() ^ (unsigned long long)gai_tmp_ctr++) + ".gtok";
+                    std::to_string(this_pid() + (unsigned long long)now2 +
+                                   gai_tmp_ctr++) + ".gtok";
                 fs::path tmp = fs::temp_directory_path() / uniq;
                 tk.save(tmp.string());
                 tmp_tok = tmp.string();
@@ -530,7 +529,7 @@ static int cmd_quantize(const Args& args) {
     }
 
     if (args.flag("measure")) {
-        // Per-tensor outlier scan before export (norms stay F32 by profile).
+
         double worst_rel = 0.0;
         std::string worst_name;
         ExportProfileGGUF pp = gguf_profile_for(prof);
@@ -550,11 +549,17 @@ static int cmd_quantize(const Args& args) {
     }
 
     log_info(strfmt("[quant] %s -> %s   profile=%s (GGUF-only)", in.c_str(), out.c_str(), prof.c_str()));
+
+    struct TmpGuard {
+        std::string p;
+        ~TmpGuard() {
+            if (!p.empty()) {
+                std::error_code ec;
+                fs::remove(p, ec);
+            }
+        }
+    } tmp_guard{tmp_tok};
     export_model_gguf(out, model, tok_path, gguf_profile_for(prof), {}, args.str("compat", "native"));
-    if (!tmp_tok.empty()) {
-        std::error_code ec;
-        fs::remove(tmp_tok, ec);
-    }
     return 0;
 }
 
@@ -606,7 +611,7 @@ static int cmd_tokenize(const Args& args) {
     Tokenizer tk;
     std::string tp = args.str("tokenizer");
     if (tp.empty() && args.has("model")) {
-        // Embedded tokenizer first (GGUF self-contained, then .gai blob).
+
         std::string mp = args.str("model");
         if (is_gguf_file(mp)) {
             GGUFReader gr;
@@ -641,7 +646,6 @@ static int cmd_tokenize(const Args& args) {
     }
     std::cout << "\n  decoded : " << tk.decode(ids) << "\n";
 
-    // word count for fertility
     auto f = tk.measure({text});
     std::cout << strfmt("  fertility: %.3f tokens/word, %.2f bytes/token\n",
                         f.tokens_per_word, f.bytes_per_token);
@@ -664,8 +668,6 @@ static int cmd_export(const Args& args) {
     GAI_CHECK(Checkpoint::load(ckpt, model, static_cast<AdamW*>(nullptr), loaded), "cannot load checkpoint weights");
     model.print_parameter_report();
 
-    // GGUF-only: every export is a self-contained .gguf (no .gai writing).
-    // Use --compat llama for dense Ollama files, llama_moe for MoE Ollama (experimental).
     std::string prof = args.str("profile", "fp16");
     std::string compat = args.str("compat", "native");
     std::string tok = args.str("tokenizer");
@@ -743,22 +745,16 @@ static int cmd_devices(const Args&) {
     return 0;
 }
 
-// Dumps raw teacher-forced logits for cross-engine verification (roadmap
-// item 8): run the same prompt here and in llama.cpp/ollama, then compare the
-// binary rows (or the printed top-5 + argmax). The prompt is encoded RAW (no
-// chat template); replicate the exact token ids on the other side.
-// Output: optional --out binary file [nrows,V] f32 row-major (+ stdout top-5).
 static int cmd_logits(const Args& args) {
     LoadedModel lm = load_model(args);
     std::string prompt = args.str("prompt");
     if (prompt.empty() && args.positional().size() > 1) prompt = args.positional()[1];
     GAI_CHECK(!prompt.empty(), "--prompt is required");
 
-    std::vector<i32> ids = lm.tokenizer.encode(prompt, true, false); // BOS, no EOS
+    std::vector<i32> ids = lm.tokenizer.encode(prompt, true, false);
     const int T = static_cast<int>(ids.size());
     GAI_CHECK(T > 0, "prompt encodes to zero tokens");
-    // Cap single-shot logits ([T,V] f32 would OOM weak PCs).
-    // Cap single-shot logits; score long prompts via generate/score_tokens.
+
     GAI_CHECK(T <= 512, "logits prompt too long (T>512 would materialize >64MB); "
                         "split the prompt or use score_tokens/bench instead");
     std::cout << strfmt("  tokens: %d  ids:", T);
@@ -773,9 +769,6 @@ static int cmd_logits(const Args& args) {
     Tensor& logits = m.forward(dev_ids.i32p(), 1, T, act);
     const int V = m.config().vocab_size;
 
-    // CUDA: forward() returns DEVICE memory. The dump loop below reads it from
-    // the host, which segfaulted on any GPU run. Stage the whole [T,V] block on
-    // the host in bounded row blocks (T<=512 and V<=32k caps it at 64 MiB).
     std::vector<float> host_logits;
     device_stage_f32_2d(logits.data_ptr(), m.device(), T, V, host_logits);
     const float* L = host_logits.data();
@@ -789,7 +782,7 @@ static int cmd_logits(const Args& args) {
         const float* row = L + static_cast<size_t>(t) * V;
         if (out) out.write(reinterpret_cast<const char*>(row),
                            static_cast<std::streamsize>(V) * 4);
-        // top-5 + argmax for eyeball comparison
+
         int top[5] = {-1, -1, -1, -1, -1};
         for (int v = 0; v < V; ++v) {
             for (int k = 0; k < 5; ++k) {

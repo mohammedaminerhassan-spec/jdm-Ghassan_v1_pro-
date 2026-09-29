@@ -10,31 +10,8 @@ namespace fs = std::filesystem;
 
 namespace gai {
 
-static constexpr u32 CKPT_MAGIC   = 0x54504B47u;   // "GKPT"
-// v3: TrainState carries loss_scale + clean_steps + tok_vocab (v2 rejected)
-// v4: adds u8 opt_kind after has_opt (0=adamw, 1=lion).
-// v5: field-wise ModelConfig (no compiler padding) + field-wise loader RNG
-//     state incl. Box-Muller spare. Loader accepts v3+v4+v5.
-// v6 (10/10): adds moe_jitter + rope_yarn_mscale (DeepSeek long-ctx + jitter).
-//     Loader accepts v3+v4+v5+v6; v5 files get jitter=0/mscale=0 defaults.
-// v7: optimizer state blob is versioned field-wise data with per-parameter
-//     presence flags (frozen params store nothing; P2-3/P2-4). Loader accepts
-//     v3..v7; v<=6 optimizer blobs use the legacy raw-struct layout.
-// v8: TrainState carries scheduler snapshot (total/warmup/peak/min/decay/kind)
-//     so resume with a different schedule warns instead of silently reshaping
-//     past lr_at(N). Loader accepts v3..v8; v<8 gets sched_total=0 (unknown).
-// v9 (Pro): persists moe_aux_free + rope_yarn_low/high + sliding_window +
-//     rope_type. Loader accepts v3..v9; v<=8 files get Pro defaults (off).
-// v11 (multi-session safety): TrainState carries the tokenizer CONTENT
-//     fingerprint (tok_fingerprint). Resuming a checkpoint with a DIFFERENT
-//     .gtok is refused: same vocab_size + different merges = different token
-//     ids = silently corrupted embeddings/softmax. Loader accepts v3..v11;
-//     v<=10 files get fingerprint 0 (unknown -> warn, training continues).
-// v12: TrainState carries the rank-0 validation loader state (val_loader).
-//     Eval consumes val batches continuously, so a resume without it restarts
-//     eval at batch 0: different val loss, different best.ckpt. Loader accepts
-//     v3..v12; v<=11 files get val batches = -1 (unknown -> keep the fresh
-//     loader, never a zeroed stream).
+static constexpr u32 CKPT_MAGIC   = 0x54504B47u;
+
 static constexpr u32 CKPT_VERSION = 12u;
 static constexpr u8 OPT_ADAMW = 0u;
 static constexpr u8 OPT_LION  = 1u;
@@ -44,8 +21,6 @@ static bool checkpoint_version_supported(u32 version) {
     return version >= 3u && version <= CKPT_VERSION;
 }
 
-// v11 tokenizer fingerprint reader (shared by the three load paths).
-// NOTE: defined after rd<> below.
 static bool rd_tok_fp_v11(std::istream& f, TrainState& state, u32 version);
 
 template <typename T> static void wr(std::ostream& o, const T& v) {
@@ -59,17 +34,11 @@ static bool rd_tok_fp_v11(std::istream& f, TrainState& state, u32 version) {
     if (version >= 11u) {
         if (!rd(f, state.tok_fingerprint)) return false;
     } else {
-        state.tok_fingerprint = 0;   // pre-v11: unknown, not a mismatch
+        state.tok_fingerprint = 0;
     }
     return true;
 }
 
-// Shared TrainState prefix reader: step through tok_fingerprint, in exact
-// file order. Used by all three load() paths AND peek(). A single definition
-// means peek() can never drift behind load() again (the v11 fingerprint was
-// verified by load but invisible to peek, which silently disabled the resume
-// identity gate and spammed a false "predates fingerprints" warning).
-// (Loader/sched readers are defined below; forward-declared here.)
 static bool rd_loader_v5(std::istream& i, DataLoader::State& s);
 static bool rd_loader_legacy(std::istream& i, DataLoader::State& s);
 static bool rd_sched_v8(std::istream& f, TrainState& state);
@@ -97,15 +66,13 @@ static bool rd_state_prefix(std::istream& f, TrainState& state, u32 version) {
     if (version >= 12u) {
         if (!rd_loader_v5(f, state.val_loader)) return false;
     } else {
-        // Unknown, NOT zero: a zeroed stream would resume eval on the wrong
-        // RNG stream. The trainer keeps the freshly opened loader instead.
+
         state.val_loader = DataLoader::State{};
         state.val_loader.batches = -1;
     }
     return true;
 }
 
-// Field-wise config IO: stable across compilers (no struct padding).
 static void wr_config(std::ostream& o, const ModelConfig& c) {
     wr(o, c.vocab_size); wr(o, c.hidden_size); wr(o, c.num_layers);
     wr(o, c.num_heads); wr(o, c.num_kv_heads); wr(o, c.intermediate_size);
@@ -116,8 +83,8 @@ static void wr_config(std::ostream& o, const ModelConfig& c) {
     u8 sh = c.moe_shared ? 1 : 0, qk = c.use_qk_norm ? 1 : 0;
     wr(o, tie); wr(o, moe); wr(o, sh); wr(o, qk);
     wr(o, c.num_experts); wr(o, c.moe_top_k); wr(o, c.moe_expert_dim);
-    wr(o, c.moe_jitter); wr(o, c.rope_yarn_mscale); // v6 additions
-    u8 auxfree = c.moe_aux_free ? 1 : 0;            // v9 Pro additions
+    wr(o, c.moe_jitter); wr(o, c.rope_yarn_mscale);
+    u8 auxfree = c.moe_aux_free ? 1 : 0;
     wr(o, auxfree);
     wr(o, c.rope_yarn_low); wr(o, c.rope_yarn_high);
     wr(o, c.sliding_window); wr(o, c.rope_type);
@@ -150,8 +117,7 @@ static bool rd_config_v6(std::istream& i, ModelConfig& c) {
     c.moe_shared = sh != 0; c.use_qk_norm = qk != 0;
     return true;
 }
-// v9 Pro tail: v6 payload + aux_free/yarn_low/high/sliding/rope_type.
-// v<=8 files never had these bytes: caller must set Pro defaults first.
+
 static bool rd_config_v9(std::istream& i, ModelConfig& c) {
     if (!rd_config_v6(i, c)) return false;
     u8 auxfree = 0;
@@ -187,7 +153,7 @@ static bool rd_config_v5(std::istream& i, ModelConfig& c) {
     if (!rd(i, c.moe_expert_dim)) return false;
     c.tie_embeddings = tie != 0; c.use_moe = moe != 0;
     c.moe_shared = sh != 0; c.use_qk_norm = qk != 0;
-    c.moe_jitter = 0.0f; c.rope_yarn_mscale = 0.0f; // v5 defaults
+    c.moe_jitter = 0.0f; c.rope_yarn_mscale = 0.0f;
     return true;
 }
 static void wr_loader_v5(std::ostream& o, const DataLoader::State& s) {
@@ -196,7 +162,7 @@ static void wr_loader_v5(std::ostream& o, const DataLoader::State& s) {
     wr(o, s.rng_spare);
     wr(o, s.rng_has_spare);
 }
-// v8 scheduler snapshot (fixed-size, no padding): total/warmup/peak/min/decay/kind + ddp world.
+
 static void wr_sched_v8(std::ostream& o, const TrainState& s) {
     wr(o, s.sched_total);
     wr(o, s.sched_warmup);
@@ -223,7 +189,7 @@ static bool rd_loader_v5(std::istream& i, DataLoader::State& s) {
     if (!rd(i, s.rng_has_spare)) return false;
     return true;
 }
-// Legacy loader state (v3/v4): u64[4] + i64, no spare.
+
 static bool rd_loader_legacy(std::istream& i, DataLoader::State& s) {
     s = DataLoader::State{};
     for (int k = 0; k < 4; ++k) if (!rd(i, s.rng[k])) return false;
@@ -231,11 +197,7 @@ static bool rd_loader_legacy(std::istream& i, DataLoader::State& s) {
     return true;
 }
 static bool arch_match(const ModelConfig& a, const ModelConfig& b) {
-    // Only SHAPE-affecting fields block resume (wrong numel).
-    // Loss/recipe fields (aux/z/rope/jitter/mscale/eps/init) only warn:
-    // changing a loss weight must not fail a resume.
-    // qk_norm DOES change shapes (adds 2xHD params/layer) so it must match.
-    // max_seq_len changes KV-cache only (no weights), so warn, don't fail.
+
     if (!(a.vocab_size == b.vocab_size && a.hidden_size == b.hidden_size &&
           a.num_layers == b.num_layers && a.num_heads == b.num_heads &&
           a.num_kv_heads == b.num_kv_heads && a.intermediate_size == b.intermediate_size &&
@@ -297,7 +259,8 @@ CheckpointSnapshot Checkpoint::capture(const Model& model,
 static void write_optimizer_snapshot(std::ostream& f, const OptimizerStateSnapshot& opt) {
     const u8 fmt = 1;
     const i64 step = opt.step;
-    const size_t count = opt.first.size();
+
+    const u64 count = static_cast<u64>(opt.first.size());
     switch (opt.kind) {
         case OptimizerSnapshotKind::AdamW:
             f.write(reinterpret_cast<const char*>(&count), sizeof(count));
@@ -391,10 +354,6 @@ static void publish_file(const std::string& path, const std::string& tmp) {
         GAI_CHECK(false, "cannot finalise checkpoint: " + reason);
     }
 
-    // Successful publish has installed a complete new target. The backup is
-    // only a crash-recovery staging file during the rename window; retaining it
-    // after a successful save would permanently double checkpoint disk usage
-    // and can exhaust Kaggle's saved-output quota on long runs.
     std::error_code cleanup_ec;
     if (fs::exists(backup, cleanup_ec) && !cleanup_ec) {
         fs::remove(backup, cleanup_ec);
@@ -552,8 +511,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     }
 
     if (!rd_state_prefix(f, state, version)) return false;
-    // tokenizer identity: resuming with a different vocab silently corrupts
-    // every embedding row. tok_vocab==0 means "unknown" (never for v3 files).
+
     if (!read_moe_bias(f, model, version >= 10u)) return false;
     if (state.tok_vocab != 0 && state.tok_vocab != model.config().vocab_size) {
         log_error(strfmt("checkpoint vocab %d != model vocab %d; refusing resume",
@@ -563,7 +521,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // Implausible param counts (corrupt file) fail fast before the read loop.
+
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen;
     for (u64 i = 0; i < n; ++i) {
@@ -584,9 +542,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         pp->w.copy_from(cpu);
         seen.insert(name);
     }
-    // New params (e.g. qk_qnorm/qk_knorm) missing from old checkpoints keep
-    // their fresh init instead of failing the whole resume — unless the caller
-    // asked for an exact resume, where that would be silent corruption.
+
     for (Parameter* pp : model.parameters()) {
         if (seen.find(pp->name) == seen.end()) {
             if (strict) {
@@ -600,7 +556,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     u8 has_opt = 0;
     if (!rd(f, has_opt)) return false;
     if (version == 3u) {
-        // legacy v3: payload is always AdamW
+
         if (has_opt && opt) {
             if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
                 if (strict) { log_error("exact resume: legacy v3 optimizer state unreadable"); return false; }
@@ -639,10 +595,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
 
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
-    // Accept v3..v9: weights + schedule always restore; moments restart fresh
-    // with a warning when the optimizer kind differs, rather than restarting step 0.
-    // v9 optimizer blob layout is unchanged since v7, so only version < 5
-    // is legacy (v9 blobs restore Lion/Muon moments).
+
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
     bool is_legacy = (version < 5u);
 
@@ -672,7 +625,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // Implausible param counts (corrupt file) fail fast before the read loop.
+
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen_lion;
     for (u64 i = 0; i < n; ++i) {
@@ -706,8 +659,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
     u8 has_opt = 0;
     if (!rd(f, has_opt)) return false;
     if (is_legacy) {
-        // v3/v4 payload may be AdamW: weights already restored above,
-        // moments can't be reused for Lion -> fresh start for opt only.
+
         if (has_opt) {
             if (strict) {
                 log_error("exact resume: legacy checkpoint cannot supply lion moments");
@@ -743,15 +695,14 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
 bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainState& state,
                       bool* out_moments_restored, bool strict) {
     if (out_moments_restored) *out_moments_restored = false;
-    // Mirrors the Lion loader exactly (weights + schedule + kind gate); only
-    // the expected kind tag and the moments call differ.
+
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
 
     u32 magic = 0, version = 0;
     if (!rd(f, magic) || magic != CKPT_MAGIC) return false;
     if (!rd(f, version) || !checkpoint_version_supported(version)) return false;
-    // Same v9 gate as the Lion loader above.
+
     bool is_legacy = (version < 5u);
 
     ModelConfig cfg{};
@@ -780,7 +731,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
 
     u64 n = 0;
     if (!rd(f, n)) return false;
-    // Implausible param counts (corrupt file) fail fast before the read loop.
+
     if (n > 10000) { log_error("checkpoint corrupt: param count implausible"); return false; }
     std::unordered_set<std::string> seen_muon;
     for (u64 i = 0; i < n; ++i) {
@@ -814,8 +765,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
     u8 has_opt = 0;
     if (!rd(f, has_opt)) return false;
     if (is_legacy) {
-        // v3/v4 payloads predate Muon: weights already restored above,
-        // moments restart fresh for the optimizer only.
+
         if (has_opt) {
             if (strict) {
                 log_error("exact resume: legacy checkpoint cannot supply muon moments");
@@ -863,8 +813,7 @@ bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& sta
     } else {
         if (!rd(f, cfg)) return false;
     }
-    // Full state prefix (same reader as load): peek must see everything the
-    // resume gates check (sched snapshot, tok_vocab, tok_fingerprint).
+
     if (!rd_state_prefix(f, state, version)) return false;
     return true;
 }
@@ -889,4 +838,4 @@ std::string Checkpoint::latest_in(const std::string& dir) {
     return found.back();
 }
 
-} // namespace gai
+}

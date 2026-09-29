@@ -6,10 +6,6 @@
 
 namespace gai {
 
-// Linear warmup -> cosine decay to min_lr_ratio * peak (default).
-// WSD (warmup-stable-decay): warmup -> constant peak -> linear/cooldown decay.
-// WSD is preferred for long T4 runs: you can extend total steps without
-// retuning the cosine shape; just keep training in the stable phase.
 class LrScheduler {
 public:
     LrScheduler() = default;
@@ -20,23 +16,25 @@ public:
 
     float lr_at(i64 step) const {
         if (total_ <= 0) return peak_;
-        // Clamp the domain: the warmup formula is only valid in [0, total].
+
         if (step < 0) step = 0;
         if (step > total_) step = total_;
         if (warmup_ > 0 && step < warmup_) {
-            // start at 1/warmup of peak rather than exactly 0 so step 0 makes progress
+
             return peak_ * (static_cast<float>(step + 1) / static_cast<float>(warmup_));
         }
         if (type_ == "wsd") {
-            i64 stable_end = total_ - static_cast<i64>(decay_frac_ * static_cast<float>(total_ - warmup_));
+
+            i64 stable_end = total_ - static_cast<i64>(static_cast<double>(decay_frac_) *
+                             static_cast<double>(total_ - warmup_));
             if (stable_end < warmup_) stable_end = warmup_;
-            if (step < stable_end) return peak_;   // stable phase
+            if (step < stable_end) return peak_;
             i64 decay_steps = total_ - stable_end;
             if (decay_steps <= 0) return peak_;
-            float p = static_cast<float>(step - stable_end) / static_cast<float>(decay_steps);
-            if (p > 1.0f) p = 1.0f;
-            // linear decay to min_ratio (stable + predictable on T4 restarts)
-            return peak_ * (1.0f - (1.0f - min_ratio_) * p);
+            double p = static_cast<double>(step - stable_end) / static_cast<double>(decay_steps);
+            if (p > 1.0) p = 1.0;
+
+            return peak_ * (1.0f - (1.0f - min_ratio_) * static_cast<float>(p));
         }
         i64 decay_steps = total_ - warmup_;
         if (decay_steps <= 0) return peak_;
@@ -58,8 +56,8 @@ private:
     i64   warmup_    = 2000;
     i64   total_     = 20000;
     float min_ratio_ = 0.1f;
-    std::string type_ = "cosine";  // cosine | wsd
-    float decay_frac_ = 0.2f;      // wsd: last 20% decays
+    std::string type_ = "cosine";
+    float decay_frac_ = 0.2f;
 };
 
-} // namespace gai
+}

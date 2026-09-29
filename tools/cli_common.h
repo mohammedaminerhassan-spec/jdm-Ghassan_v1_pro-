@@ -7,7 +7,6 @@
 
 namespace gai {
 
-// Tiny argument parser shared by all tools: --key value, --flag, positionals.
 class Args {
 public:
     Args(int argc, char** argv);
@@ -19,7 +18,7 @@ public:
     u64         num_u64(const std::string& k, u64 def = 0) const;
     double      real(const std::string& k, double def = 0.0) const;
     bool        flag(const std::string& k, bool def = false) const;
-    // Strict getters fail fast on malformed values (used with --strict-args).
+
     i64         num_strict(const std::string& k) const;
     int         num_int_strict(const std::string& k) const;
     double      real_strict(const std::string& k) const;
@@ -34,9 +33,8 @@ private:
     std::vector<std::string> pos_;
 };
 
-// Enables UTF-8 output on Windows consoles so Arabic renders instead of mojibake.
 void enable_utf8_console();
 
-void apply_common_flags(const Args& a);   // --quiet --verbose --threads
+void apply_common_flags(const Args& a);
 
-} // namespace gai
+}

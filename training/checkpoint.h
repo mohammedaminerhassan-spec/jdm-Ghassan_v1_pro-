@@ -13,34 +13,24 @@ struct TrainState {
     double last_loss   = 0.0;
     u64    seed        = 42;
     DataLoader::State loader{};
-    // v3 additions: without these a resume silently changes training dynamics
-    double loss_scale  = 65536.0;  // dynamic loss-scaler value
-    int    clean_steps = 0;        // scaler clean-step counter
-    int    tok_vocab   = 0;        // tokenizer vocab at save time (0 = unknown)
-    // v11: tokenizer CONTENT fingerprint (FNV-1a of the .gtok bytes). The vocab
-    // SIZE is not identity: a re-trained BPE with the same 32000 merges
-    // different ids, so a multi-session resume would silently train on
-    // different tokens. 0 = unknown (pre-v11 file) -> warn, never block.
+
+    double loss_scale  = 65536.0;
+    int    clean_steps = 0;
+    int    tok_vocab   = 0;
+
     u64    tok_fingerprint = 0;
-    // v12: validation loader state. Eval consumes val batches CONTINUOUSLY, so
-    // without this a resume restarts eval at batch 0 while an uninterrupted
-    // run would be at batch N: different val loss, different best.ckpt. Only
-    // rank 0 evaluates, so only its stream is stored. batches < 0 = unknown
-    // (pre-v12 file) -> keep the freshly opened loader, never a zero stream.
+
     DataLoader::State val_loader{};
-    // v8 additions: scheduler snapshot so resume with a different
-    // max_steps/epochs/warmup/lr cannot silently reshape PAST lr_at(N).
+
     i64    sched_total = 0;
     i64    sched_warmup = 0;
     float  sched_peak = 0.0f;
     float  sched_min_ratio = 0.1f;
     float  sched_decay_frac = 0.2f;
-    int    sched_kind = 0;  // 0=cosine, 1=wsd
-    int    ddp_world = 1;   // world_size at save (DDP resume must match)
+    int    sched_kind = 0;
+    int    ddp_world = 1;
 };
 
-// Full training checkpoint: weights + optimizer moments + schedule position +
-// dataloader position + RNG. Resume is bit-exact for the data order.
 struct CheckpointSnapshot {
     ModelConfig config;
     TrainState state;
@@ -84,20 +74,9 @@ public:
                                       const TrainState& state);
     static void save(const CheckpointSnapshot& snapshot, const std::string& path);
 
-    // out_moments_restored (optional): true iff optimizer moments were
-    // actually restored. False on kind mismatch / corrupt blob / legacy /
-    // weights-only (opt==null). Callers MUST reset bias-correction t_=0 when
-    // false, else resumed steps are ~10x too small (m≈(1-b)*g, bc≈1).
-    //
-    // `resume_mode`: strict=true implements `resume_mode: exact`. It turns
-    // every "warn and continue" recovery path into a hard failure (parameter
-    // missing from the file, optimizer kind mismatch, unreadable moments,
-    // moments present but no optimizer supplied), so an exact resume can never
-    // silently run with fresh-init parameters or fresh optimizer moments.
-    // strict=false is the historical `migrate` behavior.
     static bool load(const std::string& path,
                      Model& model,
-                     AdamW* opt,          // may be null (inference / eval)
+                     AdamW* opt,
                      TrainState& state,
                      bool* out_moments_restored = nullptr,
                      bool strict = false);
@@ -114,10 +93,9 @@ public:
                      bool* out_moments_restored = nullptr,
                      bool strict = false);
 
-    // reads only the header + config, for `ghassan-ai info`
     static bool peek(const std::string& path, ModelConfig& cfg, TrainState& state);
 
     static std::string latest_in(const std::string& dir);
 };
 
-} // namespace gai
+}

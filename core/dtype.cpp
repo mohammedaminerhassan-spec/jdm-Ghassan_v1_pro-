@@ -58,17 +58,15 @@ size_t dtype_block_bytes(DType t) {
         case DType::Q4_0: return sizeof(BlockQ4_0);
         case DType::Q4_1: return sizeof(BlockQ4_1);
     }
-    return 0;
+    GAI_FAIL("unknown DType in dtype_block_bytes");
 }
 
 size_t dtype_nbytes(DType t, size_t numel) {
     int bs = dtype_block_size(t);
     if (bs == 1) return numel * dtype_block_bytes(t);
-    // Quantized storage holds whole blocks; a partial tail block is zero-padded
-    // (see quantize_q8_0/q4_0/q4_1). Round up instead of crashing so odd-sized
-    // tensors quantize; the logical element count still comes from the shape.
+
     const size_t bsu = static_cast<size_t>(bs);
     return ((numel + bsu - 1) / bsu) * dtype_block_bytes(t);
 }
 
-} // namespace gai
+}

@@ -24,4 +24,4 @@ size_t KVCache::bytes() const {
     return n;
 }
 
-} // namespace gai
+}

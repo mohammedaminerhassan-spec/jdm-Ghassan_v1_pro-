@@ -1,6 +1,3 @@
-// Elementwise, normalization, embedding, activation, loss and optimizer kernels.
-// Attention lives in cuda/attention.cu.
-
 #include "cuda/cuda_ops.h"
 #include "cuda/cuda_utils.h"
 #include "core/ops.h"
@@ -30,14 +27,9 @@ static inline int grid_for(i64 n, int block) {
     return static_cast<int>(g);
 }
 
-// ---------------------------------------------------------------- workspace
-// Round up to 64MB chunks so warmup size variations don't cause repeated
-// cudaFree/cudaMalloc. Monotonic by design, freed at shutdown.
 static void*  g_ws = nullptr;
 static size_t g_ws_bytes = 0;
 
-// Forward declaration for SceAcc so free_workspace() can release it.
-// The full definition is near the CE-accumulation kernels below.
 struct SceAcc;
 static SceAcc* g_sce_acc = nullptr;
 
@@ -57,15 +49,12 @@ static void* workspace(size_t bytes) {
     return g_ws;
 }
 
-// Pre-size the GEMM/conversion pool before the first step. Called once
-// from the trainer with the recipe's worst-case size; later workspace() calls
-// then hit the fast path (bytes <= g_ws_bytes) and never resize mid-run.
 void reserve_workspaces(size_t gemm_bytes, size_t moe_bytes) {
     if (gemm_bytes > 0) workspace(gemm_bytes);
     if (moe_bytes > 0) moe_reserve_workspace(moe_bytes);
 }
 
-void free_sampling_workspace();  // defined with the sampling kernels below
+void free_sampling_workspace();
 void free_workspace() {
     if (g_ws) cudaFree(g_ws);
     g_ws = nullptr;
@@ -75,15 +64,10 @@ void free_workspace() {
     moe_free_workspace();
 }
 
-// Diagnosability: report monotonic pool footprint in OOM messages so
-// nvidia-smi vs guard mismatch is explainable (pools never shrink by design).
 size_t pool_bytes() { return g_ws_bytes; }
 
-// Persistent sampling scratch, defined once here so both
-// free_sampling_workspace() above and the kernels below can use them.
-// g_topk_cap tracks the allocated pair count (64*128 max) so top-K stays exact.
 static i32* g_pen_hist = nullptr;
-static int* g_pen_freq = nullptr;  // V-sized histogram for k_rep_hist/apply
+static int* g_pen_freq = nullptr;
 static int g_pen_freq_cap = 0;
 static i32* g_argmax_id = nullptr;
 static float* g_topk_tv = nullptr;
@@ -104,12 +88,10 @@ static bool g_fp16_gemm = true;
 void set_fp16_gemm(bool on) { g_fp16_gemm = on; }
 bool fp16_gemm_enabled() { return g_fp16_gemm; }
 
-// BF16 path defaults OFF (T4/sm_75 has no BF16 cores); strictly opt-in.
 static bool g_bf16_gemm = false;
 void set_bf16_gemm(bool on) { g_bf16_gemm = on; }
 bool bf16_gemm_enabled() { return g_bf16_gemm; }
 
-// f32 row-major [rows,cols] (stride ld_src) -> contiguous fp16 block
 __global__ void k_f32_to_f16_strided(const float* src, __half* dst,
                                      int rows, int cols, int ld_src) {
     i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,7 +101,6 @@ __global__ void k_f32_to_f16_strided(const float* src, __half* dst,
     dst[i] = __float2half(src[(i64)r * ld_src + c]);
 }
 
-// f32 row-major [rows,cols] (stride ld_src) -> contiguous bf16 block
 #if __CUDACC_VER_MAJOR__ >= 11
 __global__ void k_f32_to_bf16_strided(const float* src, __nv_bfloat16* dst,
                                       int rows, int cols, int ld_src) {
@@ -131,8 +112,6 @@ __global__ void k_f32_to_bf16_strided(const float* src, __nv_bfloat16* dst,
 }
 #endif
 
-// Large-GEMM fast path: fp16 tensor cores with fp32 accumulation, fp32 I/O.
-// Master weights never leave fp32 — conversion is per-call scratch.
 static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb, float beta, float* C, int ldc) {
@@ -144,10 +123,9 @@ static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
     k_f32_to_f16_strided<<<grid_for((i64)nA, 256), 256>>>(A, Ah, rA, cA, lda);
     k_f32_to_f16_strided<<<grid_for((i64)nB, 256), 256>>>(B, Bh, rB, cB, ldb);
     CU_CHECK(cudaGetLastError());
-    // Same operand/flag mapping as gemm(): contiguous strides are the widths.
+
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
-    // NOTE: must be cublasGemmEx (19 args). The legacy cublasSgemmEx takes
-    // only 16 args and was removed in recent CUDA toolkits.
+
     cublasStatus_t s = cublasGemmEx(h,
                                      trans_b ? CUBLAS_OP_T : CUBLAS_OP_N,
                                      trans_a ? CUBLAS_OP_T : CUBLAS_OP_N,
@@ -162,14 +140,11 @@ static void gemm_fp16(bool trans_a, bool trans_b, int M, int N, int K,
     if (s != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx failed");
 }
 
-// BF16 tensor-core GEMM (Ampere+ sm_80 and newer, CUDA 11+ only; T4/sm_75 excluded).
 #if __CUDACC_VER_MAJOR__ >= 11
 static void gemm_bf16(bool trans_a, bool trans_b, int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb, float beta, float* C, int ldc) {
-    // ARCH GUARD: T4/sm_75 has no BF16 tensor cores. Issuing CUDA_R_16BF on
-    // sm_75 is slow emulation or NOT_SUPPORTED. The trainer already falls
-    // back, but a direct set_gemm_bf16(true) must also fail loudly here.
+
     int dev = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&dev) == cudaSuccess &&
@@ -200,9 +175,8 @@ static void gemm_bf16(bool trans_a, bool trans_b, int M, int N, int K,
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (s != CUBLAS_STATUS_SUCCESS) GAI_FAIL("cublasGemmEx BF16 failed");
 }
-#endif // __CUDACC_VER_MAJOR__ >= 11
+#endif
 
-// ---------------------------------------------------------------- reductions
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (int off = WARP / 2; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
@@ -214,7 +188,6 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
-// block-wide sum, 1024 threads max (32 warps)
 __device__ __forceinline__ float block_sum(float v, float* smem) {
     int lane = threadIdx.x % WARP;
     int wid  = threadIdx.x / WARP;
@@ -243,7 +216,6 @@ __device__ __forceinline__ float block_max(float v, float* smem) {
     return smem[0];
 }
 
-// Human-readable cuBLAS status (enum values are stable across toolkits).
 static const char* cublas_status_name(cublasStatus_t s) {
     switch (s) {
         case CUBLAS_STATUS_SUCCESS:          return "SUCCESS";
@@ -259,10 +231,6 @@ static const char* cublas_status_name(cublasStatus_t s) {
     }
 }
 
-// ================================================================ GEMM (cuBLAS)
-// We store everything row-major; cuBLAS is column-major. A row-major
-// C[MxN] = A[MxK] * B[KxN] equals, in column-major terms,
-// C'[NxM] = B'[NxK] * A'[KxM], which is what we issue below.
 void gemm(bool trans_a, bool trans_b, int M, int N, int K,
           float alpha, const float* A, int lda, const float* B, int ldb,
           float beta, float* C, int ldc) {
@@ -275,11 +243,7 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
         }
         return;
     }
-    // FP16 tensor-core fast path for large GEMMs (compute-only mixed precision).
-    // Small GEMMs stay fp32: conversion overhead would eat the win. The
-    // threshold is tunable via ops::set_gemm_fp16_mnk_threshold() for
-    // Nsight-driven autotuning (M==1 decode stays fp32 by design at the
-    // default 1M — converting ~MBs to save ~kMACs loses).
+
     const i64 mnk = (i64)M * N * K;
     const i64 mnk_thr = ops::gemm_fp16_mnk_threshold();
     if (g_fp16_gemm && mnk >= mnk_thr) {
@@ -287,10 +251,10 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
         gemm_fp16(trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
-    // BF16 tensor-core fast path (Ampere+ sm_80 and newer, CUDA 11+)
+
 #if __CUDACC_VER_MAJOR__ >= 11
     if (g_bf16_gemm && mnk >= mnk_thr) {
-        ops::perf_note_fp16_gemm();  // tensor-core path (shared counter)
+        ops::perf_note_fp16_gemm();
         gemm_bf16(trans_a, trans_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
@@ -298,16 +262,12 @@ void gemm(bool trans_a, bool trans_b, int M, int N, int K,
     (void)g_bf16_gemm;
 #endif
     cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
-    cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;   // note the swap
+    cublasOperation_t opA = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasStatus_t s = cublasSgemm(h, opA, opB, N, M, K,
                                    &alpha, B, ldb, A, lda, &beta, C, ldc);
     if (s != CUBLAS_STATUS_SUCCESS) {
-        // Name the failure precisely: a bare "cublasSgemm failed" cannot tell
-        // a handle/device mismatch from a wedged GPU or a host shape bug.
-        // The handle is bound to its creation device (see cublas_handle), so
-        // report both ids: on multi-GPU runners a slip between them is the
-        // usual suspect for NOT_INITIALIZED on an otherwise valid call.
+
         int cur_dev = -1;
         cudaGetDevice(&cur_dev);
         GAI_FAIL(strfmt("cublasSgemm failed: status=%d (%s) | M=%d N=%d K=%d "
@@ -393,7 +353,6 @@ void linear_backward(const float* x, const float* w, const float* dy,
     if (dw) gemm(true,  false, N, K, M, 1.0f, dy, N, x, K, 1.0f, dw, K);
 }
 
-// ================================================================ elementwise
 __global__ void k_add(const float* a, const float* b, float* o, i64 n) {
     i64 i = blockIdx.x * i64(blockDim.x) + threadIdx.x;
     i64 stride = i64(gridDim.x) * blockDim.x;
@@ -434,7 +393,6 @@ void copy(float* dst, const float* src, i64 n) {
     CU_CHECK(cudaMemcpy(dst, src, sizeof(float) * size_t(n), cudaMemcpyDeviceToDevice));
 }
 
-// ================================================================ embedding
 __global__ void k_embed_fwd(const i32* ids, const float* table, float* out,
                             i64 ntok, int dim, int vocab) {
     i64 t = blockIdx.x;
@@ -463,8 +421,7 @@ __global__ void k_embed_bwd(const i32* ids, const float* dout, float* dtable,
 void embedding_forward(const i32* ids, const float* table, float* out,
                        i64 ntok, int dim, int vocab) {
     if (ntok <= 0) return;
-    // ntok is grid-sized as int: fail fast above 2G instead of launching
-    // with a truncated block count (OOB).
+
     GAI_CHECK(ntok <= 2147483647LL, "embedding_forward: ntok exceeds INT_MAX");
     int block = dim >= 256 ? 256 : ((dim + 31) / 32) * 32;
     if (block < 32) block = 32;
@@ -482,7 +439,6 @@ void embedding_backward(const i32* ids, const float* dout, float* dtable,
     CU_CHECK(cudaGetLastError());
 }
 
-// ================================================================ rmsnorm
 __global__ void k_rmsnorm_fwd(const float* x, const float* w, float* out, float* rrms,
                               int dim, float eps) {
     extern __shared__ float smem[];
@@ -497,8 +453,7 @@ __global__ void k_rmsnorm_fwd(const float* x, const float* w, float* out, float*
     }
     ss = block_sum(ss, smem);
     float inv = rsqrtf(ss / float(dim) + eps);
-    // Clamp non-finite (eps<=0 or inf input can still produce inf/NaN),
-    // mirroring the CPU reference.
+
     if (!isfinite(inv)) inv = 0.0f;
     if (threadIdx.x == 0 && rrms) rrms[r] = inv;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = xr[i] * inv * w[i];
@@ -522,8 +477,6 @@ __global__ void k_rmsnorm_bwd_dx(const float* x, const float* w, const float* do
     }
 }
 
-// dweight[i] = sum_r dout[r,i] * x[r,i] * rrms[r]  -> one block per column tile
-// Accumulate in double (matches the CPU reference); the store stays f32.
 __global__ void k_rmsnorm_bwd_dw(const float* x, const float* dout, const float* rrms,
                                  float* dweight, i64 rows, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -566,7 +519,6 @@ void rmsnorm_backward(const float* x, const float* w, const float* dout,
     }
 }
 
-// ================================================================ rope
 __global__ void k_rope(float* q, float* k, const i32* pos, i64 ntok,
                        int n_heads, int n_kv, int hd, float theta, float sign) {
     int half = hd / 2;
@@ -578,7 +530,7 @@ __global__ void k_rope(float* q, float* k, const i32* pos, i64 ntok,
     for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
         int i = idx % half;
         int h = idx / half;
-        // Double-precision phase keeps long-context angles accurate.
+
         double freq_d = pow((double)theta, -(2.0 * (double)i) / (double)hd);
         double ang_d  = (double)p * freq_d;
         float c, s;
@@ -615,7 +567,6 @@ void rope_backward(float* dq, float* dk, const i32* pos, i64 ntok,
     CU_CHECK(cudaGetLastError());
 }
 
-// Pro: NeoX half-rotate + full YaRN ramp (DeepSeek-V3 / LLaMA-3 class).
 __global__ void k_rope_ex(float* q, float* k, const i32* pos, i64 ntok,
                           int n_heads, int n_kv, int hd, float theta, float sign,
                           int rope_type, float yarn_low, float yarn_high, float yarn_scale) {
@@ -738,7 +689,6 @@ void rope_backward_cached(float* dq, float* dk, const i32* pos, const float* inv
     CU_CHECK(cudaGetLastError());
 }
 
-// ================================================================ swiglu
 __global__ void k_swiglu_fwd(const float* g, const float* u, float* o, i64 n) {
     i64 i = blockIdx.x * i64(blockDim.x) + threadIdx.x;
     i64 stride = i64(gridDim.x) * blockDim.x;
@@ -776,13 +726,6 @@ void swiglu_backward(const float* g, const float* u, const float* dout,
     CU_CHECK(cudaGetLastError());
 }
 
-// ================================================================ cross entropy
-// One block per row. Fused: online max, sum, loss and dlogits in a single pass over V,
-// which avoids materialising a second [N, V] probability buffer.
-// z_scale adds z-loss: loss += z*logZ^2, grad += 2*z*logZ*p (SUM semantics).
-// The kernel writes SUM grads directly (mean*x == sum elementwise) and the
-// caller scales by eff_scale only. Valid-row counting folds into this kernel
-// (one atomic per valid row). Only fp associativity differs (~1 ulp).
 __global__ void k_ce(const float* logits, const i32* targets, float* dlogits,
                      int V, float* loss_out, int* d_count, float z_scale) {
     extern __shared__ float smem[];
@@ -838,8 +781,9 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
         if (out_count) *out_count = 0;
         return;
     }
-    // buffers: [n floats losses] [CeReduce: count + 64 partials].
-    // Count and loss cross the host in ONE cudaMemcpy.
+
+    GAI_CHECK(n <= 2147483647LL, "cuda sce: rows exceed INT_MAX");
+
     const int block = 256;
     const int red_grid = 64;
     struct CeReduce { int count; float partial[64]; };
@@ -861,7 +805,6 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     k_sum_partial<<<red_grid, block, sh>>>(losses, n, red->partial);
     CU_CHECK(cudaGetLastError());
 
-    // THE single host sync of this call.
     CeReduce hred;
     CU_CHECK(cudaMemcpy(&hred, red, sizeof(CeReduce), cudaMemcpyDeviceToHost));
     if (out_count) *out_count = hred.count;
@@ -870,19 +813,8 @@ void softmax_cross_entropy(const float* logits, const i32* targets, float* dlogi
     if (out_loss_sum) *out_loss_sum = total;
 }
 
-// ================================================================ device-side CE accumulation
-// The chunked training loop calls the loss once per CE chunk per microbatch.
-// These fold loss+count into a persistent 16-byte device accumulator with no
-// host traffic, and sce_acc_end() performs the single synchronized reduction
-// per microbatch. dlogits are still written per chunk (the backward consumes
-// them immediately).
-
-// Packed so loss+count cross the host in ONE 16-byte memcpy.
-// NOTE: SceAcc and g_sce_acc are forward-declared at the top of this file
-// (near the workspace section) so free_workspace() can release them before
-// the full definition here. The definition must match the forward decl exactly.
 struct SceAcc { double loss; long long count; };
-// g_sce_acc is already declared above (forward decl); do not redeclare.
+
 static void sce_acc_ensure() {
     if (!g_sce_acc) CU_CHECK(cudaMalloc(&g_sce_acc, sizeof(SceAcc)));
 }
@@ -891,8 +823,6 @@ void sce_acc_begin() {
     CU_CHECK(cudaMemset(g_sce_acc, 0, sizeof(SceAcc)));
 }
 
-// Single-thread fold: exactly one thread runs (all others return), so no
-// atomics are needed and there is no architecture gate (plain += on device).
 __global__ void k_sce_fold(const float* partial, const int* count,
                            SceAcc* acc) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -905,10 +835,9 @@ __global__ void k_sce_fold(const float* partial, const int* count,
 void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
                     i64 n, int V, float z_scale) {
     if (n <= 0) return;
+    GAI_CHECK(n <= 2147483647LL, "cuda sce_accumulate: rows exceed INT_MAX");
     sce_acc_ensure();
-    // Same launch shape as softmax_cross_entropy (shared factorization would
-    // couple the two paths; the duplication is 6 lines and keeps the hot
-    // training path independent of the eval/inference path).
+
     const int block = 256;
     const int red_grid = 64;
     struct CeReduce { int count; float partial[64]; };
@@ -929,31 +858,19 @@ void sce_accumulate(const float* logits, const i32* targets, float* dlogits,
     k_sum_partial<<<red_grid, block, sh>>>(losses, n, red->partial);
     CU_CHECK(cudaGetLastError());
 
-    // Fold into the persistent accumulator. Still no host traffic: the fold
-    // kernel runs on the same stream, in order, after the reduction.
     k_sce_fold<<<1, 1>>>(red->partial, &red->count, g_sce_acc);
     CU_CHECK(cudaGetLastError());
 }
 
 void sce_acc_end(double* out_loss_sum, i64* out_count) {
     sce_acc_ensure();
-    // THE single host sync of the whole accumulation window.
+
     SceAcc hacc{0.0, 0};
     CU_CHECK(cudaMemcpy(&hacc, g_sce_acc, sizeof(SceAcc), cudaMemcpyDeviceToHost));
     if (out_loss_sum) *out_loss_sum = hacc.loss;
     if (out_count) *out_count = (i64)hacc.count;
 }
 
-// ================================================================ fast sampling
-// These kernels keep sampling on GPU: penalties in place, then top-K
-// (K<=128, ~1KB D2H) or full-vocab argmax (4B D2H) for greedy.
-// Math mirrors Sampler::apply_penalties + Sampler::sample;
-// CPU mirrors in core/ops_cpu.cpp serve as the test reference.
-
-// Frequency-table repetition penalties mirror the CPU Sampler hashmap design
-// on GPU: one histogram pass over history (<=2048 atomic writers into a
-// V-sized table), then one O(V) elementwise apply. Formulas apply rep, then
-// freq, then pres — identical to the CPU path.
 __global__ void k_rep_hist(const i32* hist, int n, int* freq, int V) {
     int i = (int)((i64)blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
@@ -984,9 +901,7 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
         CU_CHECK(cudaMalloc(&g_pen_freq, sizeof(int) * (size_t)V));
         g_pen_freq_cap = V;
     }
-    // H2D staging is one small synchronous copy (<=8KB). Note: plain
-    // cudaMemcpy can block the host until prior queued work drains; true
-    // async needs pinned history + streams.
+
     CU_CHECK(cudaMemcpy(g_pen_hist, hist, sizeof(i32) * (size_t)hist_n,
                         cudaMemcpyHostToDevice));
     CU_CHECK(cudaMemset(g_pen_freq, 0, sizeof(int) * (size_t)V));
@@ -997,7 +912,6 @@ void apply_rep_penalties(float* logits, int V, const i32* hist, int hist_n,
     CU_CHECK(cudaGetLastError());
 }
 
-// Full-vocab first-max (ties: lowest id, matches CPU). Single block.
 __global__ void k_argmax(const float* x, int V, i32* out_id) {
     __shared__ float sv[1024];
     __shared__ i32 si[1024];
@@ -1032,9 +946,6 @@ i32 argmax_token(const float* logits, int V) {
     return h;
 }
 
-// Top-K in two stages, exact for K <= 128. Stage 1 keeps block-top-K (64*K
-// candidates, K<=128 → ≤8192); stage 2 is an exact linear-scan top-K over
-// all candidates. Ties by lowest id.
 __global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K) {
     __shared__ float sv[512];
     __shared__ i32 si[512];
@@ -1053,9 +964,7 @@ __global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K)
     sv[2 * t] = v0; si[2 * t] = i0; sv[2 * t + 1] = v1; si[2 * t + 1] = i1;
     __syncthreads();
     if (t == 0) {
-        // Exact block-top-K over the 512 thread-local survivors (chunk ≤512
-        // for V≤32k, so this covers the whole chunk; larger V still keeps
-        // the true block-top-K whenever K≤128 ≤512 survivors).
+
         for (int k = 0; k < K; ++k) {
             float bv = -FLT_MAX;
             i32 bi = 0;
@@ -1070,10 +979,7 @@ __global__ void k_topk_s1(const float* x, int V, float* tvals, i32* tids, int K)
 
 __global__ void k_topk_s2(float* tvals, i32* tids, int M,
                           float* ovals, i32* oids, int K) {
-    // Exact single-thread top-K over M=64*K ≤8192 candidates (≤1M compares,
-    // negligible vs GEMMs, once per sampled token). tvals/tids are mutable
-    // stage-1 scratch (fully overwritten next call), so winners are excluded
-    // by writing -FLT_MAX in place — O(K*M), obviously exact, no pruning.
+
     if ((int)threadIdx.x == 0 && (int)blockIdx.x == 0) {
         for (int k = 0; k < K; ++k) {
             float bv = -FLT_MAX;
@@ -1091,11 +997,12 @@ __global__ void k_topk_s2(float* tvals, i32* tids, int M,
 }
 
 void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_ids) {
-    // V >= 512 guarantees stage-1 slots hold real values (no -FLT_MAX filler
-    // can leak into the output); true for all our vocabs.
-    GAI_CHECK(V >= 512 && K >= 1 && K <= 128, "topk_select: V/K out of range");
+
+    GAI_CHECK(K >= 1 && K <= 128, "topk_select: K out of range [1,128]");
+    GAI_CHECK(V >= 64 * K, "topk_select: vocab too small for K (block filler would leak)");
+    GAI_CHECK(V <= 64 * 512, "topk_select: vocab exceeds tiled kernel coverage");
     const int need = 64 * K;
-    // Persistent staging grows monotonically to max-needed (≤8192 pairs).
+
     if (!g_topk_tv || !g_topk_ti || g_topk_cap < need) {
         if (g_topk_tv) { cudaFree(g_topk_tv); g_topk_tv = nullptr; }
         if (g_topk_ti) { cudaFree(g_topk_ti); g_topk_ti = nullptr; }
@@ -1109,7 +1016,6 @@ void topk_select(const float* logits, int V, int K, float* out_vals, i32* out_id
     CU_CHECK(cudaGetLastError());
 }
 
-// ================================================================ adamw
 __global__ void k_adamw(float* w, const float* g, float* m, float* v, i64 n,
                         float lr, float b1, float b2, float eps, float wd,
                         float bc1, float bc2, float gscale) {
@@ -1161,21 +1067,15 @@ __global__ void k_sqnorm(const float* g, i64 n, float* out) {
     extern __shared__ float smem[];
     i64 i = blockIdx.x * i64(blockDim.x) + threadIdx.x;
     i64 stride = i64(gridDim.x) * blockDim.x;
-    // PRECISION: accumulate in double (was float). At 100M params the float
-    // error drifts gnorm/clip vs the CPU double reference (~10 absolute).
+
     double s = 0.0;
     for (; i < n; i += stride) { double v = (double)g[i]; s += v * v; }
-    // block_sum is float; fold the double via two-stage: each thread writes
-    // float(s) is lossy, so instead reduce in shared as float of chunks?
-    // Keep exact: write double bits via float pair is overkill; the dominant
-    // error was per-element float accumulation, now double. Final block
-    // reduction in float over 256 values is ~1ulp.
+
     float sf = (float)s;
     sf = block_sum(sf, smem);
     if (threadIdx.x == 0) out[blockIdx.x] = sf;
 }
 
-// Scale gradients in-place by a constant factor (for distributed training)
 __global__ void k_scale_grad(float* g, i64 n, float scale) {
     i64 i = blockIdx.x * i64(blockDim.x) + threadIdx.x;
     i64 stride = i64(gridDim.x) * blockDim.x;
@@ -1203,11 +1103,9 @@ double global_sq_norm(const float* g, i64 n) {
     return s;
 }
 
-// Fused norm: all per-tensor tiles launch async into slices of one monotonic
-// workspace buffer, then a single D2H + host reduce.
 double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& parts) {
     const int block = 256;
-    const int grid = 16; // smaller per-tensor grid: 16*200=3200 partials max
+    const int grid = 16;
     size_t nparts = 0;
     for (auto& pr : parts) if (pr.second > 0) ++nparts;
     if (nparts == 0) return 0.0;
@@ -1227,5 +1125,5 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
     return s;
 }
 
-} // namespace cuda_ops
-} // namespace gai
+}
+}

@@ -4,7 +4,6 @@
 #include <cctype>
 #include <cstring>
 
-
 namespace gai {
 namespace english_logic {
 
@@ -45,8 +44,6 @@ static bool starts_word(const std::string& s, const char* pre) {
     return s.size() == n || !is_word_char(s[n]);
 }
 
-
-
 bool is_greeting(const std::string& user_text) {
     std::string l = low_trim(user_text);
     static const char* kGreet[] = {
@@ -80,9 +77,7 @@ bool is_coding(const std::string& user_text) {
         "return", "import", "script", "program", "debug", "compile",
         "algorithm", "plainformat",
     };
-    // "return" alone is ambiguous ("return a product" vs "return a value"):
-    // it only signals code alongside another code word. Found by the English
-    // behavior-data audit (a shopping exchange misclassified as Coding).
+
     int hits = 0;
     bool has_return = false;
     for (const char* w : kCodeWords) {
@@ -92,8 +87,7 @@ bool is_coding(const std::string& user_text) {
     }
     if (hits > 0) return true;
     if (has_return) {
-        // bare "return" + code markers already handled above; otherwise it is
-        // only code with an explicit code noun nearby (value/statement/type).
+
         static const char* kReturnCtx[] = {"value", "statement", "type", "keyword"};
         for (const char* w : kReturnCtx)
             if (has_word(l, w)) return true;
@@ -103,8 +97,9 @@ bool is_coding(const std::string& user_text) {
 
 bool is_instruction(const std::string& user_text) {
     std::string l = low_trim(user_text);
+
     static const char* kVerbs[] = {
-        "write", "implement", "create", "develop", "calculate", "explain",
+        "write", "implement", "create", "develop", "explain",
         "solve", "convert", "generate", "design", "debug", "describe",
         "summarize", "translate", "classify", "list",
     };
@@ -116,7 +111,7 @@ bool is_instruction(const std::string& user_text) {
 
 bool is_question(const std::string& user_text) {
     std::string t = user_text;
-    // trailing ? (allow trailing spaces/quotes)
+
     size_t e = t.size();
     while (e > 0 && (t[e - 1] == ' ' || t[e - 1] == '\t' || t[e - 1] == '\n' ||
                      t[e - 1] == '\r' || t[e - 1] == '"' || t[e - 1] == '\'')) --e;
@@ -188,7 +183,8 @@ bool meets_multiple_choice_discipline(const std::string& reply) {
     if (l.size() < 3) return false;
     const char c = l[0];
     if (c < 'a' || c > 'd') return false;
-    if (l[1] != '.' && l[1] != ')' && l[1] != ':' && l[1] != ' ') return false;
+
+    if (l[1] != '.' && l[1] != ')' && l[1] != ':') return false;
     return true;
 }
 
@@ -196,10 +192,12 @@ bool contains_code(const std::string& reply) {
     std::string l = low_trim(reply);
     if (l.find("```") != std::string::npos) return true;
     if (l.find("#include") != std::string::npos) return true;
+
     if (l.find("plainformat") != std::string::npos) return true;
+
     static const char* kCode[] = {
         "def ", "function ", "return ", "import ", "class ", "for (", "while (",
-        "if (", "=>", "{", "}", ";",
+        "if (", "=>",
     };
     for (const char* k : kCode) {
         if (l.find(k) != std::string::npos) return true;
@@ -240,5 +238,5 @@ bool obeys_answer_discipline(const std::string& reply) {
     return check_english_reply("", reply).disciplined;
 }
 
-} // namespace english_logic
-} // namespace gai
+}
+}

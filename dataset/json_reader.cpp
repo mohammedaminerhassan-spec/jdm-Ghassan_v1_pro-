@@ -1,11 +1,3 @@
-// dataset/json_reader.cpp — PARQUET-ONLY: minimal messages_json parser.
-//
-// File-based JSON ingestion (read_json_docs / read_json_dir / ...) was
-// REMOVED. The prebuilt English lake is read directly from
-// english_parquet/* via dataset/parquet_reader.h. This file keeps the bounded DOM +
-// schema mapping needed to parse ONE {"messages":[...]} text from the
-// messages_json parquet column. Malformed rows -> false (skip, never crash).
-
 #include "dataset/json_reader.h"
 
 #include <algorithm>
@@ -14,11 +6,10 @@
 namespace gai {
 namespace {
 
-// ---------------------------------------------------------------- DOM
 constexpr int   kMaxDepth = 32;
 constexpr size_t kMaxMembers = 10000;
-constexpr size_t kMaxArray = 10000000;
-constexpr size_t kMaxFileBytes = size_t(1) << 31;   // 2 GiB single-text cap
+constexpr size_t kMaxArray = 100000;
+constexpr size_t kMaxTextBytes = size_t(64) << 20;
 
 struct JVal {
     enum class T { Null, Bool, Num, Str, Arr, Obj } t = T::Null;
@@ -55,7 +46,7 @@ static void utf8_emit(std::string& o, unsigned cp) {
         o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
         o += static_cast<char>(0x80 | (cp & 0x3F));
     } else {
-        o += '\xEF'; o += '\xBF'; o += '\xBD';  // U+FFFD
+        o += '\xEF'; o += '\xBF'; o += '\xBD';
     }
 }
 
@@ -122,13 +113,13 @@ static bool parse_string(Cur& c, std::string& out, size_t cap) {
             if (out.size() < cap) out += ch;
         }
     }
-    return false;  // unterminated
+    return false;
 }
 
 static bool parse_value(Cur& c, JVal& out, size_t cap, int depth);
 
 static bool parse_array(Cur& c, JVal& out, size_t cap, int depth) {
-    ++c.p;  // [
+    ++c.p;
     out.t = JVal::T::Arr;
     skip_ws(c);
     if (!c.eof() && *c.p == ']') { ++c.p; return true; }
@@ -147,7 +138,7 @@ static bool parse_array(Cur& c, JVal& out, size_t cap, int depth) {
 }
 
 static bool parse_object(Cur& c, JVal& out, size_t cap, int depth) {
-    ++c.p;  // {
+    ++c.p;
     out.t = JVal::T::Obj;
     skip_ws(c);
     if (!c.eof() && *c.p == '}') { ++c.p; return true; }
@@ -222,7 +213,6 @@ static bool parse_value(Cur& c, JVal& out, size_t cap, int depth) {
     return false;
 }
 
-// ---------------------------------------------------------------- schema mapping
 static const JVal* find_key(const JVal& obj, const std::string& key) {
     if (obj.t != JVal::T::Obj) return nullptr;
     for (const auto& kv : obj.o)
@@ -242,7 +232,10 @@ static Role map_role(const std::string& r) {
     if (l == "system" || l == "developer") return Role::System;
     if (l == "user" || l == "human" || l == "question" || l == "instruction" ||
         l == "prompt" || l == "problem" || l == "query" || l == "input") return Role::User;
-    return Role::Assistant;
+    if (l == "assistant" || l == "gpt" || l == "ai" || l == "answer" ||
+        l == "response" || l == "output" || l == "completion") return Role::Assistant;
+
+    return Role::User;
 }
 
 static bool extract_message(const JVal& obj, Message& m) {
@@ -267,8 +260,6 @@ static bool extract_message(const JVal& obj, Message& m) {
 static bool object_to_doc(const JVal& obj, const JsonReaderOptions& opts, JsonDoc& doc) {
     if (obj.t != JVal::T::Obj) return false;
 
-    // parquet messages_json shape: {"messages":[{role,content},...]}
-    // (+ "conversation"/"turns"/"dialogue"/"history" aliases, kept for lake compat)
     for (const char* k : {"messages", "conversation", "turns", "dialogue", "history"}) {
         const JVal* arr = find_key(obj, k);
         if (arr && arr->t == JVal::T::Arr && !arr->a.empty()) {
@@ -290,7 +281,6 @@ static bool object_to_doc(const JVal& obj, const JsonReaderOptions& opts, JsonDo
         }
     }
 
-    // instruction (+ input) / output (kept: some lake rows use this shape)
     {
         std::string instr, input, output, system;
         bool has_instr = as_str(find_key(obj, "instruction"), instr);
@@ -317,7 +307,6 @@ static bool object_to_doc(const JVal& obj, const JsonReaderOptions& opts, JsonDo
         }
     }
 
-    // plain text fallback
     for (const auto& k : opts.text_keys) {
         std::string t;
         if (as_str(find_key(obj, k), t)) {
@@ -333,7 +322,7 @@ static bool object_to_doc(const JVal& obj, const JsonReaderOptions& opts, JsonDo
 
 static bool parse_text_to_doc(const std::string& text, const JsonReaderOptions& opts,
                               JsonDoc& doc) {
-    if (text.empty() || text.size() > kMaxFileBytes) return false;
+    if (text.empty() || text.size() > kMaxTextBytes) return false;
     Cur c{text.data(), text.data() + text.size()};
     JVal v;
     if (!parse_value(c, v, opts.max_value_bytes, 0)) return false;
@@ -343,11 +332,11 @@ static bool parse_text_to_doc(const std::string& text, const JsonReaderOptions& 
     return object_to_doc(v, opts, doc);
 }
 
-} // namespace
+}
 
 bool doc_from_json_text(const std::string& text, JsonDoc& doc,
                         const JsonReaderOptions& opts) {
     return parse_text_to_doc(text, opts, doc);
 }
 
-} // namespace gai
+}

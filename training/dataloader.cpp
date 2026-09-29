@@ -62,7 +62,6 @@ bool valid_doc_offsets(const std::vector<u64>& offsets, u64 n_tokens) {
 }
 }
 
-// ================================================================ writer
 ShardWriter::ShardWriter(const std::string& path, int vocab_size, bool with_loss_mask)
     : path_(path), u16_mode_(vocab_size <= 65535), with_mask_(with_loss_mask),
       vocab_size_(vocab_size) {
@@ -84,9 +83,7 @@ void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector
     }
     doc_offsets_.push_back(static_cast<u64>(tokens_.size()));
     for (size_t i = 0; i < tokens.size(); ++i) {
-        // Fail-loud token range: an id outside the writing vocabulary (or a
-        // negative id, e.g. an unmasked -100) must never enter a shard — on
-        // load it would read OOB embeddings or silently truncate u16 casts.
+
         GAI_CHECK(tokens[i] >= 0 && tokens[i] < vocab_size_,
                   strfmt("token id %d out of writing-vocab range [0,%d)",
                          tokens[i], vocab_size_));
@@ -130,7 +127,6 @@ void ShardWriter::close() {
     GAI_CHECK(f.good(), "shard write failed: " + path_);
 }
 
-// ================================================================ reader
 bool Shard::load(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
@@ -203,8 +199,6 @@ bool Shard::load_header(const std::string& path) {
     return true;
 }
 
-// Per-thread cached fd: avoids open/close per row. The cache reopens only
-// when the path changes; seeks are cheap.
 namespace {
 struct ShardFdCache {
     std::ifstream f;
@@ -221,7 +215,7 @@ struct ShardFdCache {
     }
 };
 thread_local ShardFdCache t_fd_cache;
-} // namespace
+}
 
 bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vector<u8>& mask_out) const {
     tok_out.assign(static_cast<size_t>(len), 0);
@@ -239,7 +233,7 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
                      (unsigned long long)start, (unsigned long long)len,
                      (unsigned long long)total));
     if (!streaming_) {
-        // RAM path: memcpy from loaded vectors.
+
         for (u64 i = 0; i < len; ++i) {
             u64 ti = start + i;
             tok_out[static_cast<size_t>(i)] = tokens_[static_cast<size_t>(ti)];
@@ -247,7 +241,7 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
         }
         return true;
     }
-    // Streaming path: random reads from disk (small, SSD-friendly).
+
     std::ifstream& f = t_fd_cache.open(path_);
     if (!f.good()) return false;
     size_t tok_sz = (header_.dtype == 0 ? sizeof(u16) : sizeof(u32));
@@ -255,9 +249,7 @@ bool Shard::read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vect
     f.seekg(static_cast<std::streamoff>(tok_off), std::ios::beg);
     if (!f.good()) return false;
     if (header_.dtype == 0) {
-        // Never malloc on the streaming hot path. Reuse a thread-local
-        // staging buffer (grows monotonically; reads already happen
-        // per-thread, so this is race-free).
+
         thread_local std::vector<u16> t_u16_stage;
         if (t_u16_stage.size() < static_cast<size_t>(len))
             t_u16_stage.resize(static_cast<size_t>(len));
@@ -296,7 +288,6 @@ u64 Shard::doc_index_of(u64 pos) const {
     return static_cast<u64>(it - doc_offsets_.begin()) - 1;
 }
 
-// ================================================================ loader
 std::vector<std::string> list_shards(const std::string& dir, const std::string& prefix) {
     std::vector<std::string> out;
     std::error_code ec;
@@ -329,8 +320,7 @@ bool DataLoader::open(const std::vector<std::string>& paths, BatchSpec spec, u64
 
     for (const auto& p : paths) {
         Shard s;
-        // Header-only open: doc table in RAM, tokens stream from disk (T4 RAM saver).
-        // Falls back to full load for tiny/test shards.
+
         if (!s.load_header(p) && !s.load(p)) {
             log_warn("dataloader: cannot load shard " + p);
             continue;
@@ -371,7 +361,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
     double wsum = 0.0;
     for (const auto& [domain, w] : mix) {
         if (!std::isfinite(w) || !(w > 0.0)) continue;
-        // Domain shards are train_<domain>_*.gbin (see data_pipeline --domain).
+
         std::string prefix = std::string("train_") + domain;
         std::vector<std::string> paths = list_shards(dir, prefix);
         const std::string exact_prefix = prefix + "_";
@@ -385,7 +375,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         }
         DomainGroup g;
         g.domain = domain;
-        g.weight = w; // raw for now, normalized below
+        g.weight = w;
         for (const auto& p : paths) {
             Shard s;
             if (!s.load_header(p) && !s.load(p)) { log_warn("dataloader: cannot load shard " + p); continue; }
@@ -410,7 +400,7 @@ bool DataLoader::open_mix(const std::string& dir, const std::map<std::string, do
         total_tokens_ = 0;
         return false;
     }
-    // Normalize weights over the domains actually found.
+
     for (auto& g : groups_) g.weight /= wsum;
     use_mix_ = true;
     return true;
@@ -569,10 +559,7 @@ bool DataLoader::next(Batch& out) {
 
     out.B = B;
     out.T = T;
-    // PERF: reserve once so the prefetch slot reuse doesn't realloc 3xB*T
-    // ints every micro (384 small allocs/step at grad_accum=128). assign()
-    // reuses capacity when already sized; after std::move the slot is empty,
-    // so keep capacity via reserve on first fill.
+
     const size_t need = static_cast<size_t>(B) * static_cast<size_t>(T);
     if (out.ids.capacity() < need) {
         out.ids.reserve(need);
@@ -585,7 +572,7 @@ bool DataLoader::next(Batch& out) {
     out.tokens_supervised = 0;
 
     for (int b = 0; b < B; ++b) {
-        // A failed window read must never become a silent padded row.
+
         bool row_ok = false;
         std::string last_path;
         for (int attempt = 0; attempt < 8 && !row_ok; ++attempt) {
@@ -616,7 +603,7 @@ bool DataLoader::next(Batch& out) {
                 shp = &shards_[si];
             }
             last_path = shp->path();
-            // Phase 1A: use segment-masked packing when enabled.
+
             row_ok = pack_sequences_ ? fill_packed_row(*shp, out, b)
                                      : fill_from_shard(*shp, out, b);
         }
@@ -631,7 +618,7 @@ bool DataLoader::next(Batch& out) {
 }
 
 void DataLoader::skip_batches(i64 n) {
-    // Prefer the O(1)-I/O fast path (identical RNG stream, no disk reads).
+
     fast_forward(n);
 }
 
@@ -736,4 +723,4 @@ void DataLoader::set_state(const State& s) {
     committed_state_ = s;
 }
 
-} // namespace gai
+}

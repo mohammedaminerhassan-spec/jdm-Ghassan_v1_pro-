@@ -1,20 +1,3 @@
-// End-to-end checkpoint-flow integration test (CPU).
-//
-// This is the single-rank proxy for the Kaggle 4xT4 run and the regression net
-// for the Phase 1D / F-01 / F-05 / F-06 / F-07 / F-08 work:
-//
-//   * the background writer really publishes both best.ckpt and last.ckpt when
-//     a step improves validation AND the save cadence fires (the case that used
-//     to serialize the same multi-GB snapshot twice),
-//   * the eval "is this a new best" decision is routed through the same code
-//     path every rank executes, so the DDP collective order cannot desync,
-//   * a failed/asynchronous write is surfaced instead of being swallowed,
-//   * a finished run drains the writer, and
-//   * `resume_mode: exact` accepts a genuine continuation and refuses a drifted
-//     recipe.
-//
-// It replaces the mock-queue test, which re-implemented the queue policy and
-// therefore could not catch a regression in the production code.
 #include "training/trainer.h"
 #include "training/checkpoint.h"
 
@@ -43,7 +26,6 @@ static ModelConfig tiny_config() {
     return cfg;
 }
 
-// One shard with enough tokens for the trainer's row sampler.
 static void write_shard(const std::filesystem::path& path, u32 vocab) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -70,15 +52,15 @@ static TrainerConfig base_cfg(const std::string& data_dir, const std::string& ck
     c.scheduler = "cosine";
     c.optimizer = "adamw";
     c.log_every = 0;
-    // Fire BOTH on the same step: that is the duplicate-write + DDP-order case.
+
     c.eval_every = 1;
     c.eval_batches = 1;
     c.save_every = 1;
     c.checkpoint_dir = ckpt_dir;
     c.device = "cpu";
     c.seed = 5;
-    c.gemm_fp16 = false;          // CPU reference path
-    c.loss_scale_init = 0.0;      // no fp16 scaling without fp16 GEMMs
+    c.gemm_fp16 = false;
+    c.loss_scale_init = 0.0;
     c.stage = "pretrain";
     return c;
 }
@@ -107,9 +89,7 @@ int main() {
     const fs::path last = root / "ckpt" / "last.ckpt";
 
     i64 final_step = 0;
-    // ---------------------------------------------------------------------
-    // 1. A full short run: eval + save cadence both fire every step.
-    // ---------------------------------------------------------------------
+
     {
         Model model(tiny_config(), Device::CPU);
         model.init_weights(5);
@@ -122,13 +102,10 @@ int main() {
         CHECK(trainer.state().tokens_seen > 0, "tokens were accounted");
     }
 
-    // The writer must have been drained by run() before it returned, so both
-    // files are on disk the moment we get here.
     CHECK(fs::exists(last, ec), "last.ckpt was published");
     CHECK(fs::exists(best, ec), "best.ckpt was published (eval improved at least once)");
     CHECK(file_size_at_least(last, 64), "last.ckpt is not truncated");
 
-    // Both names must describe the same committed step, and both must load.
     {
         Model probe(tiny_config(), Device::CPU);
         probe.init_weights(1);
@@ -137,10 +114,7 @@ int main() {
         CHECK(Checkpoint::peek(last.string(), c1, st_last), "last.ckpt header is readable");
         CHECK(Checkpoint::peek(best.string(), c2, st_best), "best.ckpt header is readable");
         CHECK(st_last.step == final_step, "last.ckpt records the final step");
-        // The trainer runs a one-batch-ahead prefetch worker: the checkpoint
-        // cursor must describe the last batch actually consumed, not the
-        // speculative batch sitting in the prefetch buffer (else exact resume
-        // silently skips training data).
+
         CHECK(st_last.loader.batches == final_step,
               "last.ckpt loader cursor matches consumed batches (no prefetched batch skipped on resume)");
         CHECK(st_best.step > 0 && st_best.step <= final_step, "best.ckpt records a real step");
@@ -149,9 +123,6 @@ int main() {
               "so the two files must agree (the duplicate-write case)");
     }
 
-    // The second name for the same step is published from the first file, so
-    // the two must be byte-identical in content (same inode after a hard link,
-    // same bytes after a copy).
     {
         std::ifstream a(best, std::ios::binary);
         std::ifstream b(last, std::ios::binary);
@@ -164,28 +135,22 @@ int main() {
               "best.ckpt and last.ckpt for the same step have identical content");
     }
 
-    // ---------------------------------------------------------------------
-    // 2. Exact resume of a genuine continuation is accepted and continues.
-    // ---------------------------------------------------------------------
     {
         Model model(tiny_config(), Device::CPU);
         model.init_weights(1);
         model.enable_grad(true);
         TrainerConfig cfg = base_cfg(data_dir, ckpt_dir);
         cfg.resume_mode = "exact";
-        cfg.resume = "auto";           // picks up last.ckpt
+        cfg.resume = "auto";
         cfg.max_steps = final_step + 2;
         Trainer trainer(model, cfg);
         trainer.run();
         CHECK(trainer.state().step == final_step + 2, "exact resume continued the schedule");
     }
 
-    // ---------------------------------------------------------------------
-    // 3. Exact resume of a DRIFTED recipe is refused (fail closed).
-    // ---------------------------------------------------------------------
     {
         ModelConfig drifted = tiny_config();
-        drifted.rms_eps = 1e-4f;       // different math, same shapes
+        drifted.rms_eps = 1e-4f;
         Model model(drifted, Device::CPU);
         model.init_weights(1);
         model.enable_grad(true);
@@ -202,9 +167,6 @@ int main() {
         CHECK(threw, "exact resume refuses a math-recipe drift");
     }
 
-    // ---------------------------------------------------------------------
-    // 4. Migrate mode tolerates the same drift (explicit, logged opt-out).
-    // ---------------------------------------------------------------------
     {
         ModelConfig drifted = tiny_config();
         drifted.rms_eps = 1e-4f;

@@ -1,6 +1,3 @@
-// dataset/english_dialogue_content.cpp — authored English dialogue-behavior data.
-// Twin of darija_synthesis_content.cpp (Darija). Every line written fresh for this project:
-// persona, tone, honesty, refusal, and dialogue flow — not facts.
 #include "dataset/english_dialogue_content.h"
 
 namespace gai {
@@ -753,5 +750,5 @@ const std::vector<const char*>& system_prompts() {
     return k;
 }
 
-} // namespace english_dialogue_data
-} // namespace gai
+}
+}

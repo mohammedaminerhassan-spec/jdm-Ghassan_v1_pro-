@@ -8,7 +8,6 @@
 
 namespace gai {
 
-// Measures everything the design doc promises to measure about a corpus.
 struct CorpusStats {
     u64 documents = 0;
     u64 lines = 0;
@@ -17,7 +16,7 @@ struct CorpusStats {
     u64 words = 0;
     u64 tokens = 0;
 
-    std::map<std::string, u64> by_lang;      // lang tag -> docs
+    std::map<std::string, u64> by_lang;
     u64 arabic_script_docs = 0;
     u64 latin_script_docs  = 0;
     u64 arabizi_docs       = 0;
@@ -32,9 +31,9 @@ struct CorpusStats {
     double tokens_per_word = 0.0;
     double bytes_per_token = 0.0;
 
-    u64 vocab_used = 0;                      // distinct token ids observed
-    double vocab_coverage = 0.0;             // vocab_used / vocab_size
-    double oov_byte_rate = 0.0;              // fraction of tokens that are raw bytes
+    u64 vocab_used = 0;
+    double vocab_coverage = 0.0;
+    double oov_byte_rate = 0.0;
 
     std::vector<u64> doc_token_hist;
 
@@ -59,4 +58,4 @@ private:
     std::unordered_set<i32> seen_tokens_;
 };
 
-} // namespace gai
+}

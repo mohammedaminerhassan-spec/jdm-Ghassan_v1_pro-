@@ -22,7 +22,6 @@ void CorpusAnalyzer::add_document(const std::string& text) {
         else if (static_cast<double>(ss.latin) / static_cast<double>(letters) > 0.6) ++st_.latin_script_docs;
     }
 
-    // word count
     u64 w = 0;
     {
         bool in_word = false;
@@ -36,7 +35,6 @@ void CorpusAnalyzer::add_document(const std::string& text) {
     }
     st_.words += w;
 
-    // line count
     st_.lines += 1 + static_cast<u64>(std::count(text.begin(), text.end(), '\n'));
 
     LangScore ls = lid_.classify(text);
@@ -83,7 +81,6 @@ CorpusStats CorpusAnalyzer::finish() {
         if (st_.words) st_.tokens_per_word = static_cast<double>(st_.tokens) / static_cast<double>(st_.words);
         if (st_.tokens) st_.bytes_per_token = static_cast<double>(st_.bytes) / static_cast<double>(st_.tokens);
 
-        // byte-fallback tokens are ids [16, 272)
         u64 raw_bytes = 0;
         for (i32 id : seen_tokens_) if (id >= 16 && id < 272) ++raw_bytes;
         st_.oov_byte_rate = st_.vocab_used ? static_cast<double>(raw_bytes) / static_cast<double>(st_.vocab_used) : 0.0;
@@ -142,4 +139,4 @@ std::string CorpusStats::report(int vocab_size) const {
     return o.str();
 }
 
-} // namespace gai
+}

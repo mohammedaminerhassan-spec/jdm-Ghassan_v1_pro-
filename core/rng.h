@@ -5,13 +5,12 @@
 
 namespace gai {
 
-// xoshiro256** — fast, small state, easy to checkpoint.
 class Rng {
 public:
     explicit Rng(u64 seed = 1234567891011ULL) { seed_with(seed); }
 
     void seed_with(u64 seed) {
-        // splitmix64 expansion
+
         for (int i = 0; i < 4; ++i) {
             seed += 0x9E3779B97F4A7C15ULL;
             u64 z = seed;
@@ -36,13 +35,11 @@ public:
 
     u32 next_u32() { return static_cast<u32>(next_u64() >> 32); }
 
-    // uniform in [0,1)
     float uniform() {
         return static_cast<float>((next_u64() >> 40) * (1.0 / 16777216.0));
     }
     float uniform(float lo, float hi) { return lo + (hi - lo) * uniform(); }
 
-    // uniform integer in [0, n)
     u64 below(u64 n) {
         GAI_CHECK(n > 0, "below(0)");
         return next_u64() % n;
@@ -62,7 +59,6 @@ public:
         return mean + stddev * (u * m);
     }
 
-    // truncated normal in [-2σ, 2σ]  (standard init for transformer weights)
     float truncated_normal(float stddev) {
         for (int i = 0; i < 8; ++i) {
             float x = normal(0.0f, stddev);
@@ -71,7 +67,6 @@ public:
         return 0.0f;
     }
 
-    // checkpointable state (full: includes Box-Muller spare for bit-exact resume)
     void  get_state(u64 out[4]) const { for (int i = 0; i < 4; ++i) out[i] = s_[i]; }
     void  set_state(const u64 in[4]) { for (int i = 0; i < 4; ++i) s_[i] = in[i]; has_spare_ = false; spare_ = 0.0f; }
     void  get_full_state(u64 out[4], float& spare, bool& has_spare) const {
@@ -92,7 +87,6 @@ private:
     bool  has_spare_ = false;
 };
 
-// 64-bit FNV-1a, used for dedup / eval-contamination hashing
 inline u64 fnv1a64(const void* data, size_t n) {
     const u8* p = static_cast<const u8*>(data);
     u64 h = 1469598103934665603ULL;
@@ -112,4 +106,4 @@ inline u64 splitmix64(u64 x) {
     return x ^ (x >> 31);
 }
 
-} // namespace gai
+}

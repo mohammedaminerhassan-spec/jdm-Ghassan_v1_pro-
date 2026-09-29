@@ -1,13 +1,3 @@
-// v12 regression: eval consumes val batches CONTINUOUSLY, so a resume that
-// restarts the val loader at batch 0 sees different eval windows than an
-// uninterrupted run -> different val loss -> different best.ckpt. The
-// checkpoint must carry the rank-0 val cursor and the resume must restore it.
-//
-// Design (deterministic on CPU, no coincidence): run A goes 1..4 straight;
-// run B goes 1..2, resumes, goes 3..4. Same seed/data => same weights at each
-// step (proven by test_trainer_ckpt_flow). Eval windows then decide: B sees
-// val batches 4..7 at steps 3..4 IFF the cursor was restored (0..3 if it
-// restarted). Equal best_val + cursor==8 is exact equality, not luck.
 #include "training/trainer.h"
 #include "training/checkpoint.h"
 
@@ -62,7 +52,7 @@ static TrainerConfig val_cfg(const std::string& data_dir, const std::string& ckp
     c.scheduler = "cosine";
     c.optimizer = "adamw";
     c.log_every = 0;
-    c.eval_every = 1;      // eval every step: 2 val batches per step
+    c.eval_every = 1;
     c.eval_batches = 2;
     c.save_every = 2;
     c.checkpoint_dir = ckpt_dir;
@@ -88,7 +78,6 @@ int main() {
     write_shard(root / "data" / "val_0000.gbin", vocab);
     const std::string data_dir = (root / "data").string();
 
-    // Run A: straight 1..4 (4 evals x 2 batches = 8 val batches consumed).
     double best_a = 0.0;
     {
         Model model(tiny_config(), Device::CPU);
@@ -107,7 +96,6 @@ int main() {
               "run A checkpoint carries the val cursor (8 batches)");
     }
 
-    // Run B: fresh 1..2 (val cursor must be 4 in its checkpoint).
     {
         Model model(tiny_config(), Device::CPU);
         model.init_weights(5);
@@ -124,7 +112,6 @@ int main() {
               "run B checkpoint carries the val cursor (4 batches)");
     }
 
-    // Resume B 3..4: eval must continue on val batches 4..7, matching A.
     {
         Model model(tiny_config(), Device::CPU);
         model.init_weights(1);

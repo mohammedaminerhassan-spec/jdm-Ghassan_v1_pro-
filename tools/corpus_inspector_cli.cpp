@@ -1,6 +1,3 @@
-// corpus_stats - measures everything about a corpus that the design doc promises:
-// Arabic/Darija/MSA/Arabizi/French shares, duplicates, lengths, vocab coverage.
-
 #include "tools/cli_common.h"
 #include "dataset/corpus_stats.h"
 #include "dataset/dedup.h"

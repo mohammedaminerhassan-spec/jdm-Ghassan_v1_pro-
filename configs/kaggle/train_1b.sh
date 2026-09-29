@@ -1,43 +1,31 @@
 #!/usr/bin/env bash
-# kaggle/train_1b.sh — Ghassan v1 Pro English two-stage training (Kaggle GPU, multi-session safe)
-#
-#   Stage A (pretrain): configs/flash_480m_single.yaml on artifacts/shards_en (English lake)
-#   Stage B (sft)     : configs/sft_flash_480m_single.yaml on artifacts/shards_en
-#   -> GGUF export -> English smoke test. WSD scheduler + resume=auto so you can
-#   stop/resume across Kaggle sessions until loss converges.
-#
-# Usage:
-#   bash configs/kaggle/train_1b.sh                                   # 9h budget default
-#   bash configs/kaggle/train_1b.sh --time-budget-min 500
-#   bash configs/kaggle/train_1b.sh --pilot-only
-#   bash configs/kaggle/train_1b.sh --no-export
-#   bash configs/kaggle/train_1b.sh --preflight      # gates only, no training
-#   bash configs/kaggle/train_1b.sh --skip-preflight # skip auto-gates (not advised)
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="full"
-# Overridable recipe (Pro 1B run shown below; defaults = Pro 480M English).
-# Example:
-#   CONFIG_PT=configs/pro_1b_single.yaml CONFIG_SFT=configs/sft_pro_1b_single.yaml \
-#   PT_DIR=artifacts/shards_en SFT_DIR=artifacts/shards_en \
-#   CKPT_PT=artifacts/checkpoints/pro_v1 CKPT_SFT=artifacts/checkpoints/pro_v1_sft \
-#   GGUF_OUT=artifacts/ghassan-v1-pro-1b_q4_0.gguf \
-#   bash configs/kaggle/train_1b.sh --time-budget-min 420 --export-profile q4_0 --pt-fraction 70
+
 CONFIG_PT="${CONFIG_PT:-${REPO_DIR}/configs/flash_480m_single.yaml}"
 CONFIG_SFT="${CONFIG_SFT:-${REPO_DIR}/configs/sft_flash_480m_single.yaml}"
-# A Kaggle session is 12h wall clock, and the notebook spends a few minutes on
-# the clone/build before this script even starts. 540 min was the old default
-# and it planned a budget the session could not honour, so the run was killed
-# mid-stage. Keep a real margin below the limit.
-SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-540}"   # 9h ceiling (Kaggle caps at 12h)
-DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))     # 480 min = 8h of training in ONE session
+
+SESSION_LIMIT_MIN="${SESSION_LIMIT_MIN:-540}"
+DEFAULT_BUDGET=$(( SESSION_LIMIT_MIN - 60 ))
 TIME_BUDGET_MIN="${TIME_BUDGET_MIN:-$DEFAULT_BUDGET}"
 [[ "${TIME_BUDGET_MIN}" -gt "$(( SESSION_LIMIT_MIN - 20 ))" ]] && {
     echo "[ERROR] --time-budget-min ${TIME_BUDGET_MIN} exceeds the ${SESSION_LIMIT_MIN} min session limit."
     echo "        Budget from the session length, not from ambition."
     exit 1
 }
+
+SESSION_SPENT_MIN="${SESSION_SPENT_MIN:-0}"
+if [[ "${SESSION_SPENT_MIN}" -gt 0 ]]; then
+    TIME_BUDGET_MIN=$(( TIME_BUDGET_MIN - SESSION_SPENT_MIN ))
+    [[ "${TIME_BUDGET_MIN}" -lt 60 ]] && {
+        echo "[ERROR] only ${TIME_BUDGET_MIN}m left after ${SESSION_SPENT_MIN}m spent; refusing a doomed run."
+        exit 1
+    }
+    echo "[time] session already spent ~${SESSION_SPENT_MIN}m (setup/data); training budget -> ${TIME_BUDGET_MIN}m"
+fi
 export GAI_AI_GGUF=1
 EXPORT_GGUF=1
 EXPORT_PROFILE="q4_0"
@@ -46,7 +34,7 @@ EXPORT_MARGIN_SEC=900
 PT_FRACTION=60
 
 SKIP_PREFLIGHT=0
-while [[ $# -gt 0 ]]; do
+while [[ $
     case "$1" in
         --pilot-only)      MODE="pilot";   shift ;;
         --preflight)       MODE="preflight"; shift ;;
@@ -60,18 +48,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 BINARY="${REPO_DIR}/build/bin/gai_train"
-# Kaggle SAVES everything under /kaggle/working and caps THAT at ~20 GB, which
-# is a different limit from free disk space (~57 GB). Everything the run
-# produces counts: clone + build tree + shards + checkpoints + GGUF. The gate
-# projects it before the first step instead of failing at Save Version.
-OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"   # unset = per-recipe default below
+
+OUTPUT_BUDGET_MB="${OUTPUT_BUDGET_MB:-}"
 if [[ -z "${OUTPUT_BUDGET_MB}" ]]; then
     case "${CONFIG_PT}" in *1b*) OUTPUT_BUDGET_MB=18432;; *) OUTPUT_BUDGET_MB=17408;; esac
 fi
 GEN_BIN="${REPO_DIR}/build/bin/ghassan-ai"
 TOK="${TOK:-${REPO_DIR}/artifacts/tokenizer/english32k.gtok}"
-# PRO-HARDEN: fallback الصامت إلى 16k كان يضيع run كاملا ثم يفشل عند البوابة.
-# نفشل فورا إن غاب 32k (setup.sh يدربه تلقائيا من English lake).
+
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] 32k tokenizer missing: ${TOK} (legacy 16k fallback DISABLED: it would waste embeddings)."
     echo "[ERROR] Run: bash configs/kaggle/setup.sh --with-parquet  (trains english32k.gtok automatically)"
@@ -88,14 +72,8 @@ echo "  Ghassan v1 Pro English — Two-Stage Training [${MODE}]"
 echo "  FLAGSHIP single-T4 recipe: ~480M total / ~204M active MoE | WSD + resume"
 echo "============================================================"
 
-# PRO-HARDEN: حفظ checkpoints/GGUF في /kaggle/working/output (دائم) لا في
-# artifacts المؤقتة فقط. trap عند EXIT/INT/TERM ينسخ آخر حالة حتى لو
-# أوقفت Kaggle الجلسة — بلا هذا يضيع 9h تدريب.
 persist_output() {
-    # /kaggle/working itself is what "Save Version" persists. Sources already
-    # inside it must NOT be copied into output/ — that stores every multi-GB
-    # checkpoint TWICE against the 20GB quota (a successful train could then
-    # fail at Save). Only outside sources are copied.
+
     [[ -d "/kaggle/working" ]] || return 0
     local dest="/kaggle/working/output"
     mkdir -p "${dest}" 2>/dev/null || true
@@ -123,15 +101,13 @@ SFT_SHARDS=$(find "${SFT_DIR}" -name "train_*.gbin" 2>/dev/null | wc -l)
 [[ "${PT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No pretrain shards in ${PT_DIR}. Run build_english_data.sh first."; exit 1; }
 [[ "${SFT_SHARDS}" -gt 0 ]] || { echo "[ERROR] No SFT shards in ${SFT_DIR}. Run build_english_data.sh first."; exit 1; }
 echo "[data] pretrain shards: ${PT_SHARDS} | sft shards: ${SFT_SHARDS}"
-# DISK FIT (Kaggle cap 20GB): one snapshot = weights + optimizer moments
-# (480M-AdamW ~5.8GB, 1B-Lion ~8.3GB; last+best = 2x at most).
-# Auto-clean intermediates that are never needed during training, then guard.
+
 echo "[disk] before training:"; df -h "${REPO_DIR}" | tail -n 1
 rm -rf "${REPO_DIR}/artifacts/corpus" "${REPO_DIR}/artifacts/synth" 2>/dev/null || true
-# If shards_en still has a leftover merged jsonl, it is dead weight now.
+
 find "${REPO_DIR}/artifacts" -maxdepth 2 -name "synthetic_*.jsonl" -delete 2>/dev/null || true
 FREE_KB=$(df "${REPO_DIR}" | awk 'NR==2{print $4}')
-# Need ~10GB free for 2x Pro ckpt + GGUF export temp. Fail fast, never mid-run OOM.
+
 if [[ "${FREE_KB}" -lt 10485760 ]]; then
   echo "[ERROR] Disk too full for Pro training (free <10GB). 19.5GB Kaggle needs:"
   echo "  rm -rf artifacts/corpus artifacts/synth <merged jsonl> (done above)"
@@ -144,20 +120,36 @@ yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space
 mkdir -p "${CKPT_PT}" "${CKPT_SFT}"
 PIPE_BIN="${REPO_DIR}/build/bin/data_pipeline"
 
-# ---------------------------------------------------------------- preflight
-# Phase-3 gates that run WITHOUT a GPU: config/tokenizer/shard truth BEFORE
-# any GPU hour burns. A declared mix domain with zero shards, a wrong-vocab
-# tokenizer, or a memory estimate over budget FAILS here — never mid-run.
-# (CUDA gates — parity test, nvidia-smi, real tok/s — stay in setup.sh and
-# the pilot, which genuinely need the GPU.)
 run_preflight() {
     echo ""
     echo "==================== preflight ===================="
-    # P1. configs exist
+
     [[ -f "${CONFIG_PT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_PT}"; return 1; }
     [[ -f "${CONFIG_SFT}" ]] || { echo "[preflight FAIL] missing ${CONFIG_SFT}"; return 1; }
     echo "[preflight] configs present"
-    # P2. tokenizer file is 32k AND matches the model vocab (never legacy 16k)
+
+    SFT_PT_CKPT="$(yget pretrained_checkpoint "${CONFIG_SFT}" || true)"
+    if [[ -n "${SFT_PT_CKPT}" ]]; then
+        case "${SFT_PT_CKPT}" in
+            /*) SFT_PT_CKPT_ABS="${SFT_PT_CKPT}" ;;
+            *)  SFT_PT_CKPT_ABS="${REPO_DIR}/${SFT_PT_CKPT}" ;;
+        esac
+        EXPECT_PT_LCKPT="${CKPT_PT}/last.ckpt"
+        if [[ "${SFT_PT_CKPT_ABS}" != "${EXPECT_PT_LCKPT}" ]]; then
+            echo "[preflight FAIL] SFT pretrain checkpoint chain mismatch."
+            echo "              SFT yaml wants to load : ${SFT_PT_CKPT_ABS}"
+            echo "              stage A would write   : ${EXPECT_PT_LCKPT}"
+            echo "              stage B would then abort (fail-fast) after the whole pretrain."
+            echo "              fix (pick one):"
+            echo "                1) export CKPT_PT=$(dirname "${SFT_PT_CKPT_ABS}")"
+            echo "                2) set training.pretrained_checkpoint=${SFT_PT_CKPT} in ${CONFIG_SFT}"
+            return 1
+        fi
+        echo "[preflight] SFT->PT checkpoint chain OK (${EXPECT_PT_LCKPT})"
+    else
+        echo "[preflight WARN] ${CONFIG_SFT} has no training.pretrained_checkpoint"
+    fi
+
     [[ -f "${TOK}" ]] || { echo "[preflight FAIL] tokenizer missing: ${TOK}"; return 1; }
     TOK_VOCAB=$("${PIPE_BIN}" tok-info --tokenizer "${TOK}" 2>/dev/null \
         | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
@@ -167,13 +159,13 @@ run_preflight() {
         return 1
     }
     echo "[preflight] tokenizer vocab ok: ${TOK_VOCAB}"
-    # P3. shard dirs non-empty
+
     for d in "${PT_DIR}" "${SFT_DIR}"; do
         n=$(find "$d" -name "train_*.gbin" 2>/dev/null | wc -l)
         [[ "$n" -gt 0 ]] || { echo "[preflight FAIL] no train shards in $d"; return 1; }
     done
     echo "[preflight] shard dirs non-empty"
-    # P4. declared mix vs built shards (effective distribution on record)
+
     for pair in "${CONFIG_PT}:${PT_DIR}" "${CONFIG_SFT}:${SFT_DIR}"; do
         yaml="${pair%%:*}"; dir="${pair##*:}"
         python3 - "$yaml" "$dir" <<'EOF' || return 1
@@ -207,12 +199,17 @@ if missing:
     sys.exit(1)
 EOF
     done
-    # P5. measured shard totals (source of truth, not comments)
+
     "${PIPE_BIN}" inspect --shards "${PT_DIR}" --tokenizer "${TOK}" || return 1
     "${PIPE_BIN}" inspect --shards "${SFT_DIR}" --tokenizer "${TOK}" || return 1
-    # P6. memory truth on CPU (no GPU needed for the estimate)
-    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cpu || return 1
-    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cpu || return 1
+
+    VRAM_MB=15360
+    case "${CONFIG_PT}" in *1b*) VRAM_MB=16384;; esac
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cpu --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cpu --strict-config --output-budget-mb "${OUTPUT_BUDGET_MB}" || return 1
+    "${BINARY}" --config "${CONFIG_PT}" --dry-run --device cpu --strict-config --max-vram-mb "${VRAM_MB}" --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] PT recipe exceeds budget (${VRAM_MB}MiB)"; return 1; }
+    "${BINARY}" --config "${CONFIG_SFT}" --dry-run --device cpu --strict-config --max-vram-mb "${VRAM_MB}" --output-budget-mb "${OUTPUT_BUDGET_MB}" || { echo "[preflight FAIL] SFT recipe exceeds budget (${VRAM_MB}MiB)"; return 1; }
+    echo "[preflight] VRAM OK (<=$(( VRAM_MB / 1024 ))GiB)"
     echo "==================== preflight: ALL GATES PASSED ===================="
     return 0
 }
@@ -228,15 +225,15 @@ fi
 echo ""
 echo "[pilot] Measuring Pro speed (${PILOT_STEPS} steps)..."
 P_START=$(date +%s)
-# 10/10: do NOT force --gemm-fp16 0. Pilot must measure the REAL recipe (fp16 ON
-# for T4). Old script forced fp32, measured 3-5x slower speed, then planned
-# steps from that wrong number AND trained the full run in slow fp32.
-# --resume none is MANDATORY here: with resume:auto an old checkpoint at
-# step >= PILOT_STEPS would make the pilot do ~zero work in ~zero seconds,
-# and the absurd tok/s would corrupt the whole session budget below.
+
+PILOT_CKPT="${PILOT_CKPT:-/tmp/gai_pilot_1b}"
+rm -rf "${PILOT_CKPT}"; mkdir -p "${PILOT_CKPT}"
+trap 'rm -rf "${PILOT_CKPT}"; persist_output' EXIT INT TERM
 "${BINARY}" --config "${CONFIG_PT}" --device cuda --tokenizer "${TOK}" \
     --data "${PT_DIR}" --max-steps "${PILOT_STEPS}" --warmup 0 --resume none \
+    --checkpoint-dir "${PILOT_CKPT}" \
     --output-budget-mb "${OUTPUT_BUDGET_MB}"
+rm -rf "${PILOT_CKPT}"
 P_END=$(date +%s)
 P_ELAPSED=$(( P_END - P_START )); [[ "${P_ELAPSED}" -le 0 ]] && P_ELAPSED=1
 P_TPS=$(( $(yget batch_size "${CONFIG_PT}") * $(yget seq_len "${CONFIG_PT}") * $(yget grad_accum "${CONFIG_PT}") * PILOT_STEPS / P_ELAPSED ))
@@ -261,10 +258,7 @@ EVAL_CAD=$(( TOTAL_STEPS / 10 )); [[ "${EVAL_CAD}" -lt 50 ]] && EVAL_CAD=50
 echo "[plan] budget=${TIME_BUDGET_MIN}min remain~=${REMAIN_SEC}s"
 echo "[plan] total_steps=${TOTAL_STEPS} (pretrain=${PT_STEPS}, sft=${SFT_STEPS})"
 echo "[plan] ~$(( TOTAL_STEPS * FULL_TPS / 1000000 ))M tokens this session"
-# HONESTY: the trainer now KEEPS a longer plan recorded in the checkpoint
-# (multi-session continuation), so a shrinking budget on the next session will
-# not silently reshape the LR curve. Say so here, or the log looks like the
-# trainer ignored --max-steps.
+
 LAST_PT_CKPT="${CKPT_PT}/last.ckpt"
 if [[ -f "${LAST_PT_CKPT}" ]]; then
     echo "[plan] ${LAST_PT_CKPT} exists: this is a CONTINUATION. The trainer keeps that"
@@ -284,20 +278,19 @@ echo "[stage-A] took $(( ($(date +%s) - T0) / 60 ))m"
 echo ""
 echo "[stage-B] SFT Pro (${SFT_STEPS} steps)..."
 T0=$(date +%s)
-# SFT resumes the PRETRAIN checkpoint (frozen embeddings), so its own quota
-# projection must see the pretrain checkpoints already on disk.
+
 if [[ "${EXPORT_GGUF}" -eq 1 ]]; then
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-        --resume auto \
+        --checkpoint-dir "${CKPT_SFT}" --resume auto \
         --output-budget-mb "${OUTPUT_BUDGET_MB}" \
         --export "${GGUF_OUT}" --export-profile "${EXPORT_PROFILE}"
 else
     "${BINARY}" --config "${CONFIG_SFT}" --device cuda --tokenizer "${TOK}" \
         --data "${SFT_DIR}" --max-steps "${SFT_STEPS}" --warmup "${SFT_WARM}" \
         --eval-every "${EVAL_CAD}" --save-every "${EVAL_CAD}" \
-        --resume auto \
+        --checkpoint-dir "${CKPT_SFT}" --resume auto \
         --output-budget-mb "${OUTPUT_BUDGET_MB}"
 fi
 echo "[stage-B] took $(( ($(date +%s) - T0) / 60 ))m"

@@ -1,6 +1,3 @@
-# Ghassan AI — cross-platform line-ending + binary safety.
-# Shell scripts MUST stay LF or Kaggle/Linux fails with `bad interpreter`.
-# C++/YAML/CMake stay LF for deterministic diffs. Binary artifacts never diffed.
 *.sh text eol=lf
 *.bash text eol=lf
 *.py text eol=lf
@@ -17,7 +14,7 @@ CMakeLists.txt text eol=lf
 *.ps1 text eol=lf
 *.json text eol=lf
 *.jsonl text eol=lf
-# Binary model/data artifacts: no conversion, no diff.
+
 *.gai binary
 *.gguf binary
 *.gbin binary

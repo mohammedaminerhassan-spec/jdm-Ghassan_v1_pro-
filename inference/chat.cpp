@@ -14,8 +14,7 @@ ChatSession::ChatSession(Generator& gen, ChatOptions opts)
     GAI_CHECK(opts_.retrieve_top_k >= 0, "retrieve top_k must be >= 0");
     GAI_CHECK(opts_.gen.max_new_tokens >= 0, "chat max tokens must be >= 0");
     if (opts_.system.empty()) {
-        // PRO-EN: English persona is script-independent (never swapped by the
-        // ScriptRouter); Darija keeps the legacy Arabic-default routing.
+
         opts_.system = (opts_.persona == "en" || opts_.persona == "english")
                            ? ChatTemplate::default_system_english()
                            : ChatTemplate::default_system();
@@ -48,16 +47,15 @@ void ChatSession::set_system(const std::string& s) {
 
 void ChatSession::apply_script_policy(const std::string& user_message) {
     if (history_.empty() || history_[0].role != Role::System) return;
-    // PRO-EN: with the English persona the system line is script-independent
-    // and must NOT be swapped per turn (legacy Darija routing only).
+
     if (opts_.persona == "en" || opts_.persona == "english") return;
     ReplyScript script = ChatTemplate::detect_script(user_message);
     if (!custom_system_) {
-        // Default persona: swap the whole system line to the matching script.
+
         history_[0].content = ChatTemplate::system_for_script(script);
         opts_.system = history_[0].content;
     } else {
-        // Custom persona: keep it, enforce the script with one directive line.
+
         const std::string dir = ChatTemplate::script_directive(script);
         if (history_[0].content.find(dir) == std::string::npos) {
             history_[0].content += std::string("\n") + dir;
@@ -66,9 +64,11 @@ void ChatSession::apply_script_policy(const std::string& user_message) {
 }
 
 void ChatSession::trim_history() {
-    // keep the system prompt + the most recent N user/assistant pairs
+
     if (static_cast<int>(history_.size()) <= 1 + 2 * opts_.max_history_turns) return;
     size_t keep_from = history_.size() - static_cast<size_t>(2 * opts_.max_history_turns);
+
+    while (keep_from > 1 && history_[keep_from].role == Role::Assistant) --keep_from;
     std::vector<Message> trimmed;
     trimmed.push_back(history_[0]);
     for (size_t i = keep_from; i < history_.size(); ++i) trimmed.push_back(history_[i]);
@@ -77,8 +77,11 @@ void ChatSession::trim_history() {
 
 bool ChatSession::try_retrieve(const std::string& user_message, std::string& out) const {
     if (opts_.retrieve_index.empty()) return false;
+
+    if (opts_.retrieve_index != retrieve_loaded_path_) retrieve_tried_ = false;
     if (!retrieve_tried_) {
         retrieve_tried_ = true;
+        retrieve_loaded_path_ = opts_.retrieve_index;
         std::vector<QaEntry> docs;
         size_t n = 0;
         namespace fs = std::filesystem;
@@ -86,7 +89,7 @@ bool ChatSession::try_retrieve(const std::string& user_message, std::string& out
         if (fs::is_directory(opts_.retrieve_index, ec)) {
             n = load_qa_dir(opts_.retrieve_index, docs);
         } else {
-            // single file or directory with one file
+
             if (load_qa_json(opts_.retrieve_index, docs)) n = docs.size();
             else n = load_qa_dir(opts_.retrieve_index, docs);
         }
@@ -96,7 +99,9 @@ bool ChatSession::try_retrieve(const std::string& user_message, std::string& out
         }
     }
     if (!retrieve_ || retrieve_->size() == 0) return false;
-    auto hits = retrieve_->query(user_message, opts_.retrieve_top_k, opts_.retrieve_threshold);
+
+    const int k = opts_.retrieve_top_k > 0 ? opts_.retrieve_top_k : 1;
+    auto hits = retrieve_->query(user_message, k, opts_.retrieve_threshold);
     if (hits.empty()) return false;
     out = retrieve_->doc(hits[0].doc).answer;
     return true;
@@ -149,9 +154,9 @@ static void adapt_english_generation(GenerationConfig& cfg, const std::string& u
 }
 
 std::string ChatSession::send(const std::string& user_message) {
-    // RAG fast path: paraphrase-aware keyword match (digit-normalized, e.g.
-    // "salam 3likom" == "salam alikom"). When a close question exists in the
-    // indexed data, return its stored answer directly instead of hallucinating.
+
+    apply_script_policy(user_message);
+
     if (opts_.retrieve_direct) {
         std::string retrieved;
         if (try_retrieve(user_message, retrieved)) {
@@ -162,15 +167,12 @@ std::string ChatSession::send(const std::string& user_message) {
             return retrieved;
         }
     }
-    // ScriptRouter runs BEFORE the turn is encoded: the system persona for
-    // this turn always matches the script the user just typed in.
-    apply_script_policy(user_message);
     history_.push_back({Role::User, user_message});
-    // Augment mode: prepend best hit as context when direct is off
+
     if (!opts_.retrieve_direct && !opts_.retrieve_index.empty()) {
         std::string retrieved;
         if (try_retrieve(user_message, retrieved)) {
-            // inject as a system reminder so the model stays grounded
+
             history_.insert(history_.end() - 1,
                             {Role::System, "Context (from dataset): " + retrieved});
         }
@@ -198,8 +200,7 @@ std::string ChatSession::send(const std::string& user_message) {
 }
 
 void ChatSession::run_repl() {
-    // The banner must match the persona: telling an English user to "type your
-    // message in Darija" is a real UX bug, not decoration.
+
     const bool en = (opts_.persona == "en" || opts_.persona == "english");
     if (en) {
         std::cout <<
@@ -270,7 +271,7 @@ void ChatSession::run_repl() {
         send(line);
         if (opts_.show_stats) std::cout << "  [" << gen_.stats().summary() << "]\n";
     }
-    std::cout << "\n  بسلامة!\n";
+    std::cout << (en ? "\n  Goodbye!\n" : "\n  بسلامة!\n");
 }
 
-} // namespace gai
+}

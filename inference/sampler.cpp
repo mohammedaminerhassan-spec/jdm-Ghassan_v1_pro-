@@ -33,18 +33,25 @@ Sampler::Sampler(SamplingConfig cfg) : cfg_(cfg) {
 }
 
 void SamplingConfig::validate() {
-    // temperature: NaN/Inf/negative -> greedy آمن؛ 0 يعني greedy أصلا.
+
     if (!std::isfinite(temperature) || temperature < 0.0f) temperature = 0.0f;
-    if (temperature > 5.0f) temperature = 5.0f;  // يمنع توزيع مسطح مدمر
-    // top_p: خارج (0,1] يعني معطل؛ 0 كان يعطل خطأ فيجب أن يعني توكن واحد؟ لا:
-    // القاعدة الصحيحة top_p<=0 أو >=1 = معطل (full set). نطبع القيم الشاذة.
+    if (temperature > 5.0f) temperature = 5.0f;
+
     if (!std::isfinite(top_p) || top_p < 0.0f) top_p = 1.0f;
     if (top_p > 1.0f) top_p = 1.0f;
     if (!std::isfinite(min_p) || min_p < 0.0f) min_p = 0.0f;
     if (min_p >= 1.0f) min_p = 0.0f;
     if (top_k < 0) top_k = 0;
-    if (top_k == 1) greedy = true;  // top_k=1 هو greedy ضمنيا
-    // penalties: قيم سالبة أو ضخمة تقلب الإشارة/تسمم logits.
+
+    if (top_k > 2048) {
+        static bool warned_topk = false;
+        if (!warned_topk) {
+            warned_topk = true;
+            log_warn("[sample] top_k huge; clamping to 2048 (full-sort per token otherwise)");
+        }
+        top_k = 2048;
+    }
+
     if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f)
         repetition_penalty = 1.0f;
     if (repetition_penalty > 5.0f) repetition_penalty = 5.0f;
@@ -56,7 +63,7 @@ void SamplingConfig::validate() {
     if (presence_penalty > 5.0f) presence_penalty = 5.0f;
     if (repetition_window < 0) repetition_window = 0;
     if (repetition_window > 8192) repetition_window = 8192;
-    // no_repeat_ngram: 0=off; clamp to [0,8] (larger n rarely helps, costs scan).
+
     if (no_repeat_ngram < 0) no_repeat_ngram = 0;
     if (no_repeat_ngram == 1) no_repeat_ngram = 2;
     if (no_repeat_ngram > 8) no_repeat_ngram = 8;
@@ -82,8 +89,6 @@ void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& 
                   ? std::min(hist.size(), static_cast<size_t>(cfg_.repetition_window))
                   : hist.size();
 
-    // Copy the window into a thread-local buffer, sort, then apply the
-    // penalty per run — same CTRL-style math with no hashing.
     thread_local std::vector<i32> win_buf;
     win_buf.clear();
     win_buf.reserve(window);
@@ -99,7 +104,7 @@ void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& 
         const int n = static_cast<int>(j - i);
         float& l = logits[win_buf[i]];
         if (rep) {
-            // CTRL-style: divide positive logits, multiply negative ones
+
             l = (l > 0.0f) ? l / cfg_.repetition_penalty : l * cfg_.repetition_penalty;
         }
         if (freq) l -= cfg_.frequency_penalty * static_cast<float>(n);
@@ -111,7 +116,7 @@ void Sampler::apply_penalties(float* logits, int vocab, const std::vector<i32>& 
 static void ban_no_repeat_ngram(float* logits, int vocab,
                                   const std::vector<i32>& hist, int n) {
     if (n <= 0 || vocab <= 0 || hist.size() < static_cast<size_t>(n - 1)) return;
-    // Prefix = last n-1 tokens; ban any token that previously followed it.
+
     const size_t m = hist.size();
     const size_t pre = static_cast<size_t>(n - 1);
     for (size_t i = 0; i + static_cast<size_t>(n) <= m; ++i) {
@@ -130,18 +135,13 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
     apply_penalties(logits, vocab, history);
     if (cfg_.no_repeat_ngram > 0) ban_no_repeat_ngram(logits, vocab, history, cfg_.no_repeat_ngram);
 
-    if (cfg_.greedy || cfg_.temperature <= 0.0f) {
+    if (cfg_.greedy || cfg_.temperature <= 0.0f || cfg_.top_k == 1) {
         int best = 0;
         float bv = logits[0];
         for (int i = 1; i < vocab; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
         return best;
     }
 
-    // FIX P2 (O(V log V) per token): when no top-k/top-p/min-p filtering is
-    // active, skip sorting entirely and sample the full softmax in O(V).
-    // Otherwise cap the pre-sort candidate set: min-p/top-p discard the tail
-    // anyway, so a 2048-cap keeps exact output in practice while cutting
-    // partial_sort from O(V log K) with K=V to O(V log 2048).
     const bool no_filter = (cfg_.top_k <= 0 || cfg_.top_k >= vocab) &&
                            (cfg_.top_p <= 0.0f || cfg_.top_p >= 1.0f) &&
                            cfg_.min_p <= 0.0f;
@@ -149,27 +149,22 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
         scratch_.clear();
         scratch_.reserve(static_cast<size_t>(vocab));
         for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);
-        // draw_from_scratch expects sorted desc for min-p/top-p; with no
-        // filter active order is irrelevant except for determinism of ties,
-        // but keep a single linear max-bubble for the -inf guard (scratch_[0]).
+
         size_t bi = 0;
         for (size_t i = 1; i < scratch_.size(); ++i)
             if (scratch_[i].first > scratch_[bi].first) bi = i;
         if (bi != 0) std::swap(scratch_[0], scratch_[bi]);
-        // Unsorted tail: sample via plain softmax below (order-free path).
-        // Fall through to draw_from_scratch which handles unsorted when
-        // limit==nprob (cumulative scan still correct, just not truncated).
-        // To keep exact semantics, sort only when filtering is active.
-        // Here no filter -> direct multinomial without sort:
+
         const float inv_t = 1.0f / cfg_.temperature;
-        float mx = scratch_[bi].first;
+
+        float mx = scratch_[0].first;
         probs_buf_.resize(scratch_.size());
         double sum = 0.0;
         for (size_t i = 0; i < scratch_.size(); ++i) {
             double p = std::exp(static_cast<double>((scratch_[i].first - mx) * inv_t));
             probs_buf_[i] = p; sum += p;
         }
-        if (!std::isfinite(sum) || sum <= 0.0) return scratch_[bi].second;
+        if (!std::isfinite(sum) || sum <= 0.0) return scratch_[0].second;
         double r = (double)rng_.uniform() * sum, acc = 0.0;
         for (size_t i = 0; i < scratch_.size(); ++i) {
             acc += probs_buf_[i];
@@ -177,9 +172,10 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
         }
         return scratch_.back().second;
     }
-    // top-k selection (partial sort keeps this cheap at V=32000)
+
     int k = (cfg_.top_k > 0 && cfg_.top_k < vocab) ? cfg_.top_k : vocab;
-    if (k > 2048 && cfg_.top_k <= 0) k = 2048;  // cap unfiltered pre-sort
+
+    if (k > 2048 && (cfg_.top_k <= 0 || cfg_.top_k >= vocab)) k = 2048;
     scratch_.clear();
     scratch_.reserve(static_cast<size_t>(vocab));
     for (int i = 0; i < vocab; ++i) scratch_.emplace_back(logits[i], i);
@@ -198,7 +194,7 @@ i32 Sampler::sample(float* logits, int vocab, const std::vector<i32>& history) {
 
 i32 Sampler::sample_candidates(const float* vals, const i32* ids, int K) {
     GAI_CHECK(K > 0 && vals && ids, "sample_candidates: empty set");
-    // Penalties were already applied device-side; rebuild the sorted set.
+
     scratch_.clear();
     scratch_.reserve(static_cast<size_t>(K));
     for (int i = 0; i < K; ++i) scratch_.emplace_back(vals[i], ids[i]);
@@ -209,12 +205,12 @@ i32 Sampler::sample_candidates(const float* vals, const i32* ids, int K) {
 
 i32 Sampler::draw_from_scratch() {
     GAI_CHECK(!scratch_.empty(), "sampler: empty candidate set");
-    // top_k أكبر من المفردات كان يقلص بصمت؛ now clamp صريح قبل softmax.
+
     const float inv_t = 1.0f / cfg_.temperature;
-    // softmax over the candidate set (temperature applied here)
+
     float mx = scratch_[0].first;
     double sum = 0.0;
-    // Reuse the member probs_buf_ instead of allocating per token.
+
     probs_buf_.resize(scratch_.size());
     double* probs = probs_buf_.data();
     for (size_t i = 0; i < scratch_.size(); ++i) {
@@ -222,12 +218,10 @@ i32 Sampler::draw_from_scratch() {
         probs[i] = p;
         sum += p;
     }
-    // guard: كل logits -inf (قناع عدواني) -> sum=0/NaN. نرجع argmax بدل NaN.
+
     if (!std::isfinite(sum) || sum <= 0.0) return scratch_[0].second;
     for (size_t i = 0; i < scratch_.size(); ++i) probs[i] /= sum;
 
-    // min-p: drop everything below min_p * p_max (applied before top-p; it is far
-    // more stable than top-p alone on a peaked small-model distribution)
     const size_t nprob = scratch_.size();
     size_t limit = nprob;
     if (cfg_.min_p > 0.0f) {
@@ -237,7 +231,6 @@ i32 Sampler::draw_from_scratch() {
         limit = std::max<size_t>(1, n);
     }
 
-    // top-p nucleus
     if (cfg_.top_p > 0.0f && cfg_.top_p < 1.0f) {
         double cum = 0.0;
         size_t n = 0;
@@ -260,4 +253,4 @@ i32 Sampler::draw_from_scratch() {
     return scratch_[limit - 1].second;
 }
 
-} // namespace gai
+}

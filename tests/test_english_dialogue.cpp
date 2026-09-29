@@ -1,14 +1,3 @@
-// English dialogue-behavior data + generator regression.
-//
-// Covers the English twin of the Darija behavior stack:
-//   * dataset/english_dialogue_content.h: every pool is non-empty, every Exchange
-//     has non-empty user+assistant, domains have the contracted shape, and no
-//     entry is an obvious template duplicate.
-//   * dataset/english_synthesis_engine.h: the generator produces well-formed multi-turn
-//     conversations whose assistant turns all pass the english_logic answer-
-//     discipline gate (the same gate the pipeline enforces on third-party data).
-//   * english_logic::is_coding: the "return" false positive (shopping "return
-//     a product" misclassified as Coding) stays fixed.
 #include "dataset/english_dialogue_content.h"
 #include "dataset/english_style_policy.h"
 #include "dataset/english_synthesis_engine.h"
@@ -29,7 +18,6 @@ static bool non_empty(const char* s) { return s && s[0] != '\0'; }
 int main() {
     namespace ed = english_dialogue_data;
 
-    // ---- 1. pool shapes --------------------------------------------------
     {
         const auto& ds = ed::domains();
         CHECK(ds.size() >= 10, "english dialogue has 10+ behavior domains");
@@ -65,7 +53,6 @@ int main() {
         CHECK(ed::system_prompts().size() >= 5, "5+ system prompts");
     }
 
-    // ---- 2. no template feel: user turns must be mostly distinct -----------
     {
         std::set<std::string> users;
         size_t total = 0;
@@ -81,13 +68,10 @@ int main() {
         }
         feed(ed::governor_exchanges());
         feed(ed::reasoning_exchanges());
-        // >90% distinct user turns: paraphrase-level variety, not slot filling.
+
         CHECK(users.size() * 100 >= total * 90, "authored user turns are overwhelmingly distinct");
     }
 
-    // ---- 3. every authored assistant turn passes the discipline gate -------
-    // (mirrors the generator's own gate; a failure here means the DATA
-    // contradicts english_logic and the data — not the gate — must change).
     {
         size_t n = 0, bad = 0;
         auto feed = [&](const std::vector<ed::Exchange>& v, const char* tag) {
@@ -115,7 +99,6 @@ int main() {
         CHECK(n > 250 && bad == 0, "all authored assistant turns obey answer discipline");
     }
 
-    // ---- 4. the "return" classifier fix ------------------------------------
     {
         CHECK(!english_logic::is_coding("How do I return something without the receipt?"),
               "shopping 'return' is not code");
@@ -131,7 +114,6 @@ int main() {
               "function request is code");
     }
 
-    // ---- 5. the generator composes valid conversations --------------------
     {
         CHECK(english_synth::EnglishSynthGenerator::domain_count() >= 10,
               "generator sees 10+ domains");
@@ -148,7 +130,7 @@ int main() {
         for (const auto& c : convs) {
             CHECK(!c.domain.empty(), "conversation has a domain");
             CHECK(c.messages.size() >= 2, "conversation has at least one turn");
-            // strict alternation starting with user (after an optional system)
+
             size_t i = 0;
             if (!c.messages.empty() && c.messages[0].role == Role::System) ++i;
             bool expect_user = true;
@@ -161,8 +143,7 @@ int main() {
                 CHECK(!c.messages[i].content.empty(), "no empty message content");
                 expect_user = !expect_user;
             }
-            // every assistant turn passes the discipline gate (belt and braces:
-            // generate() already enforces this, so a failure is a generator bug)
+
             for (size_t k = 0; k < c.messages.size(); ++k) {
                 if (c.messages[k].role != Role::Assistant) continue;
                 const std::string prev =

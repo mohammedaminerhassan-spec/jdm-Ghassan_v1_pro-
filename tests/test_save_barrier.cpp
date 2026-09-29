@@ -66,9 +66,6 @@ int main() {
     CHECK(!std::filesystem::exists(good.string() + ".tmp"), "successful save cleans up .tmp file");
     CHECK(!std::filesystem::exists(good.string() + ".bak"), "successful save cleans up .bak file");
 
-    // Replacement save: the previous checkpoint is temporarily staged as .bak,
-    // but a successful publish must remove that recovery artifact so a long
-    // Kaggle run does not retain an extra full checkpoint on disk.
     state.step = 4;
     Checkpoint::save(good.string(), model, opt, state);
     CHECK(std::filesystem::exists(good), "replacement checkpoint exists after publish");

@@ -19,6 +19,14 @@ Args::Args(int argc, char** argv) {
     if (argc > 0) prog_ = argv[0];
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+
+        auto looks_like_key = [](const std::string& s) {
+            if (s.size() < 2 || s[0] != '-') return false;
+            const char c1 = s[1];
+            if (c1 >= '0' && c1 <= '9') return false;
+            if (c1 == '.' && s.size() > 2 && s[2] >= '0' && s[2] <= '9') return false;
+            return true;
+        };
         if (a.rfind("--", 0) == 0) {
             std::string key = a.substr(2);
             size_t eq = key.find('=');
@@ -26,14 +34,14 @@ Args::Args(int argc, char** argv) {
                 kv_[key.substr(0, eq)] = key.substr(eq + 1);
                 continue;
             }
-            if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+            if (i + 1 < argc && !looks_like_key(argv[i + 1])) {
                 kv_[key] = argv[++i];
             } else {
                 kv_[key] = "1";
             }
         } else if (a.rfind("-", 0) == 0 && a.size() > 1) {
             std::string key = a.substr(1);
-            if (i + 1 < argc && std::string(argv[i + 1]).rfind("-", 0) != 0) kv_[key] = argv[++i];
+            if (i + 1 < argc && !looks_like_key(argv[i + 1])) kv_[key] = argv[++i];
             else kv_[key] = "1";
         } else {
             pos_.push_back(a);
@@ -49,22 +57,11 @@ std::string Args::str(const std::string& k, const std::string& def) const {
 }
 
 static bool parse_cli_i64(const std::string& text, i64& out) {
+
     try {
         size_t pos = 0;
         const long long v = std::stoll(text, &pos);
         if (pos != text.size()) return false;
-        out = static_cast<i64>(v);
-        return true;
-    } catch (...) {
-    }
-    try {
-        size_t pos = 0;
-        const double v = std::stod(text, &pos);
-        if (pos != text.size() || !std::isfinite(v) || std::trunc(v) != v ||
-            v < static_cast<double>(std::numeric_limits<i64>::min()) ||
-            v > static_cast<double>(std::numeric_limits<i64>::max())) {
-            return false;
-        }
         out = static_cast<i64>(v);
         return true;
     } catch (...) {
@@ -146,14 +143,14 @@ double Args::real_strict(const std::string& k) const {
         return v;
     } catch (const Error&) { throw; }
     catch (...) { GAI_FAIL("args: malformed number for '--" + k + "': '" + it->second + "' (strict-args)"); }
-    return 0.0;  // unreachable
+    return 0.0;
 }
 
 void enable_utf8_console() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    // Larger buffer so Arabic multi-byte writes are not split
+
     static char buf[1 << 16];
     setvbuf(stdout, buf, _IOFBF, sizeof(buf));
 #endif
@@ -168,11 +165,9 @@ void apply_common_flags(const Args& a) {
     if (t > 0) {
         set_num_threads(static_cast<int>(t));
     } else {
-        // T4-only + weak-PC fast path: pin OpenMP to all hardware threads by
-        // default (was lazy: omp used defaults until --threads passed).
-        // Explicit pin gives max CPU decode speed on weak local PCs.
+
         set_num_threads(num_threads());
     }
 }
 
-} // namespace gai
+}

@@ -40,7 +40,7 @@ Config Config::from_string(const std::string& text) {
     Config cfg;
     std::istringstream in(text);
     std::string line;
-    // stack of (indent, key)
+
     std::vector<std::pair<int, std::string>> stack;
     std::string list_key;
     int         list_indent = -1;
@@ -53,16 +53,12 @@ Config Config::from_string(const std::string& text) {
 
         int indent = 0;
         while (indent < static_cast<int>(raw.size()) && (raw[static_cast<size_t>(indent)] == ' ')) ++indent;
-        // Tabs are never valid YAML indentation: fail fast with line number +
-        // content (tab indent would read as indent=0 -> wrong dotted keys).
+
         if (static_cast<size_t>(indent) < raw.size() && raw[static_cast<size_t>(indent)] == '\t')
             GAI_FAIL(strfmt("config:%d: tab indentation is not allowed (use spaces): %s",
                             lineno, trim(raw).c_str()));
         std::string body = trim(raw);
-        // Minimal-subset guard: anchors/aliases/tags/multiline blocks are NOT
-        // supported by this parser. Refuse loudly with the line number instead
-        // of silently misreading them into wrong hparams (training killer).
-        // Covered: `&anchor`, `*alias`, `<<: *merge`, `!tag`, `|`, `>` blocks.
+
         if (!body.empty() && (body[0] == '&' || body[0] == '*' || body[0] == '!' ||
                               body == "|" || body == ">" || body == "|-" || body == ">-")) {
             GAI_FAIL(strfmt("config:%d: unsupported YAML construct (anchors/aliases/tags/blocks need plain scalars): %s",
@@ -73,9 +69,17 @@ Config Config::from_string(const std::string& text) {
                             lineno, body.c_str()));
         }
 
-        // list item ("- value") belonging to the last key
         if (body.rfind("- ", 0) == 0 || body == "-") {
-            if (!list_key.empty()) {
+
+            if (list_key.empty()) {
+                GAI_FAIL(strfmt("config:%d: orphan list item with no parent key: %s",
+                                lineno, body.c_str()));
+            }
+            if (indent < list_indent) {
+                GAI_FAIL(strfmt("config:%d: list item dedented outside '%s' (indent %d < %d): %s",
+                                lineno, list_key.c_str(), indent, list_indent, body.c_str()));
+            }
+            {
                 std::string item = strip_quotes(trim(body.size() > 1 ? body.substr(1) : ""));
                 auto it = cfg.kv_.find(list_key);
                 if (it == cfg.kv_.end() || it->second.empty()) cfg.kv_[list_key] = item;
@@ -96,9 +100,7 @@ Config Config::from_string(const std::string& text) {
                 else if (c == ':' && !in_s && !in_d) { colon = i; break; }
             }
         }
-        // DeepSeek rule: a non-empty, non-list line without ':' is never
-        // valid YAML — silently dropping `vocab_size 16000` trains the wrong
-        // model. Fail fast with line number.
+
         if (colon == std::string::npos) {
             if (!body.empty())
                 GAI_FAIL(strfmt("config:%d: missing ':' (want 'key: value'): %s",
@@ -108,15 +110,13 @@ Config Config::from_string(const std::string& text) {
 
         std::string key = trim(body.substr(0, colon));
         std::string val = trim(body.substr(colon + 1));
-        // Block scalars (`key: |`) would otherwise be stored as the literal
-        // string "|" (silent misconfig). Our configs never need them.
+
         if (val == "|" || val == ">" || val == "|-" || val == ">-" ||
             val == "|+" || val == ">+") {
             GAI_FAIL(strfmt("config:%d: unsupported block scalar '%s' for key '%s' (use a plain scalar)",
                             lineno, val.c_str(), key.c_str()));
         }
-        // Anchors/aliases/tags in the VALUE (`key: &a 5`, `key: *a`) would
-        // otherwise be stored literally (silent misconfig). Same loud refusal.
+
         if (!val.empty() && (val[0] == '&' || val[0] == '*' || val[0] == '!')) {
             GAI_FAIL(strfmt("config:%d: unsupported YAML construct in value for key '%s' (anchors/aliases/tags need plain scalars): %s",
                             lineno, key.c_str(), val.c_str()));
@@ -190,20 +190,11 @@ static bool full_number(const std::string& s, bool allow_float, i64& oi, double&
 }
 
 static bool full_integer_number(const std::string& s, i64& out) {
+
     try {
         size_t pos = 0;
         const long long v = std::stoll(s, &pos);
         if (pos != s.size()) return false;
-        out = static_cast<i64>(v);
-        return true;
-    } catch (...) {}
-    try {
-        size_t pos = 0;
-        const double v = std::stod(s, &pos);
-        if (pos != s.size() || !std::isfinite(v) || std::trunc(v) != v ||
-            v < static_cast<double>(std::numeric_limits<i64>::min()) ||
-            v > static_cast<double>(std::numeric_limits<i64>::max()))
-            return false;
         out = static_cast<i64>(v);
         return true;
     } catch (...) { return false; }
@@ -212,7 +203,7 @@ static bool full_integer_number(const std::string& s, i64& out) {
 i64 Config::get_int(const std::string& key, i64 def) const {
     auto it = kv_.find(key);
     if (it == kv_.end() || it->second.empty()) return def;
-    // Strict trailing check: "0.01abc" or "3e-4x" must not parse as 0.01.
+
     i64 value = 0;
     if (full_integer_number(trim(it->second), value)) return value;
     log_warn("config: ignoring malformed int for '" + key + "': '" + it->second + "'");
@@ -306,7 +297,7 @@ size_t Config::check_known(const std::vector<std::string>& exact,
         }
         if (known) continue;
         if (v.empty()) {
-            // Structural parent (other keys extend "k.")? Always fine.
+
             bool has_kids = false;
             const std::string pre = k + ".";
             for (const auto& [k2, v2] : kv_) {
@@ -338,4 +329,4 @@ std::string Config::dump() const {
     return ss.str();
 }
 
-} // namespace gai
+}

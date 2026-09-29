@@ -1,48 +1,14 @@
-# Ghassan v1 Compact — English PRETRAIN for Kaggle 2xT4 DDP.
-#
-# Why this recipe exists
-# ----------------------
-# The 1B recipe (pro_1b_2xt4) cannot be trained well inside one Kaggle
-# session: at ~612M active params a T4 pair yields roughly 17M tokens in 8h,
-# which is 0.03 tokens per parameter. The parameters are allocated but never
-# trained, and the model comes out incoherent. The 480M recipe triples the
-# token budget; this one goes further and lands near the compute-optimal ratio
-# for a single-session budget.
-#
-#   recipe          params   tokens/8h (est)   D/N        verdict
-#   pro_1b_2xt4     612M     ~17M               0.016      undertrained
-#   en_2xt4         204M     ~52M               0.11       undertrained
-#   en_compact_2xt4 109M     ~215M              ~1.97      usable
-#
-# Architecture: the same MoE/GQA/QK-norm design as the rest of the family, at a
-# size that fits the DATA budget rather than the VRAM budget. 8 experts top-2
-# plus a shared expert, so 109M parameters are stored while only ~53M are read
-# per token. Checkpoint is 602 MB, so both stages plus the GGUF fit one session.
-#
-# Context: max_seq_len 4096, and the shards are consumed at T=2048. RoPE is
-# parameterised by head_dim alone (Model::rebuild_rope_cache only bakes
-# inv_freq from head_dim and theta), and the decode path uses a ring KV cache
-# (k_attn_decode_ring), so raising max_seq_len costs nothing but a longer
-# window at inference.
-# T=2048, not 4096: the attention backward materialises a B*H*T*T float
-# probability buffer, and at B=1 H=8 T=4096 that is 512 MiB — past the 400 MiB
-# warn line and over the half of the card this recipe is meant to leave free.
-# 2048 gives 128 MiB, a clean margin, and it is the widest window that stays
-# inside the guard the project ships for T4.
-# Run: CONFIG_PT=configs/flash_109m_compact_2xt4.yaml \
-#      CONFIG_SFT=configs/sft_flash_109m_compact_2xt4.yaml \
-#      bash configs/kaggle/train_2xt4.sh
 model:
   vocab_size: 32000
   hidden_size: 512
   num_layers: 12
   num_heads: 8
   num_kv_heads: 2
-  intermediate_size: 1408   # dense fallback only (unused when use_moe=true)
+  intermediate_size: 1408
   max_seq_len: 4096
   rope_theta: 10000.0
   rms_eps: 1.0e-5
-  tie_embeddings: true      # embeddings are 16.4M of the ~62M total: tying keeps them in every token
+  tie_embeddings: true
   init_std: 0.02
   use_moe: true
   num_experts: 8
@@ -72,23 +38,19 @@ training:
   gemm_fp16: true
   fp16_weight_cache: true
   ce_chunks: 4
-  loss_scale_init: 1024     # MEASURED on T4 (this model): 8192 overflows on EVERY step
-                           # (scaler walked 8192->4096->2048->1024->512, every update
-                           # skipped). 1024 is 8x below the highest level known to
-                           # overflow here, and 2048 is the ceiling: the window is
-                           # 2000 clean steps and this stage runs ~1000, so the
-                           # scaler can never grow back into a level that breaks.
+  loss_scale_init: 1024
+
   loss_scale_max: 2048
   loss_scale_window: 2000
   batch_size: 1
   seq_len: 2048
-  grad_accum: 16            # 1*2048*16*2GPUs = 65,536 global (== en_2xt4)
+  grad_accum: 16
   max_steps: 0
   epochs: 2
-  learning_rate: 6.0e-4    # small model wants a higher LR than the 1B recipe
+  learning_rate: 6.0e-4
   min_lr_ratio: 0.1
   warmup_steps: 300
-  optimizer: adamw          # ~62M params: plenty of headroom for AdamW's 2 moments
+  optimizer: adamw
   scheduler: wsd
   sched_decay_frac: 0.2
   weight_decay: 0.1
@@ -107,7 +69,7 @@ training:
   checkpoint_dir: artifacts/checkpoints/flash_109m_compact_2xt4
   data_dir: artifacts/shards_en
   resume: auto
-  activation_checkpointing: false   # plenty of VRAM at this size; keep it fast
+  activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
   ddp: true
@@ -116,17 +78,7 @@ training:
 data:
   train_glob: artifacts/shards_en/train_*.gbin
   val_glob: artifacts/shards_en/val_*.gbin
-  # Stage-1 (broad) curriculum. english_behavior is deliberately 0.00 HERE:
-  # it is only ~2M tokens of ~325 authored templates, so any non-trivial
-  # share of a ~100M-token stage-1 budget re-reads every authored line
-  # 5-10 times and the model memorises persona phrasings instead of style.
-  # Persona is taught in stage 2 (sft_flash_109m_compact_2xt4.yaml) where the budget
-  # is small enough for the repetition to be the point.
-  # NOTE: these shards carry assistant-span loss masks (data_pipeline
-  # `parquet --mode chat`), and Trainer applies masks in EVERY stage
-  # (trainer.cpp:133). So stage 1 is masked-assistant SFT on a chat-heavy
-  # mix, not classical full-text pretraining. Only assistant tokens
-  # (~40-50% of the corpus) contribute to the loss and to the real D/N.
+
   mix:
     english_chat: 0.70
     english_instruction: 0.30

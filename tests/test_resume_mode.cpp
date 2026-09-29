@@ -1,13 +1,3 @@
-// F-08 regression: `resume_mode: exact | migrate`.
-//
-//   migrate (historical): every recovery path warns and continues — a missing
-//           parameter keeps its fresh init, an optimizer-kind switch restarts
-//           moments at t_=0, a reshaped schedule only warns.
-//   exact: the same situations are hard failures, so a production run can never
-//           silently continue with a different model or a reset optimizer.
-//
-// This exercises the Checkpoint::load(strict=...) contract directly (the
-// trainer-level gate is a thin wrapper on top of it) plus the config parsing.
 #include "training/checkpoint.h"
 #include "training/trainer.h"
 
@@ -31,7 +21,7 @@ static ModelConfig base_config() {
     cfg.num_kv_heads = 1;
     cfg.intermediate_size = 32;
     cfg.max_seq_len = 32;
-    cfg.use_qk_norm = true;          // gives the model extra, easily-missed params
+    cfg.use_qk_norm = true;
     return cfg;
 }
 
@@ -58,9 +48,6 @@ int main() {
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
 
-    // ---------------------------------------------------------------------
-    // 1. Baseline: an identical recipe resumes in BOTH modes.
-    // ---------------------------------------------------------------------
     {
         const std::string path = (dir / "match.ckpt").string();
         const ModelConfig cfg = base_config();
@@ -86,9 +73,6 @@ int main() {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // 2. Optimizer kind mismatch: adamw checkpoint + lion trainer.
-    // ---------------------------------------------------------------------
     {
         const std::string path = (dir / "kind.ckpt").string();
         const ModelConfig cfg = base_config();
@@ -117,21 +101,11 @@ int main() {
         CHECK(!ok_exact, "exact: an optimizer-kind switch is refused");
     }
 
-    // ---------------------------------------------------------------------
-    // 3. Parameter-set mismatch.
-    //
-    //    Every knob that adds parameters (use_qk_norm, moe_*) is also an
-    //    arch_match field, so in practice a parameter-set change is already a
-    //    hard failure in BOTH modes. The `strict` missing-parameter branch is
-    //    defense-in-depth for parameters a future version adds without a
-    //    matching arch_match field; what is testable here is that neither mode
-    //    silently accepts a mismatched parameter set.
-    // ---------------------------------------------------------------------
     {
         const std::string path = (dir / "missing_param.ckpt").string();
         const ModelConfig cfg = base_config();
         ModelConfig no_qk = cfg;
-        no_qk.use_qk_norm = false;      // fewer parameters than cfg
+        no_qk.use_qk_norm = false;
 
         Model smaller(no_qk, Device::CPU);
         smaller.init_weights(5);
@@ -141,7 +115,7 @@ int main() {
         Checkpoint::save(path, smaller, smaller_opt, make_state(3));
 
         {
-            // Matching recipe: both modes accept it.
+
             Model dst(no_qk, Device::CPU);
             dst.init_weights(1);
             dst.enable_grad(true);
@@ -155,7 +129,7 @@ int main() {
             CHECK(moments, "moments restored for the matching architecture");
         }
         {
-            // Destination has parameters the file does not carry.
+
             Model dst(cfg, Device::CPU);
             dst.init_weights(1);
             dst.enable_grad(true);
@@ -169,10 +143,6 @@ int main() {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // 4. Tokenizer/vocab mismatch is refused in BOTH modes (pre-existing hard
-    //    gate) — exact must not weaken it.
-    // ---------------------------------------------------------------------
     {
         const std::string path = (dir / "vocab.ckpt").string();
         const ModelConfig cfg = base_config();
@@ -199,11 +169,6 @@ int main() {
               "vocab mismatch refused in exact mode");
     }
 
-    // ---------------------------------------------------------------------
-    // 5. Config parsing: resume_mode is validated, unknown values fail.
-    // ---------------------------------------------------------------------
-    // 5. Config parsing: resume_mode is validated, unknown values fail.
-    // ---------------------------------------------------------------------
     {
         static const char* kBase =
             "training:\n"

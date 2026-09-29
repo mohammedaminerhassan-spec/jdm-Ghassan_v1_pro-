@@ -1,38 +1,22 @@
 #!/usr/bin/env bash
-# kaggle/train.sh — Ghassan v1 Pro English one-session training (Kaggle GPU).
-#
-# DEFAULT (one-shot): pilot-measure (100 steps) -> measures real tok/s ->
-#   computes max_steps to fit the time budget -> full run -> GGUF export ->
-#   English smoke test. Everything finishes inside ONE session.
-#
-# Usage:
-#   bash configs/kaggle/train.sh                                # one-shot (default)
-#   bash configs/kaggle/train.sh --pilot-only                   # just the 100-step pilot
-#   bash configs/kaggle/train.sh --full                         # full schedule, no budget cap
-#   bash configs/kaggle/train.sh --dry-run                      # memory estimate only
-#   bash configs/kaggle/train.sh --time-budget-min 420          # default 360 (6h)
-#   bash configs/kaggle/train.sh --export-profile q4_0          # default fp16
-#   bash configs/kaggle/train.sh --no-export                    # skip GGUF export
-# ----------------------------------------------------------------
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${REPO_DIR}/build"
 
-MODE="oneshot"   # oneshot | pilot | full | dryrun
+MODE="oneshot"
 CONFIG_FULL="${REPO_DIR}/configs/flash_480m_single.yaml"
 CONFIG_PILOT="${REPO_DIR}/configs/pilot_moe_smoke.yaml"
 TIME_BUDGET_MIN=360
 EXPORT_GGUF=1
 EXPORT_PROFILE="fp16"
 PILOT_STEPS=100
-EXPORT_MARGIN_SEC=900   # time reserved for export + smoke test
-# FIX (set -u crash): GGUF_OUT was only set in the --pro branch, but the
-# default one-shot path uses --export "${GGUF_OUT}" unconditionally ->
-# "unbound variable" exit BEFORE training on Kaggle. Always define a default.
+EXPORT_MARGIN_SEC=900
+
 GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
 
-while [[ $# -gt 0 ]]; do
+while [[ $
     case "$1" in
         --pro)               CONFIG_FULL="${REPO_DIR}/configs/pro_1b_single.yaml"; GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro-1b_${EXPORT_PROFILE}.gguf"; shift ;;
         --pilot-only)        MODE="pilot";   shift ;;
@@ -45,10 +29,7 @@ while [[ $# -gt 0 ]]; do
         *) shift ;;
     esac
 done
-# FIX P2 (--pro + --export-profile combo was frozen to fp16): the --pro branch
-# above baked EXPORT_PROFILE=fp16 into GGUF_OUT at parse time, and this block
-# skipped recompute for pro configs. Re-resolve unconditionally so
-# --pro --export-profile q4_0 really writes ...-1b_q4_0.gguf.
+
 if [[ "${CONFIG_FULL}" == *pro_1b_single.yaml ]]; then
     GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro-1b_${EXPORT_PROFILE}.gguf"
 else
@@ -57,14 +38,14 @@ fi
 
 BINARY="${BUILD_DIR}/bin/gai_train"
 GEN_BIN="${BUILD_DIR}/bin/ghassan-ai"
-# PRO-HARDEN: fallback الصامت 32k->16k كان يضيع run ثم يفشل لاحقا. نفشل فورا.
+
 TOK="${REPO_DIR}/artifacts/tokenizer/english32k.gtok"
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] 32k tokenizer missing: ${TOK} (legacy 16k fallback DISABLED)."
     echo "[ERROR] Run: bash configs/kaggle/setup.sh --with-parquet  (trains english32k.gtok automatically)"
     exit 1
 fi
-# PRO-HARDEN: persistence دائم لـKaggle (نفس train_1b.sh).
+
 persist_output() {
     if [[ -d "/kaggle/working" ]]; then
         mkdir -p /kaggle/working/output 2>/dev/null || true
@@ -80,13 +61,11 @@ echo "  Ghassan v1 Pro English — Kaggle Training [${MODE}] (${CONFIG_FULL})"
 echo "  Pro 480M recipe. For the 1B flagship use train_1b.sh (or --pro here)"
 echo "============================================================"
 
-# ---- sanity: binary
 if [[ ! -f "${BINARY}" ]]; then
     echo "[ERROR] gai_train not found. Run setup.sh --require-gpu first."
     exit 1
 fi
 
-# ---- GPU is MANDATORY (never train on CPU silently)
 if ! command -v nvidia-smi &>/dev/null; then
     echo "[ERROR] No NVIDIA GPU detected (nvidia-smi missing)."
     echo "[ERROR] Enable Kaggle Accelerator -> GPU, then re-run."
@@ -98,7 +77,6 @@ nvidia-smi --query-gpu=name,memory.free,memory.total \
            --format=csv,noheader 2>/dev/null | \
     awk -F, '{printf "  %s | free: %s | total: %s\n", $1,$2,$3}'
 
-# ---- tokenizer + shards
 if [[ ! -f "${TOK}" ]]; then
     echo "[ERROR] Tokenizer not found: ${TOK}"
     echo "        Run setup.sh --with-parquet first (it trains the tokenizer automatically)."
@@ -111,8 +89,6 @@ if [[ "${TRAIN_SHARDS}" -eq 0 ]]; then
 fi
 echo "[data] Training shards: ${TRAIN_SHARDS}"
 
-# ---- GPU-adaptive precision: pre-Volta GPUs (e.g. P100, CC 6.x) have no FP16
-# tensor cores, so fp16 GEMMs would run SLOWER than fp32 there. Force fp32.
 CC_MAJOR=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | cut -d. -f1 | tr -d ' ')
 FP16_OVERRIDE=()
 if [[ -n "${CC_MAJOR}" ]] && [[ "${CC_MAJOR}" -lt 7 ]]; then
@@ -122,12 +98,11 @@ else
     echo "[prec] GPU CC ${CC_MAJOR:-?}.x -> fp16 tensor GEMMs per config"
 fi
 
-# yaml helper: read a top-level training key (batch_size / seq_len / grad_accum)
 yget() { grep -E "^[[:space:]]*$1:" "$2" | head -n 1 | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
 mkdir -p "${REPO_DIR}/artifacts/checkpoints/pilot" "${REPO_DIR}/artifacts/checkpoints/en_pro"
 
-run_train() {  # $1=config $2=device $3+=extra args...
+run_train() {
     local cfg="$1"; local dev="$2"; shift 2
     "${BINARY}" --config "${cfg}" --device "${dev}" --tokenizer "${TOK}" "$@"
 }
@@ -137,19 +112,17 @@ if [[ "${MODE}" == "dryrun" ]]; then
     exit 0
 fi
 
-# ---------------------------------------------------------------- pilot: measure
 PILOT_TPS=0
 if [[ "${MODE}" == "oneshot" ]] || [[ "${MODE}" == "pilot" ]]; then
     echo ""
     echo "[pilot] Measuring real speed (${PILOT_STEPS} steps)..."
     P_START=$(date +%s)
-    # --resume none: a stale pilot checkpoint would make this do ~zero work
-    # and corrupt the session budget with an absurd tok/s (see train_1b.sh).
+
     run_train "${CONFIG_PILOT}" cuda --max-steps "${PILOT_STEPS}" --resume none "${FP16_OVERRIDE[@]}"
     P_END=$(date +%s)
     P_ELAPSED=$(( P_END - P_START ))
     if [[ "${P_ELAPSED}" -le 0 ]]; then P_ELAPSED=1; fi
-    # tokens/step straight from the pilot yaml (no hardcoding drift)
+
     P_TPS=$(( $(yget batch_size "${CONFIG_PILOT}") * $(yget seq_len "${CONFIG_PILOT}") * $(yget grad_accum "${CONFIG_PILOT}") * PILOT_STEPS / P_ELAPSED ))
     PILOT_TPS=${P_TPS}
     echo "[pilot] ${PILOT_STEPS} steps in ${P_ELAPSED}s -> ~${PILOT_TPS} tok/s"
@@ -159,11 +132,10 @@ if [[ "${MODE}" == "oneshot" ]] || [[ "${MODE}" == "pilot" ]]; then
     fi
 fi
 
-# ---------------------------------------------------------------- adaptive full run
 if [[ "${MODE}" == "oneshot" ]]; then
     F_TPS=$(( $(yget batch_size "${CONFIG_FULL}") * $(yget seq_len "${CONFIG_FULL}") * $(yget grad_accum "${CONFIG_FULL}") ))
     echo "[plan] Full config: ${F_TPS} tokens/step"
-    # conservative: full-size steps are at least as efficient per token as pilot
+
     FULL_SPS=$(awk "BEGIN {printf \"%.2f\", ${F_TPS} / ${PILOT_TPS}}")
     BUDGET_SEC=$(( TIME_BUDGET_MIN * 60 ))
     USED_SEC=$(($(date +%s) - P_START))
@@ -172,8 +144,7 @@ if [[ "${MODE}" == "oneshot" ]]; then
     if [[ "${MAX_STEPS}" -lt 50 ]]; then MAX_STEPS=50; fi
     echo "[plan] Budget ${TIME_BUDGET_MIN}min, used ${USED_SEC}s -> max_steps=${MAX_STEPS}"
     echo "[plan] Expected initial loss: ~ln(32000) ≈ 10.37 (+ tiny MoE aux term)"
-    # PRO-HARDEN: oneshot كان يحسب max-steps دون تجاوز warmup فيفشل
-    # trainer بـ GAI_FAIL(warmup<total) عند budget قصير. warmup=10% دائما.
+
     WARMUP_STEPS=$(( MAX_STEPS / 10 ))
     if [[ "${WARMUP_STEPS}" -lt 20 ]]; then WARMUP_STEPS=20; fi
     EXTRA_ARGS=(--max-steps "${MAX_STEPS}" --warmup "${WARMUP_STEPS}")
@@ -196,10 +167,6 @@ fi
 T_END=$(date +%s)
 echo "[train] Full run took $(( (T_END - T_START) / 60 ))m $(( (T_END - T_START) % 60 ))s"
 
-# ---------------------------------------------------------------- smoke test (English!)
-# SELF-CONTAINED + FATAL (v2 audit P0-35): no --tokenizer sidecar (the GGUF
-# must carry its own tokenizer) and no swallowed failure — a broken export
-# must fail the run, never print "Done!" over it.
 if [[ "${EXPORT_GGUF}" -eq 1 ]] && [[ -f "${GGUF_OUT}" ]]; then
     echo ""
     echo "[smoke] Testing the exported model (English prompt, no sidecar)..."

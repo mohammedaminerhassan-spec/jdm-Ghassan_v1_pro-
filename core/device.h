@@ -28,29 +28,13 @@ struct DeviceInfo {
 const DeviceInfo& device_info();
 void              print_device_report();
 bool              cuda_available();
-Device            best_device();          // T4-ONLY: CUDA > CPU
+Device            best_device();
 
-// ---- host resources (asked for by name, never guessed) ------------------
-// physical_ram_bytes(): total installed RAM, 0 if unknown. Budgets derived
-// from a hardcoded constant are a lie on a smaller box: the checkpoint writer
-// happily queued 32 GB of snapshots on a 30 GB Kaggle session and the OOM
-// killer won the race.
-// free_disk_bytes(path): free space on the filesystem holding `path` (0 if
-// unknown). A checkpoint save needs the previous file AND a .tmp of the same
-// size, so the transient peak is ~2x one checkpoint.
 size_t physical_ram_bytes();
 size_t free_disk_bytes(const std::string& path);
-// Recursive size of a directory tree. Hard links are counted ONCE (by file
-// id): the checkpoint writer publishes best.ckpt and last.ckpt as two names
-// for ONE inode, and a quota projection that counts names twice invents a
-// phantom second copy. unique_files (optional) receives the inode count.
+
 size_t tree_size_bytes(const std::string& path, size_t* unique_files = nullptr);
-// Same, but any directory whose NAME is in `skip_dir_names` is not descended
-// into (its whole subtree is exempt). Used by the output-quota guard: a Kaggle
-// working tree holds the CMake build/ tree and the source clone next to the
-// checkpoints, and counting the regenerable build objects against a budget
-// sized for checkpoints+GGUF invents a phantom overflow that kills a healthy
-// run before step 1.
+
 size_t tree_size_bytes_excluding(const std::string& path,
                                  const std::vector<std::string>& skip_dir_names,
                                  size_t* unique_files = nullptr);
@@ -61,13 +45,7 @@ void  device_memset_zero(void* ptr, size_t nbytes, Device dev);
 void  device_copy(void* dst, Device dst_dev, const void* src, Device src_dev, size_t nbytes);
 void  device_synchronize(Device dev);
 
-// Stage a device-resident [rows, cols] f32 tensor into a host vector, in
-// bounded row blocks. Every host-side consumer of Model::forward() output MUST
-// go through this: on CUDA the forward result lives in device memory and
-// dereferencing it from the host segfaults (that is exactly how `ghassan-ai
-// logits` crashed on a T4 while working on CPU). block_bytes caps the staging
-// buffer; the block math is what makes it safe, so it is unit-tested.
 void  device_stage_f32_2d(const void* src, Device src_dev, i64 rows, i64 cols,
                           std::vector<float>& out, size_t block_bytes = (4u << 20));
 
-} // namespace gai
+}

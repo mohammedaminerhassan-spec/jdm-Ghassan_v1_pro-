@@ -1,39 +1,3 @@
-// Attention CUDA parity gate (P1-4): the custom kernels in cuda/attention.cu
-// (flash-style tiled forward, GQA, SWA, segment-masked packing) must match
-// the CPU references in core/ops_cpu_dense.cpp + core/ops_cpu_moe.cpp before any production run.
-//
-// Runs ONLY when built with CUDA on a machine with a device; otherwise prints
-// SKIP and passes (same contract as test_moe_cuda_parity). Covers:
-//   1. causal forward, GQA (H=6/KV=2)
-//   2. full backward (dq/dk/dv) vs serial CPU reference
-//   3. SWA window forward + backward
-//   4. segment-id packing forward
-//   5. T=1 edge case
-//
-// Parity criterion: |a-b| <= atol + rtol*|b|  (the SAME mixed criterion
-// test_moe_cuda_parity.cpp uses, and for the SAME reason).
-//
-// A PURE element-wise relative error is the wrong test for a reduction. The
-// CUDA backward reassociates every sum: `dot_pg` is a strided per-lane partial
-// plus a __shfl_xor butterfly instead of a serial sum, and each dq row is a
-// per-lane register accumulation plus a __shfl_down tree instead of a serial
-// axpy. That is the same arithmetic in a different order, so it differs in the
-// last bits — and near a cancellation (dq is a sum of terms p_j*(dP_j - sum_l
-// p_l dP_l)*K_j whose terms cancel hard, so some entries land near zero) the
-// PURE relative error explodes while the absolute error stays microscopic.
-//
-// That is exactly what happened on the first T4 run of this gate:
-//   FAIL: attn bwd dq vs CPU max_rel=0.000130572 tol=0.0001
-// — 1.3e-4 against a 1e-4 gate, on an entry orders of magnitude below the
-// tensor's own scale. The MoE gate hit the identical wall ("gate grad max rel
-// err 1.48e-4") and was fixed; this one was left behind, so it has been
-// reporting a red build on a correct kernel.
-//
-// atol scales with the reference tensor's magnitude rather than being a magic
-// constant, and the diagnostic prints max_abs, max_rel, the reference scale
-// and the value at the worst element, so a REAL divergence (wrong index, a
-// dropped term, a missing scale) is still impossible to miss: those move
-// values by O(1e-2..1) relative, not by 1e-7.
 #include "core/ops.h"
 #include "core/ops_cpu.h"
 #include "core/rng.h"
@@ -63,7 +27,7 @@ static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
         ++failures;
         return false;
     }
-    // Scale from the REFERENCE (the CPU is the oracle), not from `a`.
+
     double scale = 0.0;
     for (float v : b) scale = std::max(scale, std::fabs((double)v));
     if (atol <= 0.0) atol = 1e-5 * (scale > 0.0 ? scale : 1.0);
@@ -91,28 +55,15 @@ static bool near_vec(const std::vector<float>& a, const std::vector<float>& b,
     return true;
 }
 
-// quiet = true: report the verdict but do not count a failure (the self-test
-// below deliberately feeds this function both a legal reassociation and a real
-// bug, and only one of the two must be counted).
 static bool near_vec_report(const std::vector<float>& a, const std::vector<float>& b,
                             double rtol, const char* what, double atol, bool quiet) {
     const int before = failures;
     const bool r = near_vec(a, b, rtol, what, atol);
-    if (quiet && r && failures > before) failures = before;   // un-count
-    if (quiet && !r) failures = before;                       // un-count
+    if (quiet && r && failures > before) failures = before;
+    if (quiet && !r) failures = before;
     return r;
 }
 
-// ---- CPU self-test: does this gate still CATCH a real kernel bug? --------
-//
-// A loosened tolerance is only defensible if it still fails on divergence. This
-// runs on every build (CPU included) and pins both halves of the contract:
-//   * a legal REASSOCIATION of the same sums passes (that is the whole reason
-//     for the absolute floor), and
-//   * three real kernel bugs fail loudly: dropping the softmax-Jacobian
-//     `dot_pg` term, dropping the 1/sqrt(hd) scale, and a one-position index
-//     shift. Each of those moves dq by O(1e-1..1) relative, so a criterion that
-//     let them through would be worthless.
 static void test_tolerance_contract() {
     Rng rng;
     rng.seed_with(7781);
@@ -141,16 +92,7 @@ static void test_tolerance_contract() {
         for (int i = 0; i < hd; ++i) s += a[i] * c[i];
         return s;
     };
-    // mode 0 = serial (must match the reference bit-for-bit)
-    // mode 1 = pairwise-tree reassociation of the SAME sums (legal): the terms
-    //          are identical, only the grouping differs
-    // mode 2 = softmax-Jacobian term dropped (real bug)
-    // mode 3 = scale dropped (real bug)
-    // mode 4 = k index shifted by one (real bug)
-    // Legal reassociation: the SAME terms, grouped as a binary tree. The
-    // standard pairwise reduction leaves the total in a[0]; no term is
-    // dropped or duplicated (a naive "reduce then sum every slot" double-counts
-    // the untouched ones, which is a VALUE change, not a reassociation).
+
     auto pairwise_sum = [](std::vector<float>& a) {
         for (size_t w = 1; w < a.size(); w *= 2)
             for (size_t j = 0; j + w < a.size(); j += 2 * w) a[j] += a[j + w];
@@ -201,13 +143,12 @@ static void test_tolerance_contract() {
     const std::vector<float> no_scale = build(3);
     const std::vector<float> shifted  = build(4);
 
-    // 1. the oracle agrees with its own serial re-implementation
     CHECK(near_vec(serial, dq_ref, 1e-4, "tolerance contract: serial dq == CPU dq"),
           "self-test oracle mismatch");
-    // 2. a legal reassociation PASSES the gate
+
     CHECK(near_vec_report(reassoc, dq_ref, 1e-4, "reassociation is accepted", 0.0, true),
           "a legal reassociation of the same sums must pass the mixed criterion");
-    // 3. every real bug still FAILS it
+
     CHECK(!near_vec_report(no_jac, dq_ref, 1e-4, "dropped jacobian", 0.0, true),
           "dropping the softmax-Jacobian dot_pg term must be caught");
     CHECK(!near_vec_report(no_scale, dq_ref, 1e-4, "dropped scale", 0.0, true),
@@ -220,7 +161,6 @@ static void test_tolerance_contract() {
 #include "cuda/cuda_ops.h"
 #include "core/device.h"
 
-// Copy a host vector to a CUDA tensor and back.
 static Tensor to_cuda(const std::vector<float>& h) {
     Tensor t = Tensor::empty({(i64)h.size()}, DType::F32, Device::CUDA);
     device_copy(t.data_ptr(), Device::CUDA, h.data(), Device::CPU,
@@ -274,7 +214,6 @@ static void test_backward_gqa() {
     const std::vector<float> v = rnd_vec(rng, (size_t)B * T * KV * hd, 0.5f);
     const std::vector<float> dout = rnd_vec(rng, (size_t)B * T * H * hd, 0.5f);
 
-    // Forward on CPU first (probs feed both backward paths identically).
     std::vector<float> out_cpu((size_t)B * T * H * hd, 0.0f);
     std::vector<float> probs((size_t)B * H * T * T, 0.0f);
     cpu::attention_forward(q.data(), k.data(), v.data(), out_cpu.data(),
@@ -352,7 +291,7 @@ static void test_segment_packing_fwd() {
     const std::vector<float> q = rnd_vec(rng, (size_t)B * T * H * hd, 0.5f);
     const std::vector<float> k = rnd_vec(rng, (size_t)B * T * KV * hd, 0.5f);
     const std::vector<float> v = rnd_vec(rng, (size_t)B * T * KV * hd, 0.5f);
-    // Two packed docs: [0..4] and [5..7]; cross-segment attention is masked.
+
     const std::vector<i32> seg = {0, 0, 0, 0, 0, 1, 1, 1};
 
     std::vector<float> out_cpu((size_t)B * T * H * hd, 0.0f);
@@ -392,11 +331,10 @@ static void test_t1_edge() {
     device_synchronize(Device::CUDA);
     near_vec(out_cpu, to_host(dout), 1e-4, "attn T=1 edge vs CPU");
 }
-#endif // GAI_CUDA
+#endif
 
 int main() {
-    // Runs on EVERY build, CUDA or not: the gate's own tolerance must be
-    // provably still able to catch a real kernel bug (see the self-test).
+
     test_tolerance_contract();
 #ifdef GAI_CUDA
     if (!cuda_available()) {

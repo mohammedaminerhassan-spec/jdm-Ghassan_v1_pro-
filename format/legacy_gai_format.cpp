@@ -30,7 +30,6 @@ static bool rd_str(std::istream& i, std::string& s, u32 max = 4096) {
 
 static u64 align64(u64 x) { return (x + 63ull) & ~63ull; }
 
-// ================================================================ writer
 GaiWriter::GaiWriter(const std::string& path) : path_(path) {}
 
 void GaiWriter::set_meta(const std::string& k, const std::string& v) { meta_[k] = v; }
@@ -49,16 +48,14 @@ void GaiWriter::set_config(const ModelConfig& c) {
     set_meta("moe_top_k", std::to_string(c.moe_top_k));
     set_meta("moe_expert_dim", std::to_string(c.moe_expert_dim));
     set_meta("moe_shared", c.moe_shared ? "1" : "0");
-    // DeepSeek compat rule: every knob that changes numerics must round-trip.
-    // rope_scale/qk_norm/z_loss previously dropped -> silent wrong RoPE/attn
-    // on reload. Persist all of them (old files without them load as off/0).
+
     set_meta("moe_aux_scale", strfmt("%.6f", (double)c.moe_aux_scale));
     set_meta("moe_jitter", strfmt("%.6f", (double)c.moe_jitter));
     set_meta("max_seq_len", std::to_string(c.max_seq_len));
     set_meta("rope_theta", strfmt("%.6f", c.rope_theta));
     set_meta("rope_scale", strfmt("%.6f", (double)c.rope_scale));
     set_meta("rope_yarn_mscale", strfmt("%.6f", (double)c.rope_yarn_mscale));
-    // PRO round-trip (old files without them load as defaults).
+
     set_meta("rope_yarn_low", strfmt("%.6f", (double)c.rope_yarn_low));
     set_meta("rope_yarn_high", strfmt("%.6f", (double)c.rope_yarn_high));
     set_meta("sliding_window", std::to_string(c.sliding_window));
@@ -91,7 +88,6 @@ void GaiWriter::write() {
     fs::path p(path_);
     if (p.has_parent_path()) fs::create_directories(p.parent_path());
 
-    // header text block
     std::ostringstream hs;
     for (const auto& [k, v] : meta_) hs << k << "=" << v << "\n";
     std::string header = hs.str();
@@ -110,7 +106,6 @@ void GaiWriter::write() {
         u64 count = static_cast<u64>(tensors_.size());
         wr(f, count);
 
-        // Reserve the directory, fill offsets after the data is laid out.
         std::streampos dir_pos = f.tellp();
         std::vector<TensorEntry> entries;
         entries.reserve(tensors_.size());
@@ -140,7 +135,6 @@ void GaiWriter::write() {
         wr(f, tok_bytes);
         if (tok_bytes) f.write(tok_blob_.data(), static_cast<std::streamsize>(tok_bytes));
 
-        // tensor data, aligned
         for (size_t i = 0; i < tensors_.size(); ++i) {
             u64 here = static_cast<u64>(f.tellp());
             u64 aligned = align64(here);
@@ -151,18 +145,22 @@ void GaiWriter::write() {
                     static_cast<std::streamsize>(t.nbytes()));
         }
 
-        // rewrite the directory now that offsets are known
         f.seekp(dir_pos);
         write_dir(f);
         GAI_CHECK(f.good(), "gai write failed");
     }
     std::error_code ec;
-    fs::remove(path_, ec);
+
     fs::rename(tmp, path_, ec);
+    if (ec) {
+
+        std::error_code ec2;
+        fs::remove(path_, ec2);
+        fs::rename(tmp, path_, ec);
+    }
     GAI_CHECK(!ec, "cannot finalise model file: " + ec.message());
 }
 
-// ================================================================ reader
 bool GaiReader::open(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
@@ -204,7 +202,9 @@ bool GaiReader::open(const std::string& path) {
 
     u64 tok_bytes = 0;
     if (!rd(f, tok_bytes)) return false;
-    if (tok_bytes > 0 && tok_bytes < (1ull << 32)) {
+
+    if (tok_bytes >= (1ull << 32)) return false;
+    if (tok_bytes > 0) {
         tok_blob_.assign(static_cast<size_t>(tok_bytes), '\0');
         if (!f.read(tok_blob_.data(), static_cast<std::streamsize>(tok_bytes))) return false;
     }
@@ -285,6 +285,9 @@ const TensorEntry* GaiReader::find(const std::string& name) const {
 Tensor GaiReader::read_tensor_raw(const std::string& name) const {
     const TensorEntry* e = find(name);
     GAI_CHECK(e != nullptr, "tensor not found in model file: " + name);
+
+    GAI_CHECK(e->nbytes <= file_size_ && e->offset <= file_size_ - e->nbytes,
+              "tensor range out of file bounds for " + name);
     std::ifstream f(path_, std::ios::binary);
     GAI_CHECK(f.good(), "cannot reopen model file");
     f.seekg(static_cast<std::streamoff>(e->offset));
@@ -307,7 +310,7 @@ bool GaiReader::map_weights() {
     if (path_.empty()) return false;
     auto m = std::make_shared<MappedFile>();
     if (!m->open(path_)) return false;
-    // The directory was parsed from this same file; the mapping must cover it.
+
     if (m->size() != file_size_ && file_size_ != 0) return false;
     mapping_ = std::move(m);
     return true;
@@ -317,8 +320,7 @@ Tensor GaiReader::read_tensor_wrapped(const std::string& name) const {
     GAI_CHECK(weights_mapped(), "read_tensor_wrapped needs map_weights() first");
     const TensorEntry* e = find(name);
     GAI_CHECK(e != nullptr, "tensor not found in model file: " + name);
-    // Bounds-check BEFORE forming the view: a corrupt offset must fail fast
-    // here, never become an out-of-bounds pointer (segfault on first touch).
+
     const u64 msize = mapping_->size();
     GAI_CHECK(e->offset <= msize && e->nbytes <= msize - e->offset,
               "tensor region outside mapped file (corrupt directory): " + name);
@@ -332,7 +334,6 @@ Tensor GaiReader::read_tensor_wrapped(const std::string& name) const {
     return t;
 }
 
-// ================================================================ model io
 bool load_model_from_gai(const std::string& path, Model& model) {
     GaiReader r;
     if (!r.open(path)) {
@@ -376,16 +377,13 @@ bool load_model_from_gai_mmap(const std::string& path, Model& model,
             return false;
         }
         if (e->dtype == DType::F32 && e->dims == p->shape) {
-            // Zero-copy path: weight memory IS the mapped file (no heap).
-            // The mapping stays alive inside the tensor's storage owner.
+
             Tensor t = r.read_tensor_wrapped(p->name);
             t.set_name(p->name);
             p->w = t;
             ++wrapped;
         } else {
-            // Quantized (or otherwise non-F32) entry: CPUs have no Q kernels
-            // yet (roadmap item 9), so convert once at load like the normal
-            // path. Still correct, just not zero-copy for this tensor.
+
             Tensor t = r.read_tensor_f32(p->name);
             if (t.numel() != p->numel()) {
                 log_error(strfmt("tensor %s size mismatch: file %lld vs model %lld",
@@ -418,8 +416,7 @@ ExportProfile profile_for(const std::string& name) {
         p.embedding_dtype = DType::Q8_0;
         p.norm_dtype = DType::F32;
     } else if (name == "int4") {
-        // Embeddings stay at Q8: they are read by a gather, not a matmul, and are
-        // the single most quantization-sensitive tensor in a small model.
+
         p.default_dtype = DType::Q4_0;
         p.embedding_dtype = DType::Q8_0;
         p.norm_dtype = DType::F32;
@@ -451,7 +448,7 @@ void export_model_gai(const std::string& path, Model& model,
         DType dt = is_norm ? profile.norm_dtype
                  : is_emb  ? profile.embedding_dtype
                            : profile.default_dtype;
-        // fall back if the tensor cannot be block-quantized
+
         if (!quant::is_quantizable(p->numel(), dt)) {
             log_warn(strfmt("tensor %s (%lld elems) is not %s-quantizable; storing f16",
                             p->name.c_str(), static_cast<long long>(p->numel()), dtype_name(dt)));
@@ -469,4 +466,4 @@ void export_model_gai(const std::string& path, Model& model,
                     human_bytes(total_bytes).c_str()));
 }
 
-} // namespace gai
+}

@@ -1,27 +1,6 @@
-# Ghassan v1 Ultra 1B — Large-scale synthetic data generation.
-# NOTE on the legacy "~1B" name: with the capped conversation counts below,
-# the PLANNED total is ~0.5-0.7B, not 1B. The measured shard totals printed
-# by `data_pipeline inspect` are the source of truth — never scale training
-# configs from this comment.
-#
-# Math (avg ~380 tok/conversation with system prompt + turns):
-#   700,000 pretrain convs x 380 ~= 266M tokens synthetic (<30% cap: larger
-#     synthetic fractions memorize templates instead of Darija)
-#   + JSON/CSV corpora (~200-400M after dedup; MEASURED at build time)
-#   + SFT chat (150,000 convs x ~380 ~= 57M)
-#   => ~0.5-0.7B tokens planned across artifacts/shards_1b + shards_1b_sft
-#
-# Run (needs ~15GB disk free, run once, reuse shards for all epochs):
-#   bash configs/kaggle/build_billion_data.sh
-# (data_pipeline synth takes explicit CLI flags, not --config; the build
-# script below derives its batch counts from num_conversations here.)
-#
-# NOTE: do NOT generate the full count in one process on Kaggle (OOM/timeout).
-# The build script splits into small seeded batches (14 x 50k + 2 x 75k).
-
 synth:
   seed: 1234
-  num_conversations: 700000    # capped: synthetic must stay <30% of 1B (was 1.5M=57% -> collapse)
+  num_conversations: 700000
   min_turns: 2
   max_turns: 14
   p_arabic_script: 0.55
@@ -33,19 +12,16 @@ synth:
   p_misunderstand: 0.08
   include_system: true
   p_system: 0.35
-  # Anti-collapse: each template max 500 uses (was 20000 -> model memorizes
-  # templates instead of Darija). Needs large template pool; pipeline fails fast
-  # if pool too small instead of silently repeating.
+
   max_template_uses: 500
   max_attempts_multiplier: 40
   output_path: artifacts/synth/synthetic_1b.jsonl
   shards_output: artifacts/shards_1b/sft_train_darija.gbin
   tokenizer_path: artifacts/tokenizer/darija32k.gtok
 
-# SFT split for stage 2 (smaller, higher quality)
 sft_synth:
   seed: 9999
-  num_conversations: 150000   # smaller + higher quality (was 200k)
+  num_conversations: 150000
   min_turns: 2
   max_turns: 10
   p_arabic_script: 0.50
@@ -57,6 +33,6 @@ sft_synth:
   p_misunderstand: 0.06
   include_system: true
   p_system: 0.40
-  max_template_uses: 300      # strict: SFT quality > quantity
+  max_template_uses: 300
   max_attempts_multiplier: 60
   output_path: artifacts/synth/synthetic_1b_sft.jsonl

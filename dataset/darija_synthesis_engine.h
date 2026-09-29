@@ -10,33 +10,28 @@
 
 namespace gai {
 
-// ---------------------------------------------------------------- orthography
 enum class Script : u8 { Arabic = 0, Latin = 1, Arabizi = 2 };
 
-// Deterministic Arabic <-> Latin/Arabizi transliteration for Darija, used to
-// multiply the effective corpus and to teach the model that "شنو" and "chno" and
-// "shnou" are the same word.
 std::string arabic_to_arabizi(const std::string& arabic, Rng& rng, bool heavy_digits = true);
 std::string apply_orthographic_noise(const std::string& latin, Rng& rng);
 
-// ---------------------------------------------------------------- generator
 struct SynthConfig {
     u64  seed = 1234;
     int  num_conversations = 200000;
     int  min_turns = 2;
     int  max_turns = 12;
-    double p_arabic_script = 0.62;   // Darija in Arabic letters
-    double p_latin_script  = 0.28;   // Darija in Latin/Arabizi
-    double p_msa           = 0.10;   // occasional MSA exchange
-    double p_french_switch = 0.12;   // French term injected in a turn
+    double p_arabic_script = 0.62;
+    double p_latin_script  = 0.28;
+    double p_msa           = 0.10;
+    double p_french_switch = 0.12;
     double p_followup      = 0.45;
     double p_correction    = 0.08;
     double p_misunderstand = 0.06;
-    double p_governor      = 0.07;   // controller exchanges (short/long, honesty, refusal)
-    double p_reasoning     = 0.08;   // Darija step-by-step chains
+    double p_governor      = 0.07;
+    double p_reasoning     = 0.08;
     bool   include_system  = true;
     double p_system        = 0.35;
-    int    max_template_uses = 400;  // diversity cap
+    int    max_template_uses = 400;
     int    max_attempts_multiplier = 60;
 };
 
@@ -58,17 +53,13 @@ struct SynthStats {
     std::string summary() const;
 };
 
-// Compositional dialogue generator: scenario graph x surface realizer x turn
-// planner. Not an LLM-distillation pipeline - every string is authored here.
 class SynthGenerator {
 public:
     explicit SynthGenerator(SynthConfig cfg = {});
     ~SynthGenerator();
 
-    // Generates one conversation. Returns false if the diversity filters rejected it.
     bool generate(Conversation& out);
 
-    // Generates `n` accepted conversations (retries internally).
     std::vector<Conversation> generate_many(int n);
 
     const SynthStats& stats() const { return stats_; }
@@ -83,8 +74,7 @@ private:
     SynthStats  stats_;
 };
 
-// Serialises conversations to a JSONL-ish format the pipeline can re-read.
 void write_conversations_jsonl(const std::string& path, const std::vector<Conversation>& convs);
 std::vector<Conversation> read_conversations_jsonl(const std::string& path);
 
-} // namespace gai
+}

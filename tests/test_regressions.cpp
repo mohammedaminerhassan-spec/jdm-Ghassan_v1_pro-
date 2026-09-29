@@ -10,8 +10,6 @@ static int failures = 0;
     if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; ++failures; } \
 } while (0)
 
-// P0-3: documents silent-default behavior AND the new --strict-args gate.
-// Old fossils only asserted the warn path; we assert both paths.
 static char prog[] = "test";
 static char k_n[] = "--n";
 static char v_float[] = "1.5";
@@ -23,7 +21,7 @@ static void test_malformed_int_warn() {
     Args a(3, argv1);
     i64 v = a.num("n", 0);
     CHECK(v == 0, "malformed int falls back to default");
-    // keep exact legacy log text so log-scrapers keep working
+
     log_warn("config: ignoring malformed int for 'training.count': '1.5'");
     log_warn("args: ignoring malformed int for '--n': '1.5'");
 }
@@ -41,8 +39,7 @@ static void test_malformed_int_twice() {
 }
 
 static void test_strict_args_gate() {
-    // New behavior: callers can detect malformed values via has()+parse
-    // instead of silently continuing. Args::has must be exact.
+
     char* argv1[] = {prog, k_n, v_float};
     Args a(3, argv1);
     CHECK(a.has("n"), "has(n) true");

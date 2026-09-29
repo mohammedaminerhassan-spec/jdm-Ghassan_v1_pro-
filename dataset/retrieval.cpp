@@ -13,10 +13,7 @@ namespace fs = std::filesystem;
 namespace gai {
 
 std::string retrieval_normalize(const std::string& s) {
-    // PARQUET-ONLY EN fix: Arabizi digit folding (3->a,7->h,9->q) corrupted
-    // English numbers ("What is 3+4?" -> "what is a"). Apply it ONLY when the
-    // text looks Darija-like (Arabic bytes or arabizi digit-inside-word);
-    // pure English keeps its digits so math/RAG grounding stays exact.
+
     bool has_arabic = false;
     for (size_t k = 0; k < s.size(); ++k) {
         if (static_cast<unsigned char>(s[k]) >= 0x80) { has_arabic = true; break; }
@@ -34,7 +31,7 @@ std::string retrieval_normalize(const std::string& s) {
     const bool fold_digits = has_arabic || arabizi_like;
     std::string o;
     o.reserve(s.size());
-    bool space = true; // collapse + trim
+    bool space = true;
     for (size_t i = 0; i < s.size();) {
         unsigned char c = static_cast<unsigned char>(s[i]);
         if (c == 0xD9 && i + 1 < s.size()) {
@@ -54,15 +51,13 @@ std::string retrieval_normalize(const std::string& s) {
             space = false;
             ++i;
         } else if (c >= '0' && c <= '9') {
-            // Arabizi digits -> latin letters so "3likom" == "alikom",
-            // "7al" == "hal", "9ahwa" == "qahwa". English-only queries keep
-            // digits (fold_digits==false) so "3+4" never becomes "a".
+
             if (fold_digits) {
                 if (c == '3') o += 'a';
                 else if (c == '7') o += 'h';
                 else if (c == '9') o += 'q';
-                else if (c == '5') o += 'k'; // kh -> k (close enough for match)
-                else if (c == '2') o += 'a'; // hamza -> a
+                else if (c == '5') o += 'k';
+                else if (c == '2') o += 'a';
                 else o += s[i];
             } else {
                 o += s[i];
@@ -94,10 +89,6 @@ std::vector<std::string> retrieval_tokenize(const std::string& s) {
 }
 
 namespace {
-
-// ---- minimal JSON reader for our shards: array of flat objects whose values
-// are strings or integers. Handles \" \\ \/ \b \f \n \r \t \uXXXX (with
-// surrogate pairs). Anything else (nested values) is skipped, never fatal.
 
 struct Cursor {
     const char* p;
@@ -140,7 +131,6 @@ static unsigned hex4(const char* p) {
     return v;
 }
 
-// Parses a JSON string starting at the opening quote. Returns false on error.
 static bool parse_string(Cursor& c, std::string& out) {
     if (c.eof() || *c.p != '"') return false;
     ++c.p;
@@ -175,7 +165,7 @@ static bool parse_string(Cursor& c, std::string& out) {
                             cp = 0xFFFD;
                         }
                     } else if (cp >= 0xD800 && cp <= 0xDFFF) {
-                        // FIX: lone surrogate -> replacement char (no CESU-8).
+
                         cp = 0xFFFD;
                     }
                     utf8_emit(out, cp);
@@ -208,7 +198,6 @@ static bool parse_int(Cursor& c, long long& out) {
     return true;
 }
 
-// Skips one JSON value of any shape (used for unknown keys).
 static bool skip_value(Cursor& c, int depth = 0) {
     if (depth > 64) return false;
     skip_ws(c);
@@ -249,28 +238,21 @@ static bool skip_value(Cursor& c, int depth = 0) {
             return false;
         }
     }
-    // number / true / false / null: consume until delimiter
+
     while (!c.eof() && *c.p != ',' && *c.p != ']' && *c.p != '}' &&
            *c.p != ' ' && *c.p != '\t' && *c.p != '\n' && *c.p != '\r')
         ++c.p;
     return true;
 }
 
-} // namespace
+}
 
-// Stable 63-bit FNV-1a: string ids (e.g. "ghassan_darija_0002717") become
-// deterministic int64 ids instead of failing the whole file.
 static long long hash_id_str(const std::string& s) {
     uint64_t h = 1469598103934665603ull;
     for (unsigned char ch : s) { h ^= ch; h *= 1099511628211ull; }
     return static_cast<long long>(h & 0x7FFFFFFFFFFFFFFFull);
 }
 
-// Parses ONE object body; cursor must sit right AFTER '{'.
-// Returns false only on malformed JSON (caller skips the object).
-// Missing question/answer -> *has_qa=false (object ignored, not fatal).
-// id accepts int OR string (hashed); unknown keys (domain/script/old_id/...)
-// are skipped so enriched Darija rows load fine.
 static bool parse_qa_object_body(Cursor& c, QaEntry& e, bool& has_qa, long long auto_id) {
     bool has_q = false, has_a = false;
     e.id = auto_id;
@@ -314,12 +296,15 @@ static bool parse_qa_object_body(Cursor& c, QaEntry& e, bool& has_qa, long long 
 bool load_qa_json(const std::string& path, std::vector<QaEntry>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return false;
-    // FIX: unbounded whole-file load -> bad_alloc/OOM on GB JSON (RAG build
-    // crash, low-PC killer). Cap at 2GiB and fail fast with a clear cause.
+
     {
         std::error_code ec;
         const auto fsize = std::filesystem::file_size(path, ec);
-        if (!ec && fsize > (2ull << 30)) return false;
+        if (!ec && fsize > (256ull << 20)) {
+            log_warn("retrieval: refusing QA file over 256MiB: " + path +
+                     " (split it or point --retrieve-index at a directory)");
+            return false;
+        }
     }
     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (text.empty()) return false;
@@ -329,7 +314,7 @@ bool load_qa_json(const std::string& path, std::vector<QaEntry>& out) {
     size_t loaded = 0;
     auto auto_id = [&]() { return static_cast<long long>(out.size() + loaded); };
     if (*c.p == '[') {
-        // ---- top-level array path (train-*.json shards) ----
+
         ++c.p;
         while (true) {
             skip_ws(c);
@@ -349,9 +334,7 @@ bool load_qa_json(const std::string& path, std::vector<QaEntry>& out) {
         }
         return true;
     }
-    // ---- JSONL path (one object per line(s); Darija clean files) ----
-    // Brace-depth splitter aware of strings/escapes, so pretty-printed
-    // multi-line objects also work — not just strict one-line JSONL.
+
     size_t pos = static_cast<size_t>(c.p - text.data());
     const size_t n = text.size();
     size_t bad = 0;
@@ -427,8 +410,7 @@ size_t load_qa_dir(const std::string& dir, std::vector<QaEntry>& out) {
 }
 
 void RetrievalIndex::build(const std::vector<QaEntry>& docs) {
-    // Deduplicate by normalized question: the aggregate all_darija file plus
-    // the per-category files would otherwise double the index and bias IDF.
+
     std::map<std::string, size_t> first_seen;
     std::vector<QaEntry> uniq;
     uniq.reserve(docs.size());
@@ -472,8 +454,7 @@ void RetrievalIndex::build(const std::vector<QaEntry>& docs) {
 static int lev1(const std::string& a, const std::string& b, int maxd) {
     int n = (int)a.size(), m = (int)b.size();
     if (std::abs(n - m) > maxd) return maxd + 1;
-    // Hard bound: the DP table is fixed size. Long tokens never match
-    // fuzzily (they fall through to the trigram rescue below).
+
     if (n > 15 || m > 15 || n <= 0 || m <= 0) return maxd + 1;
     int dp[16][16];
     for (int i = 0; i <= n; ++i) dp[i][0] = i;
@@ -494,7 +475,7 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
     auto qt = retrieval_tokenize(text);
     if (qt.empty()) return out;
     std::string nq = retrieval_normalize(text);
-    // BM25 lengths (avgdl over the index; N is small, linear scan is fine)
+
     double avgdl = 1.0;
     {
         double tot = 0.0;
@@ -504,7 +485,7 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
     }
     constexpr double k1 = 1.2, b = 0.75;
     std::map<size_t, double> acc;
-    // query-term frequency (repeated words count, e.g. "salam salam")
+
     std::map<std::string, int> qtf;
     for (const auto& w : qt) qtf[w]++;
     for (const auto& [w, qf] : qtf) {
@@ -512,7 +493,7 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
         std::string use = w;
         double wpen = 1.0;
         if (itw == idf_.end()) {
-            // Fuzzy: bokhir~bikhir, labas~labass, kolxi~kolchi (1-2 edits)
+
             int maxd = (int)w.size() <= 4 ? 1 : 2;
             double best_idf = 0;
             std::string best;
@@ -522,7 +503,7 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
             }
             if (best.empty()) continue;
             use = best;
-            wpen = 0.75; // penalty for fuzzy
+            wpen = 0.75;
             itw = idf_.find(use);
             if (itw == idf_.end()) continue;
         }
@@ -530,19 +511,17 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
         if (iti == inv_.end()) continue;
         double idf = itw->second;
         for (size_t d : iti->second) {
-            // tf of `use` inside doc d (docs are short QA questions)
+
             int tf = 0;
             for (const auto& dw : toks_[d]) if (dw == use) ++tf;
             if (tf <= 0) continue;
             double dl = static_cast<double>(doc_len_[d]);
             double denom = tf + k1 * (1.0 - b + b * dl / avgdl);
             double s = idf * (tf * (k1 + 1.0) / denom);
-            acc[d] += wpen * s * (1.0 + 0.1 * (qf - 1));  // slight qtf boost
+            acc[d] += wpen * s * (1.0 + 0.1 * (qf - 1));
         }
     }
-    // Trigram rescue: when NO token matched at all (heavy paraphrase or
-    // typos in every word), fall back to character-3-gram Dice overlap so
-    // "kifach nsayb" still finds "kifach nsawb". Bounded and deterministic.
+
     if (acc.empty() && !nq.empty()) {
         auto trigrams = [](const std::string& s) {
             std::map<std::string, int> m;
@@ -564,7 +543,8 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
                 }
                 if (inter == 0) continue;
                 double dice = 2.0 * inter / (qn + dn);
-                if (dice >= 0.25) acc[d] = dice * 2.0;  // rescue weight, below real BM25 hits
+                if (dice >= 0.25) acc[d] = dice * 2.0;
+
             }
         }
     }
@@ -572,7 +552,7 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
     cand.reserve(acc.size());
     for (const auto& [d, s] : acc) {
         double score = s;
-        // bigram overlap bonus: rewards word order ("chno smitk" vs "smitk chno")
+
         if (qt.size() >= 2 && toks_[d].size() >= 2) {
             int shared = 0;
             for (size_t i = 0; i + 1 < qt.size(); ++i)
@@ -596,4 +576,4 @@ std::vector<RetrievalHit> RetrievalIndex::query(const std::string& text, int top
     return cand;
 }
 
-} // namespace gai
+}

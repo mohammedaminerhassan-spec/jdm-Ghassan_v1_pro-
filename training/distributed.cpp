@@ -1,5 +1,5 @@
 #include "training/distributed.h"
-#include "core/ops.h"   // ops::perf_note_sync (telemetry for blocking collectives)
+#include "core/ops.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -43,14 +43,12 @@ bool DistributedContext::init(const Config& cfg) {
     }
 
 #ifdef GAI_NCCL
-    // Single-node 4xT4: all ranks share /tmp, so rank 0 publishes the NCCL
-    // ID through a file. torchrun users can skip this via GAI_NCCL_ID_FILE.
+
     CU_RT_CHECK(cudaSetDevice(local_rank_));
     CU_RT_CHECK(cudaStreamCreate(&stream_));
-    // Ordering event: lets the NCCL stream wait for default-stream compute
-    // without blocking the host (see wait_for_compute).
+
     CU_RT_CHECK(cudaEventCreateWithFlags(&fence_event_, cudaEventDisableTiming));
-    // Device-side word for barrier (NCCL forbids host pointers).
+
     CU_RT_CHECK(cudaMalloc(&barrier_dev_, sizeof(int)));
     CU_RT_CHECK(cudaMemset(barrier_dev_, 0, sizeof(int)));
 
@@ -61,11 +59,7 @@ bool DistributedContext::init(const Config& cfg) {
     ncclUniqueId nccl_id;
     std::memset(&nccl_id, 0, sizeof(nccl_id));
     if (global_rank_ == 0) {
-        // A stale ID file from a crashed run would have the correct size, so
-        // followers could read an old id before rank 0 rewrites it. Unlink
-        // first so followers only ever see a fresh, complete ID.
-        // ATOMIC PUBLISH: write to a tmp name + fsync + rename, so followers
-        // can never observe a half-written ID even if the size check races.
+
         {
             std::error_code ec;
             std::filesystem::remove(id_file, ec);
@@ -85,7 +79,7 @@ bool DistributedContext::init(const Config& cfg) {
             if (ec) GAI_FAIL("NCCL: atomic publish failed for " + id_file + ": " + ec.message());
         }
     } else {
-        // Bounded wait: fail loudly instead of hanging forever if rank 0 dies.
+
         bool seen = false;
         for (int i = 0; i < 3000; ++i) {
             std::error_code ec;
@@ -147,7 +141,7 @@ void DistributedContext::finalize() {
         cudaEventDestroy(fence_event_);
         fence_event_ = nullptr;
     }
-    // Rank 0 cleans the rendezvous file (single-node /tmp).
+
     if (global_rank_ == 0 && !id_file_.empty()) {
         std::error_code ec;
         std::filesystem::remove(id_file_, ec);
@@ -161,14 +155,7 @@ void DistributedContext::finalize() {
 
 #ifdef GAI_NCCL
 void DistributedContext::wait_for_compute() {
-    // Compute kernels + staged copies run on the default stream (0), NCCL on
-    // stream_. Recording here captures ALL prior default-stream work; the
-    // NCCL stream then waits, so collectives never read in-flight grads.
-    // Unlike cudaDeviceSynchronize(), the host does not block and the GPU
-    // keeps executing unrelated work: communication/computation overlap.
-    // NOTE: legacy default-stream semantics also order stream_ after stream 0,
-    // but the explicit event keeps this correct under per-thread default
-    // streams too (--default-stream per-thread).
+
     CU_RT_CHECK(cudaEventRecord(fence_event_, 0));
     CU_RT_CHECK(cudaStreamWaitEvent(stream_, fence_event_, 0));
 }
@@ -185,8 +172,7 @@ void* DistributedContext::collective_staging(void* p, size_t nbytes, bool* copy_
     *copy_back = true;
     return coll_dev_;
 }
-#endif // GAI_NCCL
-
+#endif
 
 void DistributedContext::all_reduce_sum(float* buffer, size_t numel) {
     all_reduce_sum(static_cast<void*>(buffer), numel, sizeof(float));
@@ -196,8 +182,7 @@ void DistributedContext::all_reduce_sum_i64(int64_t* buffer, size_t numel) {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    // FENCE (event-based): order the NCCL stream after default-stream compute
-    // without blocking the host (see wait_for_compute).
+
     wait_for_compute();
     const size_t nbytes = numel * sizeof(int64_t);
     bool back = false;
@@ -217,13 +202,7 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    // OVERFLOW GUARD: grad compression casts f32->f16 while grads are still
-    // scaled by loss_scale (e.g. 8192x). Scaled grads overflow fp16 -> inf ->
-    // skipped-step storm. HARD FAIL, no environment override: an env-var
-    // escape hatch is one exported line away from silently training on
-    // garbage for hours, and no shipped recipe uses compression (exact fp32
-    // path below). Compression, if ever wanted, needs unscale-first plumbing
-    // in the Trainer with numerical validation — not a runtime flag.
+
     if (config_.grad_compression && dtype_size == 4 && numel >= 4096) {
         GAI_FAIL("ddp_grad_compression=true is unsupported with loss scaling: scaled "
                  "grads overflow fp16 and corrupt training. Set "
@@ -241,7 +220,7 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] all_reduce numel=%zu dtype=%d bytes=%zu staged=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, global_rank_));
-    // FENCE (event-based): order the NCCL stream after default-stream compute.
+
     wait_for_compute();
     NCCL_CHECK(ncclAllReduce(dev, dev, numel, nccl_dtype, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
@@ -252,10 +231,6 @@ void DistributedContext::all_reduce_sum(void* buffer, size_t numel, int dtype_si
 #endif
 }
 
-// Grouped/async collectives: same launch as all_reduce_sum but the caller
-// owns completion via sync_stream(). All buffers in one group must be
-// independent (different memory, no host reads until the trailing sync);
-// ncclGroupStart/End fuses the launches into fewer NCCL kernels.
 void DistributedContext::all_reduce_sum_nosync(void* buffer, size_t numel, int dtype_size) {
     if (world_size_ <= 1) return;
 
@@ -269,10 +244,7 @@ void DistributedContext::all_reduce_sum_nosync(void* buffer, size_t numel, int d
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
-    // Host-staged buffers (back==true) need their H2D copy visible: the
-    // blocking memcpy above already completes before we return, so the
-    // grouped kernel is safe. A grouped collective whose result must come
-    // back to the host is a caller bug — refuse loudly instead of racing.
+
     if (back) GAI_FAIL("all_reduce_sum_nosync: host buffer needs copy-back; "
                        "use the syncing all_reduce_sum for host-side results");
     wait_for_compute();
@@ -314,15 +286,12 @@ void DistributedContext::broadcast(void* buffer, size_t numel, int dtype_size, i
     else if (dtype_size == 8) nccl_dtype = ncclFloat64;
     else if (dtype_size == 1) nccl_dtype = ncclInt8;
 
-    // Host buffers (e.g. the "is_best" i64 pair) MUST be staged on the
-    // device: ncclBroadcast on a host pointer aborts with an illegal memory
-    // access and kills every rank at the first new-best step.
     const size_t nbytes = numel * static_cast<size_t>(dtype_size);
     bool back = false;
     void* dev = collective_staging(buffer, nbytes, &back);
     log_debug(strfmt("[dist] broadcast numel=%zu dtype=%d bytes=%zu staged=%d root=%d rank=%d",
                      numel, dtype_size, nbytes, back ? 1 : 0, root, global_rank_));
-    // FENCE (event-based): order the broadcast after default-stream compute.
+
     wait_for_compute();
     NCCL_CHECK(ncclBroadcast(dev, dev, numel, nccl_dtype, root, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
@@ -337,9 +306,9 @@ void DistributedContext::barrier() {
     if (world_size_ <= 1) return;
 
 #ifdef GAI_NCCL
-    // Dummy all-reduce on DEVICE memory (host pointers are illegal for NCCL).
+
     if (!barrier_dev_ || !comm_) return;
-    // FENCE (event-based): prior compute visible before the barrier.
+
     wait_for_compute();
     NCCL_CHECK(ncclAllReduce(barrier_dev_, barrier_dev_, 1, ncclInt32, ncclSum, comm_, stream_));
     CU_RT_CHECK(cudaStreamSynchronize(stream_));
@@ -364,7 +333,6 @@ std::string DistributedContext::get_nccl_unique_id() {
 DistributedContext::Config distributed_config_from_env(int default_world_size) {
     DistributedContext::Config cfg;
 
-    // SLURM environment
     if (const char* slurm_ntasks = std::getenv("SLURM_NTASKS")) {
         cfg.world_size = std::atoi(slurm_ntasks);
     }
@@ -375,7 +343,6 @@ DistributedContext::Config distributed_config_from_env(int default_world_size) {
         cfg.local_rank = std::atoi(slurm_local_id);
     }
 
-    // torchrun / torch.distributed.launch environment
     if (const char* world_size = std::getenv("WORLD_SIZE")) {
         cfg.world_size = std::atoi(world_size);
     }
@@ -386,7 +353,6 @@ DistributedContext::Config distributed_config_from_env(int default_world_size) {
         cfg.local_rank = std::atoi(local_rank);
     }
 
-    // Master address/port
     if (const char* master_addr = std::getenv("MASTER_ADDR")) {
         cfg.master_addr = master_addr;
     }
@@ -394,7 +360,6 @@ DistributedContext::Config distributed_config_from_env(int default_world_size) {
         cfg.master_port = std::atoi(master_port);
     }
 
-    // Defaults
     if (cfg.world_size <= 0) cfg.world_size = default_world_size;
     if (cfg.global_rank < 0) cfg.global_rank = 0;
     if (cfg.local_rank < 0) cfg.local_rank = 0;
@@ -410,7 +375,7 @@ ScopedDistributed::ScopedDistributed(int world_size, int local_rank) {
     DistributedContext::Config cfg;
     cfg.world_size = world_size;
     cfg.local_rank = local_rank;
-    cfg.global_rank = local_rank;  // Single node assumption
+    cfg.global_rank = local_rank;
     ctx_.init(cfg);
 }
 
@@ -418,4 +383,4 @@ ScopedDistributed::~ScopedDistributed() {
     ctx_.finalize();
 }
 
-} // namespace gai
+}

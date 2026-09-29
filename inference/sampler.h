@@ -8,26 +8,23 @@ namespace gai {
 
 struct SamplingConfig {
     float temperature       = 0.8f;
-    int   top_k             = 40;      // 0 disables
-    float top_p             = 0.92f;   // 1.0 disables
-    float min_p             = 0.05f;   // 0 disables; robust alternative to top_p
-    float repetition_penalty= 1.12f;   // 1.0 disables
+    int   top_k             = 40;
+    float top_p             = 0.92f;
+    float min_p             = 0.05f;
+    float repetition_penalty= 1.12f;
     int   repetition_window = 128;
     float frequency_penalty = 0.0f;
     float presence_penalty  = 0.0f;
-    int   no_repeat_ngram   = 0;       // 0=off; 2..8 bans tokens completing a seen n-gram (Darija anti-loop)
+    int   no_repeat_ngram   = 0;
     bool  greedy            = false;
-    bool  gpu_fast_sample   = true;    // GPU penalties+top-k, ~1KB D2H/token
-    u64   seed              = 0;       // 0 = random
+    bool  gpu_fast_sample   = true;
+    u64   seed              = 0;
 
     static SamplingConfig from_config(const class Config& c, const std::string& prefix = "sampling");
-    // validate() clamps sampling knobs to sane ranges (temp/top_p/top_k/penalties/seed).
-    // Invalid values fail fast instead of sampling garbage.
+
     void validate();
 };
 
-// Applies penalties + filtering + sampling to a logits row. Stateless apart from
-// the RNG, so a Sampler can be reused across sessions.
 class Sampler {
 public:
     explicit Sampler(SamplingConfig cfg);
@@ -36,29 +33,22 @@ public:
     const SamplingConfig& config() const { return cfg_; }
     void reseed(u64 seed) { rng_.seed_with(seed); }
 
-    // `history` is the full generated context, used for repetition penalties.
-    // `logits` is modified in place.
     i32 sample(float* logits, int vocab, const std::vector<i32>& history);
 
-    // Fast path: candidates are pre-selected device-side (top-K, penalties
-    // already applied there). `vals`/`ids` hold K raw (unscaled) logits.
-    // The softmax/min-p/top-p/draw tail is SHARED with sample(), so given
-    // identical candidate sets both paths draw bit-identical tokens.
     i32 sample_candidates(const float* vals, const i32* ids, int K);
 
-    // Utility used by evaluation: log-probability of a specific token.
     static double log_prob(const float* logits, int vocab, i32 token);
 
 private:
     void apply_penalties(float* logits, int vocab, const std::vector<i32>& history) const;
-    // Shared draw tail: scratch_ holds (logit, id) candidates, sorted desc.
+
     i32 draw_from_scratch();
 
     SamplingConfig cfg_;
     Rng rng_;
     std::vector<std::pair<float, i32>> scratch_;
-    // Persistent scratch buffers (no per-token malloc).
+
     std::vector<double> probs_buf_;
 };
 
-} // namespace gai
+}

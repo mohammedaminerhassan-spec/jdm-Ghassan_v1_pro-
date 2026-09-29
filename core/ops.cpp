@@ -11,9 +11,6 @@
 #include <mutex>
 #include <unordered_map>
 
-// Dispatch (T4-ONLY): Device::CUDA goes to cuda_ops::*, everything else to cpu::*.
-// No TPU/Metal/Vulkan branches exist by design — zero dead code paths.
-
 #ifdef GAI_CUDA
 #define GAI_DISPATCH(dev, call) \
     do { if ((dev) == Device::CUDA) { cuda_ops::call; return; } cpu::call; } while (0)
@@ -30,9 +27,7 @@ namespace gai {
 namespace ops {
 
 static std::atomic<bool> g_gemm_fp16{true};
-// BF16 path defaults OFF (T4/sm_75 has no BF16 cores). The CUDA kernel checks
-// fp16 first; BF16 is strictly opt-in (the Trainer enables it only after
-// probing sm_80+). Mirrors cuda/kernels.cu g_bf16_gemm below.
+
 static std::atomic<bool> g_gemm_bf16{false};
 static std::atomic<float> g_moe_jitter{0.0f};
 static std::atomic<u64> g_jitter_seed{0};
@@ -77,9 +72,6 @@ void set_gemm_bf16(bool on) {
 
 bool gemm_bf16_enabled() { return g_gemm_bf16.load(std::memory_order_relaxed); }
 
-// PERF: fp16 fast-path engagement threshold on M*N*K (default 1M). Below it
-// the f32->f16 conversion traffic costs more than the tensor-core win —
-// this is why M==1 decode projections decode in fp32 by design, not by bug.
 static std::atomic<i64> g_mnk_threshold{1024LL * 1024LL};
 void set_gemm_fp16_mnk_threshold(i64 mnk) {
     if (mnk < 0) mnk = 0;
@@ -87,7 +79,6 @@ void set_gemm_fp16_mnk_threshold(i64 mnk) {
 }
 i64 gemm_fp16_mnk_threshold() { return g_mnk_threshold.load(std::memory_order_relaxed); }
 
-// PERF telemetry: relaxed atomics, negligible overhead (~ns).
 static std::atomic<u64> g_perf_gemm{0};
 static std::atomic<u64> g_perf_fp16{0};
 static std::atomic<u64> g_perf_h2d{0};
@@ -244,9 +235,8 @@ void split_qkv(Device dev, const float* qkv, float* q, float* k, float* v,
 
 void linear_backward(Device dev, const float* x, const float* w, const float* dy,
                      float* dx, float* dw, int M, int K, int N) {
-    // Two GEMMs inside (dx and dw) — count both so the counter reflects
-    // launched work, matching what Nsight would show.
-    g_perf_gemm.fetch_add(2, std::memory_order_relaxed);
+
+    g_perf_gemm.fetch_add((dx ? 1u : 0u) + (dw ? 1u : 0u), std::memory_order_relaxed);
     GAI_DISPATCH(dev, linear_backward(x, w, dy, dx, dw, M, K, N));
 }
 
@@ -263,8 +253,7 @@ void scale_inplace(Device dev, float* a, float s, i64 n) {
 }
 
 void zero(Device dev, float* a, i64 n) {
-    // DeepSeek fail-fast: n<=0 is a valid no-op, but null with n>0 hides a
-    // missing grad scratch (stale Activations) -> silent wrong training.
+
     if (n <= 0) return;
     GAI_CHECK(a != nullptr, "ops::zero on null pointer (missing scratch?)");
 #ifdef GAI_CUDA
@@ -446,10 +435,6 @@ void attention_decode_ex(Device dev,
     cpu::attention_decode_ex(q, kc, vc, out, H, KV, hd, cur_len, max_len, scale, scratch, window);
 }
 
-// MoE has CPU + CUDA backends only (T4-only build).
-// Telemetry: a steady_clock read per dispatch (~20ns) is invisible next to a
-// per-layer expert launch, and it is what makes launch storms observable in
-// the training log instead of only in Nsight.
 void moe_forward(Device dev,
                  const float* x, const float* router_w,
                  const float* gates, const float* ups, const float* downs,
@@ -484,8 +469,7 @@ void moe_forward_bias(Device dev,
                       float* s_gate, float* s_up, float* s_act,
                       i64 N, int d, int E, int ne, int K) {
     if (!router_bias) {
-        // Delegates to moe_forward, which already counts itself: do not note
-        // here or the decode/aux-free path would double-count.
+
         moe_forward(dev, x, router_w, gates, ups, downs, sh_g, sh_u, sh_d, out,
                     probs_cache, idx_cache, w_cache, s_gate, s_up, s_act, N, d, E, ne, K);
         return;
@@ -577,8 +561,7 @@ void softmax_cross_entropy(Device dev, const float* logits, const i32* targets,
                            float* dlogits, i64 n, int V,
                            double* out_loss_sum, i64* out_count,
                            float z_scale) {
-    // Hand-rolled dispatch (not GAI_DISPATCH): the timer note must fire on
-    // BOTH the CUDA and CPU paths, and the macro returns early on CUDA.
+
     Timer t;
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
@@ -592,8 +575,6 @@ void softmax_cross_entropy(Device dev, const float* logits, const i32* targets,
     perf_note_sce(static_cast<u64>(t.elapsed_us()));
 }
 
-// Device-side accumulate API. The timer note fires per accumulate call
-// (it measures dispatch+kernel time, not the deferred reduction).
 void sce_acc_begin(Device dev) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
@@ -632,7 +613,6 @@ void sce_acc_end(Device dev, double* out_loss_sum, i64* out_count) {
     cpu::sce_acc_end(out_loss_sum, out_count);
 }
 
-// On-device slot counting for the aux-free bias (zero D2H per layer).
 void moe_count_slots(Device dev, const i32* idx, float* acc, i64 NK, int ne) {
 #ifdef GAI_CUDA
     if (dev == Device::CUDA) {
@@ -683,5 +663,5 @@ double global_sq_norm_multi(Device dev,
     return cpu::global_sq_norm_multi(parts);
 }
 
-} // namespace ops
-} // namespace gai
+}
+}

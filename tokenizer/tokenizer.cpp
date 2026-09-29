@@ -5,10 +5,10 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 
 namespace gai {
 
-// ---------------------------------------------------------------- specials
 const std::vector<std::string>& special_token_strings() {
     static const std::vector<std::string> s = {
         "<pad>", "<s>", "</s>", "<unk>",
@@ -19,10 +19,9 @@ const std::vector<std::string>& special_token_strings() {
     return s;
 }
 
-static constexpr u32 GTOK_MAGIC   = 0x4B4F5447u;  // "GTOK"
+static constexpr u32 GTOK_MAGIC   = 0x4B4F5447u;
 static constexpr u32 GTOK_VERSION = 1u;
 
-// ---------------------------------------------------------------- build
 void Tokenizer::init_empty(const NormalizerConfig& ncfg) {
     vocab_.clear();
     token_ids_.clear();
@@ -43,6 +42,8 @@ void Tokenizer::build(const std::vector<std::string>& vocab,
 
     merges_.clear();
     merges_.reserve(merges.size() * 2);
+    std::unordered_set<i32> merged_ids;
+    merged_ids.reserve(merges.size());
     for (size_t r = 0; r < merges.size(); ++r) {
         auto itl = token_ids_.find(merges[r].first);
         auto itr = token_ids_.find(merges[r].second);
@@ -52,6 +53,15 @@ void Tokenizer::build(const std::vector<std::string>& vocab,
         u64 key = (static_cast<u64>(static_cast<u32>(itl->second)) << 32) |
                    static_cast<u32>(itr->second);
         merges_[key] = {static_cast<i32>(r), itm->second};
+        merged_ids.insert(itm->second);
+    }
+
+    for (size_t i = 0; i < vocab_.size(); ++i) {
+        const std::string& t = vocab_[i];
+        if (t.size() > 9 && t.compare(0, 9, "<|unused") == 0 &&
+            merged_ids.find(static_cast<i32>(i)) == merged_ids.end()) {
+            token_ids_.erase(t);
+        }
     }
     cache_.clear();
 }
@@ -63,9 +73,7 @@ void Tokenizer::finalize_index() {
 }
 
 std::vector<std::pair<std::string, std::string>> Tokenizer::merge_pairs_ordered() const {
-    // Invert merges_ (keyed by (left<<32|right) -> (rank, merged)) into a
-    // rank-ordered list of string pairs. Ranks may have gaps (build() skips
-    // pairs whose strings are missing from vocab), so size by max rank.
+
     i32 max_rank = -1;
     for (const auto& [key, val] : merges_) {
         if (val.first > max_rank) max_rank = val.first;
@@ -88,7 +96,6 @@ std::vector<std::pair<std::string, std::string>> Tokenizer::merge_pairs_ordered(
     return out;
 }
 
-// ---------------------------------------------------------------- BPE core
 namespace {
 struct Node {
     i32 id;
@@ -98,12 +105,12 @@ struct Node {
 };
 struct Cand {
     i32 rank;
-    int pos;       // index of the left node
+    int pos;
     i32 merged;
     int left_id;
     int right_id;
     bool operator<(const Cand& o) const {
-        if (rank != o.rank) return rank > o.rank;   // min-heap on rank
+        if (rank != o.rank) return rank > o.rank;
         return pos > o.pos;
     }
 };
@@ -114,7 +121,6 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
     GAI_CHECK(piece.size() <= static_cast<size_t>(std::numeric_limits<int>::max()),
               "tokenizer chunk exceeds int range");
 
-    // Whole-chunk fast path
     auto whole = token_ids_.find(piece);
     if (whole != token_ids_.end() && whole->second >= special::COUNT) {
         out.push_back(whole->second);
@@ -173,19 +179,17 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
         if (nodes[static_cast<size_t>(i)].alive) ids.push_back(nodes[static_cast<size_t>(i)].id);
     }
 
-    // On overflow evict a random 1/8 instead of a wholesale clear (avoids a
-    // spike every 200k unique chunks (EN lake). Evict a random 1/8 instead
-    // so hot entries survive; amortized O(1) instead of cliff.
     if (cache_.size() >= cache_limit_) {
-        size_t drop = cache_.size() / 8 + 1;
-        auto it = cache_.begin();
-        while (drop-- > 0 && it != cache_.end()) it = cache_.erase(it);
+        size_t n = 0;
+        for (auto it = cache_.begin(); it != cache_.end();) {
+            if ((n++ % 8) == 0) it = cache_.erase(it);
+            else ++it;
+        }
     }
     cache_.emplace(piece, ids);
     out.insert(out.end(), ids.begin(), ids.end());
 }
 
-// ---------------------------------------------------------------- encode
 std::vector<i32> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos) const {
     std::vector<i32> out;
     if (add_bos) out.push_back(special::BOS);
@@ -230,7 +234,6 @@ std::vector<i32> Tokenizer::encode_with_specials(const std::string& text) const 
     return out;
 }
 
-// ---------------------------------------------------------------- decode
 const std::string& Tokenizer::token_text(i32 id) const {
     static const std::string empty;
     if (id < 0 || id >= static_cast<i32>(vocab_.size())) return empty;
@@ -256,15 +259,14 @@ std::string Tokenizer::decode(const std::vector<i32>& ids, bool skip_special) co
 
 std::string Tokenizer::Stream::push(i32 id) {
     buf_ += tk_.token_text(id);
-    // emit the longest prefix that is complete UTF-8
+
     size_t safe = 0, i = 0;
     while (i < buf_.size()) {
         int len = utf8_seq_len(static_cast<u8>(buf_[i]));
-        // A lone continuation (len==0) is NOT complete: buffer it until the
-        // head byte arrives (else split codepoints / mojibake).
+
         if (len == 0) break;
         if (i + static_cast<size_t>(len) > buf_.size()) break;
-        // Validate continuations: E2 28 A1 must not count as complete.
+
         bool ok = true;
         for (int k = 1; k < len; ++k) {
             if ((static_cast<u8>(buf_[i + static_cast<size_t>(k)]) & 0xC0) != 0x80) {
@@ -282,8 +284,7 @@ std::string Tokenizer::Stream::push(i32 id) {
 }
 
 std::string Tokenizer::Stream::flush() {
-    // Never emit a raw incomplete tail.
-    // Complete tail passes through; truncated tail becomes U+FFFD.
+
     if (buf_.empty()) return {};
     std::string s;
     if (utf8_is_complete(buf_)) s = buf_;
@@ -292,7 +293,6 @@ std::string Tokenizer::Stream::flush() {
     return s;
 }
 
-// ---------------------------------------------------------------- io
 template <typename T>
 static void wr(std::ostream& o, const T& v) { o.write(reinterpret_cast<const char*>(&v), sizeof(T)); }
 template <typename T>
@@ -309,14 +309,12 @@ void Tokenizer::save(const std::string& path) const {
     u32 nvocab = static_cast<u32>(vocab_.size());
     wr(f, nvocab);
 
-    // vocab blob
     for (const auto& t : vocab_) {
         u32 len = static_cast<u32>(t.size());
         wr(f, len);
         f.write(t.data(), static_cast<std::streamsize>(len));
     }
 
-    // merges, sorted by rank so load order is deterministic
     std::vector<std::pair<i32, u64>> ordered;
     ordered.reserve(merges_.size());
     for (const auto& [key, val] : merges_) ordered.emplace_back(val.first, key);
@@ -354,9 +352,7 @@ bool Tokenizer::load(const std::string& path) {
         if (len && !f.read(t.data(), static_cast<std::streamsize>(len))) return false;
         vocab_.push_back(std::move(t));
     }
-    // bpe_chunk assumes byte fallback vocab[16+i] == single byte i
-    // (id = 16+byte). A custom/truncated/reordered .gtok silently produced
-    // wrong ids + token_text "" -> data loss. Enforce the invariant on load.
+
     if (vocab_.size() < static_cast<size_t>(special::COUNT) + 256) return false;
     for (int b = 0; b < 256; ++b) {
         const std::string& t = vocab_[static_cast<size_t>(special::COUNT) + b];
@@ -381,7 +377,6 @@ bool Tokenizer::load(const std::string& path) {
     return true;
 }
 
-// ---------------------------------------------------------------- fertility
 Tokenizer::Fertility Tokenizer::measure(const std::vector<std::string>& lines) const {
     Fertility f;
     for (const auto& line : lines) {
@@ -389,7 +384,7 @@ Tokenizer::Fertility Tokenizer::measure(const std::vector<std::string>& lines) c
         std::vector<i32> ids = encode(line);
         f.tokens += ids.size();
         f.bytes  += line.size();
-        // whitespace word count
+
         bool in_word = false;
         size_t i = 0;
         while (i < line.size()) {
@@ -404,4 +399,4 @@ Tokenizer::Fertility Tokenizer::measure(const std::vector<std::string>& lines) c
     return f;
 }
 
-} // namespace gai
+}

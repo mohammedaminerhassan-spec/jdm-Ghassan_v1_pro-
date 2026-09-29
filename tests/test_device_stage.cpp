@@ -1,9 +1,3 @@
-// Regression: staging a device-resident [rows, cols] f32 tensor to the host in
-// bounded row blocks. `ghassan-ai logits` read Model::forward() output directly
-// from the host; on CUDA that memory is on the device and the read segfaulted,
-// so the command only ever worked on CPU. This test pins the BLOCK MATH (the
-// part that can silently drop the tail of a row or read past the end) by
-// forcing many blocks, a partial last block, and a row wider than the budget.
 #include "core/device.h"
 
 #include <cmath>
@@ -40,7 +34,7 @@ static void test_single_block() {
 }
 
 static void test_many_blocks_exact() {
-    // 17 rows x 33 cols with a 256-byte budget -> many partial blocks.
+
     const i64 rows = 17, cols = 33;
     const std::vector<float> src = ramp(rows, cols);
     std::vector<float> out;
@@ -50,8 +44,7 @@ static void test_many_blocks_exact() {
 }
 
 static void test_row_wider_than_budget() {
-    // One row of 4096 floats is 16 KiB; budget it at 64 bytes so rows_per_block
-    // must clamp to 1 instead of truncating the row.
+
     const i64 rows = 4, cols = 4096;
     const std::vector<float> src = ramp(rows, cols);
     std::vector<float> out;

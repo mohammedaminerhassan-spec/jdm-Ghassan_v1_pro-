@@ -1,25 +1,5 @@
 #!/usr/bin/env bash
-# kaggle/build_english_data.sh — English-Pro shards from chat_if parquet
-# (Ghassan v1 English-Pro: 350k deduped multi-turn EN convos).
-#
-# Inputs (Kaggle dataset, attach it to the notebook/session):
-#   english_parquet/english_chat_part*.parquet        (~3.0GB, 298k rows)
-#   english_parquet/english_instruction_part*.parquet (~126MB, 51k rows)
-#   english_parquet/manifest.json                     (optional, informational only —
-#     some Kaggle uploads drop it; the build globs *.parquet and never reads it)
-#   => mount under /kaggle/input/<dataset>/ or pass EN_PARQUET_DIR=<path>
-#
-# Tokenizer: artifacts/tokenizer/english32k.gtok SHIPS in the repo zip
-# (trained --keep-case on chat_if; vocab 32000). Never rebuild it on Kaggle.
-#
-# Output: artifacts/shards_en/train_english_{chat,instruction}_*.gbin
-#   (matches configs/flash_480m_single.yaml + sft_flash_480m_single.yaml mix — preflight verified)
-#
-# Shard recipe is seq_len 1024 (long convos are WINDOW-SPLIT, never truncated).
-# All filtering is English-tuned: --style-mode en --keep-case.
-#
-# Requirements: build with Arrow (bash configs/kaggle/setup.sh --with-parquet).
-# Usage: bash configs/kaggle/build_english_data.sh [EN_PARQUET_DIR]
+
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -30,8 +10,7 @@ SHARD_SEQ_LEN=1024
 
 EN_DIR="${1:-${EN_PARQUET_DIR:-}}"
 if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
-    # maxdepth 8: same deep-nesting contract as setup.sh find_english_lake
-    # (dataset uploads like .../Users/<name>/Desktop/english_parquet).
+
     hit=""
     hit="$(find /kaggle/input -maxdepth 8 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)"
     if [[ -n "${hit}" ]]; then
@@ -44,12 +23,7 @@ if [[ -z "${EN_DIR}" && -d "/kaggle/input" ]]; then
         fi
     fi
 fi
-# Local fallbacks (in order):
-#   1. dataset/english_parquet (vendored in THIS checkout, 522k chat + 478k inst)
-#   2. ./english_parquet (prebuilt lake)
-#   3. kaggle_upload/english_parquet (vendored inside the project zip)
-# FIX P2: the script never searched dataset/english_parquet although the lake
-# ships there in this checkout, forcing a manual EN_PARQUET_DIR every time.
+
 if [[ -z "${EN_DIR}" || ! -d "${EN_DIR}" ]]; then
     if [[ -n "$(find "${REPO_DIR}/dataset/english_parquet" -maxdepth 1 -name 'english_chat_part*.parquet' 2>/dev/null | head -n 1)" ]]; then
         EN_DIR="${REPO_DIR}/dataset/english_parquet"
@@ -78,7 +52,6 @@ echo "  Ghassan English-Pro — parquet -> shards"
 echo "  lake: ${EN_DIR}"
 echo "============================================================"
 
-# ---- tokenizer gate (32k keep-case, never silent 16k/darija fallback)
 TOK_VOCAB=$("${BIN}" tok-info --tokenizer "${TOK}" 2>/dev/null | grep -oE 'vocab_size=[0-9]+' | cut -d= -f2 || true)
 [[ "${TOK_VOCAB}" == "32000" ]] || { echo "[ERROR] tokenizer vocab=${TOK_VOCAB:-?}, need 32000."; exit 1; }
 echo "[tok] ok: ${TOK} (vocab 32000, keep-case)"
@@ -101,13 +74,6 @@ echo "[2/2] english_instruction -> ${SHARD_EN} ..."
     --shard-tokens 50000000 --seq-len "${SHARD_SEQ_LEN}" \
     --report "${SHARD_EN}/report_instruction.txt"
 
-# ---- [3/3] behavior seasoning: authored persona/discipline dialogues --------
-# The Hermes lake teaches knowledge, not persona. These ~15k authored
-# conversations (greetings, honesty, refusal, neutrality, dialogue flow) are
-# what make the model behave like Ghassan instead of generic Hermes output.
-# Small on purpose (~2M tokens): seasoning, not the meal. SFT samples it at
-# 0.15 (see sft_flash_480m_single.yaml mix); pretrain ignores it (lake dominates there).
-# Set SKIP_BEHAVIOR=1 to skip (not recommended for the English-Pro model).
 BEHAVIOR_N="${BEHAVIOR_N:-15000}"
 if [[ "${SKIP_BEHAVIOR:-0}" == "1" ]]; then
     echo ""

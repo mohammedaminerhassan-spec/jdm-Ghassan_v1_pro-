@@ -8,8 +8,6 @@
 
 namespace gai {
 
-// Contiguous per-layer KV cache. Layout per layer: [max_len, num_kv_heads, head_dim]
-// which is exactly what the attention kernels expect, so no reshaping at decode time.
 class KVCache {
 public:
     KVCache() = default;
@@ -103,4 +101,4 @@ private:
     int start_   = 0;
 };
 
-} // namespace gai
+}

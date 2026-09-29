@@ -1,10 +1,3 @@
-// F-23 / F-14 regression: the arithmetic-only memory plan must agree with a
-// real Model, and the fp16 accounting must include the per-layer fused QKV
-// cache that the runtime guard previously omitted.
-//
-// Without this cross-check the duplication between Model::count_parameters()
-// and the Model constructor could silently drift, which would make
-// `gai_train --dry-run` lie exactly when it matters most (before a 4xT4 run).
 #include "model/model.h"
 #include "core/config.h"
 
@@ -42,10 +35,7 @@ static void check_config(const ModelConfig& cfg, const char* label) {
 }
 
 int main() {
-    // ---- the shipped production recipes, straight from configs/ ------------
-    // Loading a 1B model on CPU is exactly what F-23 avoids, so only the
-    // arithmetic path is checked at production size; the equivalence is proven
-    // on the small configs below.
+
     static const char* kConfigs[] = {
         "configs/flash_480m_single.yaml", "configs/pro_1b_single.yaml", "configs/pro_1b_4xt4_legacy.yaml",
         "configs/flash_480m_ollama_compat.yaml", "configs/pro_1b_auxfree_research.yaml", "configs/sft_flash_480m_single.yaml",
@@ -62,24 +52,23 @@ int main() {
         cfg.validate();
         const u64 params = Model::count_parameters(cfg);
         const Model::MemoryPlan plan =
-            Model::plan_memory(cfg, 1, 512, true, 4, /*fp16_cache=*/true);
+            Model::plan_memory(cfg, 1, 512, true, 4, true);
         CHECK(params > 0, std::string(path) + ": parameter count is positive");
         CHECK(plan.fp16_cache > 0, std::string(path) + ": fp16 cache is accounted");
         CHECK(plan.total > plan.static_total,
               std::string(path) + ": activations contribute to the total");
-        // The fp16 cache must cover every 2-D parameter AND the fused QKV cache.
+
         const size_t fused_only =
             static_cast<size_t>(cfg.num_layers) *
             static_cast<size_t>(cfg.q_dim() + 2 * cfg.kv_dim()) *
             static_cast<size_t>(cfg.hidden_size) * sizeof(u16);
         CHECK(Model::count_fp16_cache_bytes(cfg) > fused_only,
               std::string(path) + ": fp16 cache includes the fused QKV cache (F-14)");
-        // A sane upper bound: the cache can never exceed the fp32 weights.
+
         CHECK(Model::count_fp16_cache_bytes(cfg) <= plan.weights,
               std::string(path) + ": fp16 cache does not exceed the fp32 weights");
     }
 
-    // ---- equivalence on small models we CAN actually instantiate ----------
     {
         ModelConfig dense;
         dense.vocab_size = 64;
@@ -112,7 +101,6 @@ int main() {
         check_config(qk, "dense+qknorm");
     }
 
-    // ---- F-14: the runtime accounting now matches the arithmetic -----------
     {
         ModelConfig cfg;
         cfg.vocab_size = 64;
@@ -135,7 +123,6 @@ int main() {
               "F-14: the fused QKV cache is included in the runtime figure");
     }
 
-    // ---- F-16: the workspace plan is sane for the T4 recipe ---------------
     {
         ModelConfig big;
         big.vocab_size = 32000;
@@ -154,18 +141,16 @@ int main() {
         big.moe_aux_free = true;
         big.tie_embeddings = true;
         const Model::MemoryPlan plan = Model::plan_memory(big, 1, 512, true, 4, false);
-        // ~1B params => ~3.8 GiB weights + grads, +4 B/param Lion state.
+
         CHECK(plan.params > 900000000ULL && plan.params < 1200000000ULL,
               "a 1B-class recipe prices at ~1B parameters without allocating it");
-        // The whole point of the plan: price the recipe BEFORE allocating it and
-        // see that a single 16 GB T4 can hold it with >=10% headroom.
+
         const size_t t4 = 15360ULL * 1024ULL * 1024ULL;
         CHECK(plan.total * 10 <= t4 * 9,
               "the 1B T4 recipe is predicted to fit in 16 GB with >=10% headroom: " +
                   human_bytes(plan.total));
     }
 
-    // ---- F-16: workspace pre-sizing covers the allocation sites ------------
     {
         ModelConfig cfg;
         cfg.vocab_size = 32000;
@@ -184,30 +169,29 @@ int main() {
         const Model::WorkspacePlan wsp = Model::workspace_plan(cfg, B, T);
         const u64 N = static_cast<u64>(B) * T;
         const u64 NK = N * 2;
-        // Forward site in cuda/moe.cu: N*ne + 2*NK + 3*NK*E + NK*d floats.
+
         const u64 fwd_floats = N * 8 + 2 * NK + 3 * NK * 768 + NK * 768;
         CHECK(wsp.moe_bytes >= 4 * fwd_floats,
               "F-16: the MoE pool covers the forward call site");
-        // Backward site: 6*N*E + NK + 4*NK*E + 2*NK*d + NK + N*ne floats.
+
         const u64 bwd_floats =
             6 * N * 768 + NK + 4 * NK * 768 + 2 * NK * 768 + NK + N * 8;
         CHECK(wsp.moe_bytes >= 4 * bwd_floats,
               "F-16: the MoE pool covers the backward call site");
-        // GEMM pool: largest fp16 conversion pair (lm_head N*d + d*V).
+
         const u64 conv = 2 * (N * 768 + 768 * 32000);
         CHECK(wsp.gemm_bytes >= conv,
               "F-16: the GEMM pool covers the largest fp16 conversion");
-        // Monotonicity: a bigger (B,T) never plans smaller pools.
+
         const Model::WorkspacePlan small = Model::workspace_plan(cfg, 1, 512);
         CHECK(wsp.gemm_bytes >= small.gemm_bytes && wsp.moe_bytes >= small.moe_bytes,
               "F-16: workspace plans grow monotonically with (B,T)");
-        // Dense models need no MoE pool.
+
         ModelConfig dense = cfg;
         dense.use_moe = false;
         CHECK(Model::workspace_plan(dense, B, T).moe_bytes == 0,
               "F-16: dense models plan no MoE workspace");
     }
-
 
     if (failures == 0) {
         std::cout << "test_memory_plan: ALL PASS\n";

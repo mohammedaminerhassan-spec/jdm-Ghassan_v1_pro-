@@ -16,9 +16,7 @@ const char* device_name(Device d) {
 }
 
 i64 numel_of(const std::vector<i64>& shape) {
-    // DeepSeek-style hardening: signed overflow is UB and would allocate a
-    // tiny buffer then OOB-write. Saturate with a fail-fast cap (1T elements
-    // is far above any T4-safe tensor: 4TB f32).
+
     static constexpr i64 kMaxNumel = (1LL << 40);
     i64 n = 1;
     for (i64 s : shape) {
@@ -30,7 +28,6 @@ i64 numel_of(const std::vector<i64>& shape) {
     return n;
 }
 
-// ---------------------------------------------------------------- Storage
 Storage::Storage(size_t nbytes, Device dev, DType dt) : nbytes_(nbytes), device_(dev) {
     if (nbytes == 0) return;
     ptr_   = device_alloc(nbytes, dev, dt);
@@ -45,11 +42,17 @@ Storage::Storage(void* ptr, size_t nbytes, Device dev, std::shared_ptr<void> own
 }
 
 Storage::~Storage() {
-    if (owned_ && ptr_) device_free(ptr_, device_);
+
+    try {
+        if (owned_ && ptr_) device_free(ptr_, device_);
+    } catch (const std::exception& e) {
+        log_error(std::string("[storage] device_free failed in ~Storage: ") + e.what());
+    } catch (...) {
+        log_error("[storage] device_free failed in ~Storage with unknown exception");
+    }
     ptr_ = nullptr;
 }
 
-// ---------------------------------------------------------------- Tensor
 Tensor::Tensor(std::vector<i64> shape, DType dt, Device dev)
     : shape_(std::move(shape)), dtype_(dt), device_(dev) {
     numel_   = numel_of(shape_);
@@ -113,11 +116,9 @@ Tensor Tensor::clone() const {
 
 void Tensor::zero_() {
     if (!defined() || nbytes() == 0) return;
-    // External views are read-only by contract (mmap pages are PAGE_READONLY).
-    // Faulting here would be a SIGSEGV; fail fast with file:line instead.
+
     GAI_CHECK(!is_external(), "zero_ on read-only external view (mmap weight?)");
-    // Name the tensor in any device failure: a bare "cudaMemset: invalid
-    // argument" is unactionable (which of the 20+ buffers? which device?).
+
     try {
         device_memset_zero(data_ptr(), nbytes(), device_);
     } catch (const std::exception& e) {
@@ -155,4 +156,4 @@ std::string Tensor::describe() const {
     return ss.str();
 }
 
-} // namespace gai
+}

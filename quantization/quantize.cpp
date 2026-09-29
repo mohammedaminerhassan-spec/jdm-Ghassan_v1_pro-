@@ -3,20 +3,16 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 namespace gai {
 namespace quant {
 
-// ================================================================ float casts
 void f32_to_f16(const float* s, u16* d, i64 n) { for (i64 i = 0; i < n; ++i) d[i] = fp32_to_fp16(s[i]); }
 void f16_to_f32(const u16* s, float* d, i64 n) { for (i64 i = 0; i < n; ++i) d[i] = fp16_to_fp32(s[i]); }
 void f32_to_bf16(const float* s, u16* d, i64 n) { for (i64 i = 0; i < n; ++i) d[i] = fp32_to_bf16(s[i]); }
 void bf16_to_f32(const u16* s, float* d, i64 n) { for (i64 i = 0; i < n; ++i) d[i] = bf16_to_fp32(s[i]); }
 
-// ================================================================ Q8_0
-// symmetric, per-64 block, int8 range [-127, 127]
-// n may be any non-negative count: a partial tail block is zero-padded
-// (stats over the real elements only). dst must hold ceil(n / 64) blocks.
 void quantize_q8_0(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q8_0 element count must be non-negative");
     BlockQ8_0* out = static_cast<BlockQ8_0*>(dst);
@@ -25,7 +21,7 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q8_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q8_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-        // Zero the block when amax is non-finite (NaN/Inf weights).
+
         if (!std::isfinite(amax)) {
             out[b].scale = 0.0f;
             std::memset(out[b].q, 0, sizeof(out[b].q));
@@ -44,7 +40,7 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
         const float* x = src + full * Q8_BLOCK;
         float amax = 0.0f;
         for (i64 i = 0; i < rem; ++i) amax = std::max(amax, std::fabs(x[i]));
-        // Same NaN/Inf guard for the tail block (see above).
+
         if (!std::isfinite(amax)) {
             out[full].scale = 0.0f;
             std::memset(out[full].q, 0, sizeof(out[full].q));
@@ -79,10 +75,6 @@ void dequantize_q8_0(const void* src, float* dst, i64 n) {
     }
 }
 
-// ================================================================ Q4_0
-// symmetric, per-32 block, int4 range [-8, 7] stored as nibble+8 (GGML-compatible)
-// Partial tail block: stats over the real elements, padding nibbles are 8
-// (= value 0). dst must hold ceil(n / 32) blocks.
 void quantize_q4_0(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_0 element count must be non-negative");
     BlockQ4_0* out = static_cast<BlockQ4_0*>(dst);
@@ -91,10 +83,10 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
         const float* x = src + b * Q4_BLOCK;
         float amax = 0.0f;
         for (int i = 0; i < Q4_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-        // NaN/Inf guard (same contract as Q8_0 above).
+
         if (!std::isfinite(amax)) {
             out[b].scale = fp32_to_fp16(0.0f);
-            // 0x88 = zero value in Q4_0 nibble encoding (+8 offset per nibble).
+
             std::memset(out[b].q, 0x88, sizeof(out[b].q));
             continue;
         }
@@ -155,18 +147,13 @@ void dequantize_q4_0(const void* src, float* dst, i64 n) {
     }
 }
 
-// ================================================================ Q4_1
-// asymmetric (scale + min), per-32 block, uint4 range [0, 15]
-// Partial tail block: stats over the real elements, padding nibbles encode
-// value 0 under the block scale. dst must hold ceil(n / 32) blocks.
 void quantize_q4_1(const float* src, void* dst, i64 n) {
     GAI_CHECK(n >= 0, "q4_1 element count must be non-negative");
     BlockQ4_1* out = static_cast<BlockQ4_1*>(dst);
     const i64 full = n / Q4_BLOCK;
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q4_BLOCK;
-        // PRO-HARDEN: Q8_0/Q4_0 يحرسان NaN/Inf (zero-block) لكن Q4_1 كان
-        // يترك mn/mx=NaN تسمم البلوك كاملا وينتشر في GGUF. نفس المرآة هنا.
+
         bool bad = false;
         for (int i = 0; i < Q4_BLOCK; ++i)
             if (!std::isfinite(x[i])) { bad = true; break; }
@@ -191,6 +178,16 @@ void quantize_q4_1(const float* src, void* dst, i64 n) {
     const i64 rem = n % Q4_BLOCK;
     if (rem > 0) {
         const float* x = src + full * Q4_BLOCK;
+
+        bool bad = false;
+        for (i64 i = 0; i < rem; ++i)
+            if (!std::isfinite(x[i])) { bad = true; break; }
+        if (bad) {
+            out[full].scale = fp32_to_fp16(0.0f);
+            out[full].min = fp32_to_fp16(0.0f);
+            std::memset(out[full].q, 0, sizeof(out[full].q));
+            return;
+        }
         float mn = x[0], mx = x[0];
         for (i64 i = 1; i < rem; ++i) { mn = std::min(mn, x[i]); mx = std::max(mx, x[i]); }
         float scale = (mx - mn) / 15.0f;
@@ -235,7 +232,6 @@ void dequantize_q4_1(const void* src, float* dst, i64 n) {
     }
 }
 
-// ================================================================ tensor api
 bool is_quantizable(i64 numel, DType t) {
     int bs = dtype_block_size(t);
     return bs == 1 || (numel % bs == 0);
@@ -246,9 +242,6 @@ Tensor quantize(const Tensor& src, DType target) {
     GAI_CHECK(src.device() == Device::CPU, "quantize runs on CPU tensors");
     if (target == DType::F32) return src.clone();
 
-    // Non-multiples of the block size are zero-padded into the tail block
-    // (see the kernels above) instead of crashing; is_quantizable() remains
-    // for callers that prefer an f16 fallback for odd sizes (export paths).
     Tensor out(src.shape(), target, Device::CPU);
     const float* s = src.f32();
     const i64 n = src.numel();
@@ -298,6 +291,12 @@ QuantError measure_error(const Tensor& original, DType target) {
     const float* b = r.f32();
     double se = 0.0, sa = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
     for (i64 i = 0; i < e.numel; ++i) {
+
+        if (!std::isfinite(static_cast<double>(a[i])) ||
+            !std::isfinite(static_cast<double>(b[i]))) {
+            e.max_abs = std::numeric_limits<double>::infinity();
+            continue;
+        }
         double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
         se += d * d;
         sa += static_cast<double>(a[i]) * static_cast<double>(a[i]);
@@ -314,12 +313,13 @@ QuantError measure_error(const Tensor& original, DType target) {
 }
 
 const char* profile_description(const std::string& p) {
-    if (p == "fp32") return "full precision, 803 MB, reference quality";
-    if (p == "fp16") return "half precision everywhere, ~401 MB, no measurable quality loss";
-    if (p == "int8") return "Q8_0 weights, F32 norms, ~215 MB, negligible quality loss";
-    if (p == "int4") return "Q4_0 weights, Q8_0 embeddings, F32 norms, ~130 MB, small quality loss";
+
+    if (p == "fp32") return "full precision, ~200M ref 803 MB, reference quality";
+    if (p == "fp16") return "half precision everywhere, ~200M ref ~401 MB, no measurable quality loss";
+    if (p == "int8") return "Q8_0 weights, F32 norms, ~200M ref ~215 MB, negligible quality loss";
+    if (p == "int4") return "Q4_0 weights, Q8_0 embeddings, F32 norms, ~200M ref ~130 MB, small quality loss";
     return "unknown profile";
 }
 
-} // namespace quant
-} // namespace gai
+}
+}

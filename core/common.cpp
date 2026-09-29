@@ -82,23 +82,21 @@ std::string human_duration(double s) {
     return strfmt("%dd%02dh", int(s) / 86400, (int(s) % 86400) / 3600);
 }
 
-// FNV-1a 64. Stable across platforms/compilers (unlike std::hash), so a
-// checkpoint written on Kaggle Linux validates on any other host.
 u64 fingerprint_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) return 0;
-    u64 h = 1469598103934665603ULL;                 // FNV offset basis
+    u64 h = 1469598103934665603ULL;
     std::vector<char> buf(1 << 16);
     while (f) {
         f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
         std::streamsize got = f.gcount();
         for (std::streamsize i = 0; i < got; ++i) {
             h ^= static_cast<unsigned char>(buf[static_cast<size_t>(i)]);
-            h *= 1099511628211ULL;                    // FNV prime
+            h *= 1099511628211ULL;
         }
         if (got < static_cast<std::streamsize>(buf.size())) break;
     }
-    // 0 is reserved for "unknown", so never hand it back.
+
     return h ? h : 1ULL;
 }
 
@@ -122,4 +120,4 @@ void set_num_threads(int n) {
 #endif
 }
 
-} // namespace gai
+}

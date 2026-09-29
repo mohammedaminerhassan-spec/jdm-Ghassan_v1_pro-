@@ -8,30 +8,19 @@
 
 namespace gai {
 
-// ---------------------------------------------------------------- shard format
-//  .gbin :  magic "GBIN" | u32 version | u32 dtype(0=u16,1=u32) | u32 flags
-//           u64 n_tokens | u64 n_docs
-//           token stream (n_tokens elements)
-//           doc table: n_docs * u64 start offsets
-//           loss mask (optional, flags&1): n_tokens bytes
-//
-// Documents are stored back-to-back, each terminated by EOS. The loss mask lets
-// SFT shards supervise assistant spans only.
-constexpr u32 GBIN_MAGIC   = 0x4E494247u;   // "GBIN"
+constexpr u32 GBIN_MAGIC   = 0x4E494247u;
 constexpr u32 GBIN_VERSION = 1u;
 constexpr u32 GBIN_FLAG_MASK = 1u;
 
 struct ShardHeader {
     u32 magic   = GBIN_MAGIC;
     u32 version = GBIN_VERSION;
-    u32 dtype   = 0;     // 0 = u16 (vocab <= 65535), 1 = u32
+    u32 dtype   = 0;
     u32 flags   = 0;
     u64 n_tokens = 0;
     u64 n_docs   = 0;
 };
 
-// Writer used by the dataset pipeline. Call close() explicitly: the
-// destructor never writes a partial shard after an exception.
 class ShardWriter {
 public:
     ShardWriter(const std::string& path, int vocab_size, bool with_loss_mask);
@@ -47,21 +36,17 @@ private:
     std::string      path_;
     bool             u16_mode_;
     bool             with_mask_;
-    int              vocab_size_ = 0;   // range gate for add_document
+    int              vocab_size_ = 0;
     std::vector<u32> tokens_;
     std::vector<u8>  mask_;
     std::vector<u64> doc_offsets_;
     bool             closed_ = false;
 };
 
-// Reader: loads a shard into memory (shards are sized so this is cheap).
-// T4/Kaggle path: load_header() keeps only doc_offsets in RAM (~0.4MB per
-// 50M-token shard) and reads token windows from disk on demand, so 20+ shards
-// no longer pin GBs of CPU RAM. Use load() for small/val/test paths.
 class Shard {
 public:
     bool load(const std::string& path);
-    // Header-only open: reads magic+header+doc table, defers tokens/mask to disk.
+
     bool load_header(const std::string& path);
     bool is_streaming() const { return streaming_; }
 
@@ -73,17 +58,21 @@ public:
     }
     const std::string& path() const { return path_; }
 
-    i32 token(u64 i) const { return static_cast<i32>(tokens_[static_cast<size_t>(i)]); }
-    u8  mask(u64 i)  const { return mask_.empty() ? 1 : mask_[static_cast<size_t>(i)]; }
+    i32 token(u64 i) const {
+        GAI_CHECK(i < n_tokens(), "Shard::token index out of range (stale cursor?)");
+        return static_cast<i32>(tokens_[static_cast<size_t>(i)]);
+    }
+    u8  mask(u64 i)  const {
+        if (mask_.empty()) return 1;
+        GAI_CHECK(i < static_cast<u64>(mask_.size()), "Shard::mask index out of range");
+        return mask_[static_cast<size_t>(i)];
+    }
     u64 doc_end(u64 i) const;
     u64 doc_start_at(u64 doc_idx) const {
         return doc_idx < doc_offsets_.size() ? doc_offsets_[doc_idx] : 0;
     }
     u64 doc_index_of(u64 pos) const;
-    // Streaming read of [start, start+len) tokens (+mask when present).
-    // Returns false on IO error. Works in both modes (RAM path memcpys).
-    // FIX: streaming path reuses a cached fd per thread (was open+close per
-    // row: 256 opens/step -> GPU starvation that looked like a leak).
+
     bool read_window(u64 start, u64 len, std::vector<u32>& tok_out, std::vector<u8>& mask_out) const;
 
 private:
@@ -95,7 +84,6 @@ private:
     bool             streaming_ = false;
 };
 
-// ---------------------------------------------------------------- loader
 struct BatchSpec {
     int batch_size = 8;
     int seq_len    = 1024;
@@ -103,49 +91,35 @@ struct BatchSpec {
 };
 
 struct Batch {
-    std::vector<i32> ids;       // [B*T]
-    std::vector<i32> targets;   // [B*T], -100 where ignored
+    std::vector<i32> ids;
+    std::vector<i32> targets;
     std::vector<i32> segment_ids;
     int  B = 0, T = 0;
     i64  tokens_supervised = 0;
 };
 
-// One domain group for weighted mixture sampling.
-// Shards are named train_<domain>_*.gbin (pipeline --domain flag).
 struct DomainGroup {
     std::string domain;
     std::vector<Shard> shards;
     u64 total_tokens = 0;
-    double weight = 0.0;   // normalized to sum 1 over found groups
+    double weight = 0.0;
 };
 
-// Streams random windows out of a set of shards. Deterministic given a seed
-// and fully checkpointable (position + rng state).
 class DataLoader {
 public:
     DataLoader() = default;
 
-    // paths may be explicit files or a directory that is scanned for *.gbin
     bool open(const std::vector<std::string>& paths, BatchSpec spec, u64 seed);
     bool open_glob(const std::string& dir, const std::string& prefix, BatchSpec spec, u64 seed);
-    // Weighted mixture over train_<domain>_*.gbin groups. mix maps
-    // domain -> raw weight (need not sum to 1). Domains with no shards are
-    // skipped with a warning. Returns false when no domain shards were found
-    // (caller should fall back to open_glob legacy path).
+
     bool open_mix(const std::string& dir, const std::map<std::string, double>& mix,
                   BatchSpec spec, u64 seed);
 
     bool next(Batch& out);
     void skip_batches(i64 n);
-    // FIX P2 (DDP resume stall): fast_forward advances RNG + batches_ using
-    // only in-RAM doc metadata (no token read_window, no vector fills), so
-    // resuming at step 50k no longer replays GBs from disk. Bit-identical
-    // RNG consumption to next() because doc_end/n_tokens lookups are pure.
+
     void fast_forward(i64 n);
-    // DeepSeek DDP-resume rule: re-seed the stream (rank salt) without
-    // touching shards/spec, so a rank can rebuild its exact post-resume
-    // position as reseed(rank_seed)+skip(saved_batches) instead of inheriting
-    // rank0's RNG state (which repeated data on every rank).
+
     void reseed(u64 seed);
 
     u64 total_tokens() const { return total_tokens_; }
@@ -156,7 +130,6 @@ public:
     bool all_shards_have_mask() const;
     std::string mix_report() const;
 
-    // checkpointing (v5: includes RNG Box-Muller spare for bit-exact resume)
     struct State {
         u64 rng[4] = {0, 0, 0, 0};
         i64 batches = 0;
@@ -166,14 +139,11 @@ public:
     State get_state() const;
     void  set_state(const State& s);
 
-    // Set vocab size for token range validation (0 = no validation).
-    // When set, fill_from_shard/fill_packed_row check every token and
-    // GAI_FAIL on out-of-range (prevents silent OOB embedding reads).
     void set_vocab_size(int vocab_size) { vocab_size_ = vocab_size; }
 
 private:
-    std::vector<Shard> shards_;       // legacy uniform path (and val loader)
-    std::vector<DomainGroup> groups_; // mix path (train loader only)
+    std::vector<Shard> shards_;
+    std::vector<DomainGroup> groups_;
     bool use_mix_ = false;
     BatchSpec spec_;
     Rng  rng_;
@@ -182,18 +152,14 @@ private:
     i64  committed_batches_ = 0;
     State committed_state_{};
     bool pack_sequences_ = false;
-    int  vocab_size_ = 0;   // 0 = no token range validation
+    int  vocab_size_ = 0;
 
     State capture_current_state() const;
 
-    // Pick one window [B,T] from a single shard (shared by both paths).
-    // Returns false ONLY on storage read failure (never for short docs —
-    // those legitimately leave PAD tails). A failed window must never
-    // masquerade as an unsupervised row.
     bool fill_from_shard(const Shard& sh, Batch& out, int b);
     bool fill_packed_row(const Shard& sh, Batch& out, int b);
 };
 
 std::vector<std::string> list_shards(const std::string& dir, const std::string& prefix);
 
-} // namespace gai
+}

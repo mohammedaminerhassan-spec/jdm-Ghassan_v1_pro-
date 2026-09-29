@@ -1,52 +1,26 @@
-# Ghassan v1 Pro English — 4xT4 DDP recipe (sm_75, NCCL).
-# Unified 1B architecture: ~1.04B total / ~612M active (same as pro_1b_single.yaml).
-#   36 layers, 768 hidden, 12 heads, 4 KV heads, 8 experts top-4 + shared.
-# Multi-GPU English experiment. For the single-T4 flagship use
-# configs/flash_480m_single.yaml (480M) or configs/pro_1b_single.yaml (1B) via kaggle/train_1b.sh.
-# Run with kaggle/train_4xt4.sh (sets WORLD_SIZE=4, one rank per GPU).
-# Verified parameter math (tied lm_head, hd = 768/12 = 64):
-#   tok_emb  : 32000 x 768                        = 24,576,000
-#   per layer: attn 1,572,864 + moe 26,542,080 + norms 1,664 + qknorm 128
-#            = 28,122,880 (see Model::count_parameters; total ~1037M)
-#   36 layers + final_norm                         = ~1037M total
-# Active per token (top-4 of 8 + shared + full attention): ~612M (59%).
-#
-# T4 MEMORY (fp32 master, Lion, K=4, seq 512, per GPU): 4.15 + 4.15 + 4.15
-#   = 12.4GB + MoE caches + logits + NCCL buffers => ~14.5GB / 16GB.
-#   optimizer MUST be lion (AdamW OOMs). batch_size MUST be 1.
-#   seq_len 512 (not 1024). Scale with grad_accum and 4x DDP.
-#   DDP contract: global tokens/step = B*T*accum*world = 1*512*32*4 = 65,536
-#   (same family budget as pro_v1 single 1*512*128=65,536).
-#
-# T4 PRECISION: Turing has FP16 tensor cores (no BF16 cores), so
-#   precision=fp32 + gemm_fp16=true is the fast path.
-#
-# DATA: shared English lake shards (artifacts/shards_en, english32k keep-case).
-
 model:
-  vocab_size: 32000          # English keep-case BPE
+  vocab_size: 32000
   hidden_size: 768
   num_layers: 36
-  num_heads: 12              # head_dim 64, kernel-optimal
-  num_kv_heads: 4            # GQA group 3: 3x smaller KV cache
-  intermediate_size: 2240    # dense fallback only (unused when use_moe=true)
+  num_heads: 12
+  num_kv_heads: 4
+  intermediate_size: 2240
   max_seq_len: 4096
   rope_theta: 10000.0
   rms_eps: 1.0e-5
   tie_embeddings: true
   init_std: 0.02
   use_moe: true
-  num_experts: 8             # routed experts per layer
-  moe_top_k: 4               # 4 active + 1 shared = dense-MoE (~612M active)
-  moe_expert_dim: 1280       # 20x64 tensor-core aligned
+  num_experts: 8
+  moe_top_k: 4
+  moe_expert_dim: 1280
   moe_shared: true
-  moe_aux_scale: 0.01        # DeepSeek-style load-balance loss
-  moe_jitter: 0.01           # DeepSeek-V2 router exploration (train-only)
-  z_loss_scale: 0.0001       # router logit penalty (prevents explosion)
-  use_qk_norm: true          # per-head QK RMSNorm (MoE stability at 1B)
-  rope_scale: 1.0            # 1.0 off; 2.0 = 8k ctx via PI (YaRN-lite)
-  rope_yarn_mscale: 0.0      # 0=auto YaRN mscale
-  # => ~1.04B total, ~612M active per token (unified 1B arch, same as pro_v1)
+  moe_aux_scale: 0.01
+  moe_jitter: 0.01
+  z_loss_scale: 0.0001
+  use_qk_norm: true
+  rope_scale: 1.0
+  rope_yarn_mscale: 0.0
 
 tokenizer:
   path: artifacts/tokenizer/english32k.gtok
@@ -56,26 +30,26 @@ training:
   stage: pretrain
   device: cuda
   precision: fp32
-  gemm_fp16: true            # T4 FP16 tensor cores, fp32 masters + loss scaling
-  fp16_weight_cache: false   # 1B: cache ~2GB would push 14GB -> OOM; keep off
-  ce_chunks: 4               # pinned (was implicit default; saves ~100MB at T=512)
-  loss_scale_init: 8192      # MEASURED on T4: 16384 overflows on step 0-1 every run (one step wasted); 8192 is the stable level and the scaler still grows to 16384 after 2000 clean steps
-  loss_scale_max: 8192      # T4 ceiling: 16384 overflows here, never grow into it
+  gemm_fp16: true
+  fp16_weight_cache: false
+  ce_chunks: 4
+  loss_scale_init: 8192
+  loss_scale_max: 8192
   loss_scale_window: 2000
-  batch_size: 1              # T4 16GB: B=1 only for the 1B model
-  seq_len: 512               # 512 (not 1024): 1B only fits T4 with halved activations
-  grad_accum: 32             # 1*512*32*4GPUs = 65,536 global (== pro_v1 single)
+  batch_size: 1
+  seq_len: 512
+  grad_accum: 32
   max_steps: 0
   epochs: 2
   learning_rate: 3.0e-4
   min_lr_ratio: 0.1
-  warmup_steps: 1500         # 1B+Lion needs longer warmup (was 800, unstable)
-  optimizer: lion            # MANDATORY on T4 (AdamW OOMs at 1B)
+  warmup_steps: 1500
+  optimizer: lion
   scheduler: wsd
   sched_decay_frac: 0.2
   weight_decay: 0.1
   beta1: 0.9
-  beta2: 0.99                # lion default
+  beta2: 0.99
   eps: 1.0e-8
   grad_clip: 1.0
   ns_steps: 5
@@ -89,13 +63,11 @@ training:
   checkpoint_dir: artifacts/checkpoints/pro_1b_4xt4_legacy
   data_dir: artifacts/shards_en
   resume: auto
-  activation_checkpointing: false   # B==1: no effect, grad_accum does the work
+  activation_checkpointing: false
   ckpt_segments: 1
   pack_sequences: true
   output_budget_mb: 18432
-  ddp: true                  # 4x T4 data-parallel (NCCL) — for train_4xt4.sh only.
-                             # Single-GPU runs refuse DDP loudly; use
-                             # configs/flash_480m_single.yaml via kaggle/train_1b.sh instead.
+  ddp: true
 
 data:
   train_glob: artifacts/shards_en/train_*.gbin

@@ -1,16 +1,3 @@
-// F-11 / F-12 regression: the auxiliary-loss-free (DeepSeek-V3 Â§3.2) router
-// bias is optimizer-step-coupled control state.
-//
-//   F-11: when the optimizer refuses an update (non-finite grad norm) the bias
-//         must NOT move, and the counts of that step must not leak into the
-//         next step.
-//   F-12: the numerator and denominator of the per-layer load fraction must
-//         describe the SAME population. The old code divided raw routing counts
-//         by an externally supplied SUPERVISED-token count while the counts
-//         covered ALL routed tokens, so any SFT loss mask made the fractions sum
-//         to N/ntok instead of 1 and mis-scaled the bias. The denominator is
-//         now derived from the counts themselves (row_sum == routed slots),
-//         which makes the skew structurally impossible.
 #include "model/model.h"
 
 #include <cmath>
@@ -39,12 +26,11 @@ static ModelConfig test_config() {
     cfg.moe_top_k = 2;
     cfg.moe_expert_dim = 32;
     cfg.moe_shared = true;
-    cfg.moe_aux_scale = 0.0f;   // validate() requires this with aux_free
+    cfg.moe_aux_scale = 0.0f;
     cfg.moe_aux_free = true;
     return cfg;
 }
 
-// Reference load counts taken straight from the routing the model chose.
 static std::vector<double> routing_counts(const Activations& act, int B, int T,
                                           int ne, int K, int layer) {
     const size_t N = static_cast<size_t>(B) * static_cast<size_t>(T);
@@ -71,8 +57,6 @@ struct Micro {
     i64 ntok = 0;
 };
 
-// `keep_every` < 0 supervises every position, 0 supervises none, otherwise
-// only every (keep_every)-th position gets a target (what an SFT mask does).
 static Micro run_micro(Model& m, int B, int T, int keep_every, u32 salt) {
     Micro mb;
     mb.B = B;
@@ -97,23 +81,17 @@ int main() {
     const int ne = cfg.num_experts;
     const int K = cfg.moe_top_k;
     const int L = cfg.num_layers;
-    const double bias_lr = 0.001;               // Model::moe_bias_lr_
+    const double bias_lr = 0.001;
     const double target = static_cast<double>(K) / static_cast<double>(ne);
 
-    // ======================================================================
-    // 1. F-12: PARTIALLY MASKED (SFT-like) microbatches of different sizes.
-    //    The applied fraction must be the pooled routed-slot fraction, which
-    //    always sums to exactly 1 regardless of how many positions were
-    //    supervised. The old ntok-based denominator produced N/ntok here.
-    // ======================================================================
     {
         Model m(cfg, Device::CPU);
         m.init_weights(11);
         m.enable_grad(true);
         m.ensure_moe_bias();
 
-        Micro a = run_micro(m, 1, 8, 3, 1);    //  8 tokens, 1/3 supervised
-        Micro b = run_micro(m, 2, 4, 2, 2);    //  8 tokens, 1/2 supervised
+        Micro a = run_micro(m, 1, 8, 3, 1);
+        Micro b = run_micro(m, 2, 4, 2, 2);
         const int tokens = (a.B * a.T) + (b.B * b.T);
         const i64 supervised = a.ntok + b.ntok;
         CHECK(supervised > 0, "masked microbatches still supervise some tokens");
@@ -151,10 +129,6 @@ int main() {
               "F-11/F-12: the count accumulator is released after the step");
     }
 
-    // ======================================================================
-    // 2. F-11: a step the optimizer refused must leave the bias untouched and
-    //    must not leak its counts into the next step.
-    // ======================================================================
     {
         Model m(cfg, Device::CPU);
         m.init_weights(23);
@@ -162,7 +136,6 @@ int main() {
         m.ensure_moe_bias();
         const std::vector<std::vector<float>> zero = m.moe_bias_all();
 
-        // Step A: routed, then REJECTED (non-finite grad norm -> opt skipped).
         Micro rejected = run_micro(m, 1, 6, -1, 5);
         CHECK(rejected.ntok > 0, "rejected step was a real training step");
         CHECK(!m.moe_bias_acc_host().empty(), "rejected step still collected counts");
@@ -176,7 +149,6 @@ int main() {
         CHECK(m.moe_bias_acc_host().empty(),
               "F-11: rejected-step counts are dropped, not carried forward");
 
-        // Step B: accepted. Only THIS step's routing may influence the bias.
         Micro accepted = run_micro(m, 1, 5, -1, 9);
         const std::vector<double> cnt_b = routing_counts(accepted.act, accepted.B, accepted.T, ne, K, 0);
         m.apply_moe_bias_step(m.moe_bias_acc_host().data(), true);
@@ -190,17 +162,12 @@ int main() {
         }
     }
 
-    // ======================================================================
-    // 3. F-12: a FULLY masked microbatch is a true no-op. forward_backward
-    //    returns before routing when ntok==0, so such a step contributes no
-    //    counts and cannot skew the fractions of a later step.
-    // ======================================================================
     {
         Model m(cfg, Device::CPU);
         m.init_weights(31);
         m.enable_grad(true);
         m.ensure_moe_bias();
-        Micro masked = run_micro(m, 1, 7, 0, 4);   // no supervised position
+        Micro masked = run_micro(m, 1, 7, 0, 4);
         CHECK(masked.ntok == 0, "fully masked microbatch supervises nothing");
         CHECK(m.moe_bias_acc_host().empty(),
               "F-12: a fully masked microbatch contributes no routing counts");
@@ -211,9 +178,6 @@ int main() {
                 CHECK(bias[l][e] == 0.0f, "F-12: no bias drift from a fully masked step");
     }
 
-    // ======================================================================
-    // 4. Steering clamp + no-op contract.
-    // ======================================================================
     {
         Model m(cfg, Device::CPU);
         m.init_weights(43);

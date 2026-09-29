@@ -1,11 +1,5 @@
 #pragma once
 
-// English dialogue-behavior synthesizer: the English twin of SynthGenerator.
-// Composes authored English exchanges (dataset/english_dialogue_content.h) into
-// multi-turn conversations for SFT shards. No transliteration, no script
-// mixing — English is English. Every assistant turn must pass the
-// english_style_policy answer-discipline gate, so the generator can never emit
-// behavior the style filter would reject downstream.
 #include "dataset/darija_synthesis_engine.h"
 
 namespace gai {
@@ -19,20 +13,18 @@ struct EnglishSynthConfig {
     double p_greeting = 0.30;
     double p_correction = 0.07;
     double p_misunderstand = 0.06;
-    double p_governor = 0.10;    // controller exchanges (honesty, refusal, length)
-    double p_reasoning = 0.08;   // casual step-by-step chains
+    double p_governor = 0.10;
+    double p_reasoning = 0.08;
     double p_identity = 0.06;
     double p_followup = 0.45;
     double p_closer = 0.35;
     double p_backchannel = 0.15;
-    double p_filler = 0.12;      // filler prepended to an assistant turn
+    double p_filler = 0.12;
     bool   include_system = true;
     double p_system = 0.35;
     int    max_template_uses = 400;
     int    max_attempts_multiplier = 60;
-    // First-token entropy cap: no 2-word reply head may exceed this share.
-    // 0.10 (vs Darija's 0.06) because the authored English pool is smaller;
-    // still strict enough to force surface variety.
+
     double max_head_share = 0.10;
 };
 
@@ -56,5 +48,5 @@ private:
     SynthStats stats_;
 };
 
-} // namespace english_synth
-} // namespace gai
+}
+}

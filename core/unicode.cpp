@@ -2,7 +2,6 @@
 
 namespace gai {
 
-// ---------------------------------------------------------------- UTF-8
 int utf8_seq_len(u8 b) {
     if (b < 0x80) return 1;
     if ((b & 0xE0) == 0xC0) return 2;
@@ -30,7 +29,7 @@ u32 utf8_decode(const std::string& s, size_t& i) {
         if ((bk & 0xC0) != 0x80) { ++i; return 0xFFFD; }
         cp = (cp << 6) | (bk & 0x3Fu);
     }
-    // reject overlong / surrogates / out of range
+
     if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) ||
         (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
         ++i;
@@ -108,7 +107,7 @@ bool utf8_is_complete(const std::string& s) {
         int len = utf8_seq_len(b);
         if (len == 0) return false;
         if (i + static_cast<size_t>(len) > s.size()) return false;
-        // Continuation bytes must match 10xxxxxx, else the sequence is invalid.
+
         for (int k = 1; k < len; ++k) {
             if ((static_cast<u8>(s[i + static_cast<size_t>(k)]) & 0xC0) != 0x80)
                 return false;
@@ -118,23 +117,24 @@ bool utf8_is_complete(const std::string& s) {
     return true;
 }
 
-// ---------------------------------------------------------------- classification
 bool is_arabic_letter(u32 cp) {
-    if (cp >= 0x0621 && cp <= 0x063A) return true;          // hamza .. ghain
-    if (cp >= 0x0641 && cp <= 0x064A) return true;          // feh .. yeh
-    if (cp >= 0x066E && cp <= 0x06D3) return true;          // extended letters (incl. peh, gaf, veh)
+    if (cp == 0x0620) return true;
+    if (cp >= 0x0621 && cp <= 0x063A) return true;
+    if (cp >= 0x063B && cp <= 0x063F) return true;
+    if (cp >= 0x0641 && cp <= 0x064A) return true;
+    if (cp >= 0x066E && cp <= 0x06D3) return true;
     if (cp == 0x0671 || cp == 0x0672 || cp == 0x0673) return true;
     if (cp >= 0x06FA && cp <= 0x06FF) return true;
-    if (cp >= 0x0750 && cp <= 0x077F) return true;          // Arabic Supplement
-    if (cp >= 0x08A0 && cp <= 0x08BF) return true;          // Arabic Extended-A letters
+    if (cp >= 0x0750 && cp <= 0x077F) return true;
+    if (cp >= 0x08A0 && cp <= 0x08BF) return true;
     return false;
 }
 
 bool is_arabic_diacritic(u32 cp) {
-    if (cp >= 0x064B && cp <= 0x065F) return true;          // harakat + extras
-    if (cp == 0x0670) return true;                          // superscript alef
-    if (cp >= 0x06D6 && cp <= 0x06ED) return true;          // quranic marks
-    if (cp >= 0x08D3 && cp <= 0x08FF) return true;          // extended marks
+    if (cp >= 0x064B && cp <= 0x065F) return true;
+    if (cp == 0x0670) return true;
+    if (cp >= 0x06D6 && cp <= 0x06ED) return true;
+    if (cp >= 0x08D3 && cp <= 0x08FF) return true;
     return false;
 }
 
@@ -155,7 +155,7 @@ bool is_tatweel(u32 cp) { return cp == 0x0640; }
 
 bool is_latin_letter(u32 cp) {
     if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return true;
-    if (cp >= 0x00C0 && cp <= 0x024F) {                     // Latin-1 supp + extended A/B
+    if (cp >= 0x00C0 && cp <= 0x024F) {
         if (cp == 0x00D7 || cp == 0x00F7) return false;
         return true;
     }
@@ -203,9 +203,8 @@ bool is_arabizi_digit(u32 cp) {
     return cp == '2' || cp == '3' || cp == '5' || cp == '6' || cp == '7' || cp == '8' || cp == '9';
 }
 
-// ---------------------------------------------------------------- transforms
 u32 arabic_presentation_to_base(u32 cp) {
-    // Arabic Presentation Forms-B (FE70..FEFF): isolated/initial/medial/final glyphs.
+
     static const struct { u32 lo, hi, base; } fb[] = {
         {0xFE80, 0xFE80, 0x0621}, {0xFE81, 0xFE82, 0x0622}, {0xFE83, 0xFE84, 0x0623},
         {0xFE85, 0xFE86, 0x0624}, {0xFE87, 0xFE88, 0x0625}, {0xFE89, 0xFE8C, 0x0626},
@@ -223,7 +222,7 @@ u32 arabic_presentation_to_base(u32 cp) {
     if (cp >= 0xFE80 && cp <= 0xFEF4) {
         for (auto& e : fb) if (cp >= e.lo && cp <= e.hi) return e.base;
     }
-    if (cp >= 0xFEF5 && cp <= 0xFEFC) return 0x0644;   // lam-alef ligatures -> lam (alef added by caller)
+    if (cp >= 0xFEF5 && cp <= 0xFEFC) return 0x0644;
     return 0;
 }
 
@@ -235,10 +234,10 @@ u32 arabic_digit_to_ascii(u32 cp) {
 
 u32 fold_arabic_letter(u32 cp) {
     switch (cp) {
-        case 0x0622: case 0x0623: case 0x0625: case 0x0671: return 0x0627;  // آأإٱ -> ا
-        case 0x0649: return 0x064A;                                          // ى -> ي
-        case 0x0629: return 0x0647;                                          // ة -> ه
-        case 0x0624: case 0x0626: return 0x0621;                             // ؤئ -> ء
+        case 0x0622: case 0x0623: case 0x0625: case 0x0671: return 0x0627;
+        case 0x0649: return 0x064A;
+        case 0x0629: return 0x0647;
+        case 0x0624: case 0x0626: return 0x0621;
         default: return cp;
     }
 }
@@ -266,7 +265,6 @@ std::string to_lower_ascii(const std::string& s) {
     return out;
 }
 
-// ---------------------------------------------------------------- stats
 ScriptStats script_stats(const std::string& s) {
     ScriptStats st;
     size_t i = 0;
@@ -284,4 +282,4 @@ ScriptStats script_stats(const std::string& s) {
     return st;
 }
 
-} // namespace gai
+}
