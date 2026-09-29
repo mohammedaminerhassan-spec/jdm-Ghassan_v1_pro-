@@ -82,9 +82,12 @@ static void grp_ensure(size_t nk, int ne) {
         g_grp_grouped_cap = want;
     }
     if (ne > g_grp_ne_cap) {
-        if (g_grp_cnt) CU_CHECK(cudaFree(g_grp_cnt));
-        if (g_grp_cur) CU_CHECK(cudaFree(g_grp_cur));
-        if (g_grp_off) CU_CHECK(cudaFree(g_grp_off));
+        // [FIX] Null all three first so a partial cudaMalloc failure leaves them
+        // null (safe) rather than dangling.  Freed individually to avoid leaks.
+        if (g_grp_cnt) { CU_CHECK(cudaFree(g_grp_cnt)); g_grp_cnt = nullptr; }
+        if (g_grp_cur) { CU_CHECK(cudaFree(g_grp_cur)); g_grp_cur = nullptr; }
+        if (g_grp_off) { CU_CHECK(cudaFree(g_grp_off)); g_grp_off = nullptr; }
+        g_grp_ne_cap = 0;  // reset cap before alloc so a failure doesn't leave a stale cap
         gai::cuda::check_free_vram(sizeof(int) * (size_t)(ne + 1), "MoE group counters");
         CU_CHECK(cudaMalloc(&g_grp_cnt, sizeof(int) * (size_t)ne));
         CU_CHECK(cudaMalloc(&g_grp_cur, sizeof(int) * (size_t)(ne + 1)));

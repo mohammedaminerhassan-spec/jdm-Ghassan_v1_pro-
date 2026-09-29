@@ -1353,7 +1353,8 @@ void Trainer::run() {
                         "(max_steps/epochs/data changed) — past LR curve reshaped; "
                         "keep the original schedule to stay bit-consistent",
                         (long long)state_.sched_total, (long long)total_steps_));
-    }    if (state_.sched_warmup > 0 && state_.sched_warmup != cfg_.warmup_steps) {
+    }
+    if (state_.sched_warmup > 0 && state_.sched_warmup != cfg_.warmup_steps) {
         log_warn(strfmt("[sched] RESUME MISMATCH: checkpoint warmup %lld but now %lld",
                         (long long)state_.sched_warmup, (long long)cfg_.warmup_steps));
     }

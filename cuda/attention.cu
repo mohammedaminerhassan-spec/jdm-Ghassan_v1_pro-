@@ -112,7 +112,8 @@ __global__ void k_attn_fwd(const float* __restrict__ q, const float* __restrict_
         __syncwarp();
     }
 
-    const float inv = 1.0f / run_sum;
+    // [FIX] Guard against div/0 when all tokens are masked (run_sum==0 -> NaN/Inf cascade)
+    const float inv = (run_sum > 1e-30f) ? (1.0f / run_sum) : 0.0f;
     float* o = out + size_t(b) * qs + (size_t(t) * H + h) * hd;
     for (int c = lane; c < hd; c += WARP_A) o[c] = sAcc[c] * inv;
 
@@ -191,7 +192,8 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
         if (probs) probs[((size_t(b) * H + h) * T + t) * T + j] = p;
     }
     __syncwarp();
-    float inv = 1.0f / sum;
+    // [FIX] Guard against div/0 when sliding window excludes all tokens (sum==0)
+    float inv = (sum > 1e-30f) ? (1.0f / sum) : 0.0f;
     for (int c = lane; c < hd; c += WARP_A) o[c] = sAcc[c] * inv;
     if (probs) {
         float* pr = probs + ((size_t(b) * H + h) * T + t) * T;
