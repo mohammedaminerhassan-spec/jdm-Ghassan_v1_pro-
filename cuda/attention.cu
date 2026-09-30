@@ -317,7 +317,7 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     }
     const i64 mnk = (i64)M * N * K;
     const bool use_fp16 = fp16_gemm_enabled() && mnk >= ops::gemm_fp16_mnk_threshold();
-    cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+    cublasHandle_t h = reinterpret_cast<cublasHandle_t>(::gai::cuda::cublas_handle());
     // Mirror gemm()'s transpose swap: col-major C^T[N*M] = B^T * A^T.
     cublasOperation_t topA[1] = { tb ? CUBLAS_OP_T : CUBLAS_OP_N };
     cublasOperation_t topB[1] = { ta ? CUBLAS_OP_T : CUBLAS_OP_N };
@@ -325,7 +325,7 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     int ldaArr[1] = { ldaB }, ldbArr[1] = { ldaA }, ldcArr[1] = { ldaC };
     const void* alp[1] = { &alpha };
     const void* bet[1] = { &beta };
-    size_t gs[1] = { (size_t)nB };
+    int gs[1] = { nB };
     cublasStatus_t s;
     if (use_fp16) {
         // Mirror-convert the DENSE ranges once (flat: bitwise-identical to
@@ -340,22 +340,20 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
             Bh[i] = g_attn_mir + Aspan + (size_t)(B[i] - Brange);
             Ch[i] = C[i];
         }
-        cublasGemmAlgo_t algo[1] = { CUBLAS_GEMM_DEFAULT_TENSOR_OP };
         s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
                                        Ah.data(), CUDA_R_16F, ldaArr,
                                        Bh.data(), CUDA_R_16F, ldbArr, bet,
                                        Ch.data(), CUDA_R_32F, ldcArr,
-                                       CUBLAS_COMPUTE_32F, algo, 1, gs);
+                                       1, gs, CUBLAS_COMPUTE_32F);
     } else {
         std::vector<const void*> Ap(nB), Bp(nB);
         std::vector<void*> Cp(nB);
         for (int i = 0; i < nB; ++i) { Ap[i] = A[i]; Bp[i] = B[i]; Cp[i] = C[i]; }
-        cublasGemmAlgo_t algo[1] = { CUBLAS_GEMM_DEFAULT };
         s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
                                        Ap.data(), CUDA_R_32F, ldaArr,
                                        Bp.data(), CUDA_R_32F, ldbArr, bet,
                                        Cp.data(), CUDA_R_32F, ldcArr,
-                                       CUBLAS_COMPUTE_32F, algo, 1, gs);
+                                       1, gs, CUBLAS_COMPUTE_32F);
     }
     if (s != CUBLAS_STATUS_SUCCESS)
         GAI_FAIL(strfmt("attn grouped GEMM failed: status=%d M=%d N=%d K=%d nB=%d fp16=%d",
