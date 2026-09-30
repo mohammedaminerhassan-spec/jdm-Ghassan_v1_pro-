@@ -1,4 +1,5 @@
 #include "cuda/cuda_ops.h"
+#include "cuda/cuda_utils.h"
 #include "core/ops.h"
 
 #include <cuda_runtime.h>
