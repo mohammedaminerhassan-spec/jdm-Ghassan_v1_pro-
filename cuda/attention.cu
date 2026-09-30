@@ -359,8 +359,14 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
                                        1, gs, CUBLAS_COMPUTE_32F);
     }
     if (s != CUBLAS_STATUS_SUCCESS)
-        GAI_FAIL(strfmt("attn grouped GEMM failed: status=%d M=%d N=%d K=%d nB=%d fp16=%d",
-                        static_cast<int>(s), M, N, K, nB, use_fp16 ? 1 : 0));
+        GAI_FAIL(strfmt("attn grouped GEMM failed: status=%d ta=%d tb=%d M=%d N=%d K=%d "
+                        "ldaA=%d ldaB=%d ldaC=%d nB=%d fp16=%d alpha=%g beta=%g "
+                        "A0=%p B0=%p C0=%p handle=%p",
+                        static_cast<int>(s), ta ? 1 : 0, tb ? 1 : 0, M, N, K,
+                        ldaA, ldaB, ldaC, nB, use_fp16 ? 1 : 0,
+                        (double)alpha, (double)beta,
+                        nB > 0 ? A[0] : nullptr, nB > 0 ? B[0] : nullptr,
+                        nB > 0 ? (const void*)C[0] : nullptr, (const void*)h));
 }
 
 // Fused causal/window/segment softmax: reads scores S, writes normalized
