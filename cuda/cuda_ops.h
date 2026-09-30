@@ -155,6 +155,15 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
 void  free_workspace();
 void  moe_free_workspace();
 void  attn_free_dots();
+
+// Async phase timers for step-time attribution (stream-0 CUDA events; the
+// host never blocks until phase_report). Ring of start/stop pairs sized for
+// log_every<=40 at the largest recipes; single training thread assumed.
+void phase_start(int ph);
+void phase_stop(int ph);
+void phase_reset();
+void phase_shutdown();
+std::string phase_report();
 void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
 void  moe_reserve_workspace(size_t bytes);
 

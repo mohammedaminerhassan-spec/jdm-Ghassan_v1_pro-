@@ -50,6 +50,17 @@ void perf_note_sce(u64 us);
 void perf_note_opt_step(u64 us);
 void perf_note_muon_ns(int iters, u64 us);
 
+// Async phase timers for step-time attribution (which part of a training step
+// consumes wall time: attention vs MoE vs loader). CUDA path records stream-0
+// events (zero host blocking); CPU path is a no-op. Single training thread
+// per process is assumed (same contract as the rest of the engine).
+enum class TrainPhase : int { AttnFwd = 0, MoeFwd = 1, AttnBwd = 2, MoeBwd = 3, Load = 4 };
+void phase_start(Device dev, TrainPhase ph);
+void phase_stop(Device dev, TrainPhase ph);
+void phase_reset(Device dev);
+// Per-step totals since the last call (also resets). Empty on CPU.
+std::string phase_report(Device dev);
+
 void set_moe_jitter(float j);
 float moe_jitter();
 

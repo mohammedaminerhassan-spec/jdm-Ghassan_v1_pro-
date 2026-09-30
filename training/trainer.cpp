@@ -1195,14 +1195,16 @@ void Trainer::log_step(double loss, float lr, double gnorm, double dt, i64 ntok)
             if (qs.snapshot) ckpt_bytes += qs.snapshot->bytes();
         if (ckpt_active_) ckpt_bytes += ckpt_active_->bytes();
     }
+    // Phase attribution (ms/step per part; also resets the counters).
+    const std::string phases = ops::phase_report(model_.device());
     log_info(strfmt("step %6lld | loss %7.4f | ema %7.4f | ppl %8.2f | lr %.3e | gnorm %6.3f "
-                    "| %7.0f tok/s | %s | eta %s | sup %4.1f%% | ckptq %zu (%s) | perf [%s]",
+                    "| %7.0f tok/s | %s | eta %s | sup %4.1f%% | ckptq %zu (%s) | perf [%s] | %s",
                     static_cast<long long>(state_.step), loss, ema_loss_,
                     std::exp(std::min(20.0, ema_loss_)), lr, gnorm, tps,
                     human_count(static_cast<u64>(state_.tokens_seen)).c_str(),
                     human_duration(eta).c_str(), sup_frac * 100.0, ckpt_depth,
                     human_bytes(ckpt_bytes).c_str(),
-                    ops::perf_report().c_str()));
+                    ops::perf_report().c_str(), phases.c_str()));
 }
 
 double Trainer::opt_step(float lr, float grad_scale) {
@@ -1473,7 +1475,10 @@ void Trainer::run_pretrain() {
 
         for (int micro = 0; micro < cfg_.grad_accum; ++micro) {
 
-            if (!next_train_batch(batch)) {
+            ops::phase_start(model_.device(), ops::TrainPhase::Load);
+            const bool have_batch = next_train_batch(batch);
+            ops::phase_stop(model_.device(), ops::TrainPhase::Load);
+            if (!have_batch) {
                 GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
             }
 
@@ -1628,7 +1633,10 @@ void Trainer::run_sft() {
         int    micro_done = 0;
 
         for (int micro = 0; micro < cfg_.grad_accum; ++micro) {
-            if (!next_train_batch(batch)) {
+            ops::phase_start(model_.device(), ops::TrainPhase::Load);
+            const bool have_batch_sft = next_train_batch(batch);
+            ops::phase_stop(model_.device(), ops::TrainPhase::Load);
+            if (!have_batch_sft) {
                 GAI_FAIL("dataloader has no shards mid-run in " + cfg_.data_dir);
             }
 

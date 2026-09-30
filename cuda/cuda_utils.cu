@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace gai {
 namespace cuda {
@@ -173,6 +174,8 @@ void shutdown() {
     cuda_ops::free_workspace();
     cuda_ops::free_sampling_workspace();
     cuda_ops::moe_free_workspace();
+    cuda_ops::attn_free_dots();
+    cuda_ops::phase_shutdown();
 
     if (g_initialized) {
         cudaDeviceSynchronize();
@@ -182,5 +185,74 @@ void shutdown() {
     g_initialized = false;
 }
 
+}  // namespace cuda
+
+namespace cuda_ops {
+
+// Async phase timers: stream-0 event pairs in a ring. Record calls never
+// block the host; only phase_report() synchronizes (once per log line).
+// Ring is sized for log_every<=40 at the largest recipes; single training
+// thread per process is assumed (same contract as the MoE workspace).
+namespace {
+constexpr size_t kPhaseRing = 16384;
+struct PhaseSlot { cudaEvent_t s = nullptr, e = nullptr; int ph = -1; bool used = false; };
+std::vector<PhaseSlot> g_slots;
+size_t g_head = 0;
+void phase_pool() {
+    if (!g_slots.empty()) return;
+    g_slots.resize(kPhaseRing);
+    for (size_t i = 0; i < kPhaseRing; ++i) {
+        if (cudaEventCreate(&g_slots[i].s) != cudaSuccess ||
+            cudaEventCreate(&g_slots[i].e) != cudaSuccess)
+            GAI_FAIL("phase timer pool: cudaEventCreate failed");
+    }
 }
+}  // namespace
+
+void phase_start(int ph) {
+    phase_pool();
+    PhaseSlot& sl = g_slots[g_head];
+    sl.ph = ph;
+    sl.used = true;
+    if (cudaEventRecord(sl.s, 0) != cudaSuccess)
+        GAI_FAIL("phase_start: cudaEventRecord failed");
+}
+void phase_stop(int ph) {
+    (void)ph;
+    phase_pool();
+    PhaseSlot& sl = g_slots[g_head];
+    if (cudaEventRecord(sl.e, 0) != cudaSuccess)
+        GAI_FAIL("phase_stop: cudaEventRecord failed");
+    g_head = (g_head + 1) % kPhaseRing;
+}
+void phase_reset() {
+    for (auto& sl : g_slots) { sl.used = false; sl.ph = -1; }
+}
+void phase_shutdown() {
+    for (auto& sl : g_slots) {
+        if (sl.s) { cudaEventDestroy(sl.s); sl.s = nullptr; }
+        if (sl.e) { cudaEventDestroy(sl.e); sl.e = nullptr; }
+        sl.used = false;
+    }
+    g_slots.clear();
+    g_head = 0;
+}
+std::string phase_report() {
+    static const char* names[] = {"attnF", "moeF", "attnB", "moeB", "load"};
+    double ms[5] = {};
+    for (auto& sl : g_slots) {
+        if (!sl.used || sl.ph < 0 || sl.ph > 4) continue;
+        float d = 0.0f;
+        if (cudaEventElapsedTime(&d, sl.s, sl.e) != cudaSuccess)
+            GAI_FAIL("phase_report: cudaEventElapsedTime failed");
+        ms[sl.ph] += static_cast<double>(d);
+        sl.used = false;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "ph [%s %.1f %s %.1f %s %.1f %s %.1f]",
+                  names[0], ms[0], names[1], ms[1], names[2], ms[2], names[3], ms[3]);
+    return std::string(buf);
+}
+
+}  // namespace cuda_ops
 }

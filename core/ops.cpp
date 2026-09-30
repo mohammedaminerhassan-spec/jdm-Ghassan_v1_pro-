@@ -7,6 +7,8 @@
 #endif
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -119,6 +121,65 @@ void perf_note_muon_ns(int iters, u64 us) {
     g_perf_muon_ns.fetch_add(1, std::memory_order_relaxed);
     g_perf_muon_ns_iters.fetch_add(static_cast<u64>(iters), std::memory_order_relaxed);
     g_perf_muon_ns_us.fetch_add(us, std::memory_order_relaxed);
+}
+
+namespace {
+// Host-side loader-stall timer (DataLoader/prefetch wait is host time, not
+// GPU work, so it is measured with a CPU clock; single training thread).
+std::chrono::steady_clock::time_point g_load_t0{};
+double g_load_ms = 0.0;
+bool   g_load_open = false;
+}
+
+void phase_start(Device dev, TrainPhase ph) {
+    if (ph == TrainPhase::Load) {
+        g_load_t0 = std::chrono::steady_clock::now();
+        g_load_open = true;
+        return;
+    }
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_start(static_cast<int>(ph)); return; }
+#else
+    (void)dev;
+#endif
+}
+void phase_stop(Device dev, TrainPhase ph) {
+    if (ph == TrainPhase::Load) {
+        if (g_load_open) {
+            g_load_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - g_load_t0).count();
+            g_load_open = false;
+        }
+        return;
+    }
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_stop(static_cast<int>(ph)); return; }
+#else
+    (void)dev;
+#endif
+}
+void phase_reset(Device dev) {
+    g_load_ms = 0.0;
+    g_load_open = false;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) { cuda_ops::phase_reset(); return; }
+#else
+    (void)dev;
+#endif
+}
+std::string phase_report(Device dev) {
+    std::string s;
+#ifdef GAI_CUDA
+    if (dev == Device::CUDA) s = cuda_ops::phase_report();
+#else
+    (void)dev;
+#endif
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), " load %.1fms", g_load_ms);
+    s += buf;
+    g_load_ms = 0.0;
+    g_load_open = false;
+    return s;
 }
 PerfCounters perf_counters() {
     PerfCounters c;

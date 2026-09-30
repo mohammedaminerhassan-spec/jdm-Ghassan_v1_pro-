@@ -1391,10 +1391,12 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             ops::copy(dev, act.saved_v[sl].f32(), vp, N * kvd);
         }
 
+        ops::phase_start(dev, ops::TrainPhase::AttnFwd);
         ops::attention_forward_ex(dev, qp, kp, vp,
                                   act.att_out.f32(), nullptr,
                                   B, T, H, KV, hd, scale, cfg_.sliding_window,
                                   segment_ids);
+        ops::phase_stop(dev, ops::TrainPhase::AttnFwd);
         if (train) ops::copy(dev, act.saved_attout[sl].f32(), act.att_out.f32(), N * qd);
 
         ops::linear_forward(dev, act.att_out.f32(), L.wo.w.f32(), act.proj.f32(), static_cast<int>(N), qd, d);
@@ -1416,6 +1418,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
             float* rw    = train ? act.saved_moe_w[sl].f32()     : nullptr;
             const float* bias = (cfg_.moe_aux_free && !moe_bias_.empty())
                 ? moe_bias_ptr(l) : nullptr;
+            ops::phase_start(dev, ops::TrainPhase::MoeFwd);
             ops::moe_forward_bias(dev, act.xb2.f32(), L.router.w.f32(), bias,
                                   L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                                   L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
@@ -1424,6 +1427,7 @@ void Model::forward_body(const i32* ids, int B, int T, Activations& act,
                                   act.ffn_out.f32(), probs, ridx, rw,
                                   act.moe_gate.f32(), act.moe_up.f32(), act.moe_act.f32(),
                                   N, d, E, ne, K);
+            ops::phase_stop(dev, ops::TrainPhase::MoeFwd);
             if (train) {
                 ops::copy(dev, act.saved_gate[sl].f32(), act.moe_gate.f32(), N * K * E);
                 ops::copy(dev, act.saved_up[sl].f32(),   act.moe_up.f32(),   N * K * E);
@@ -1558,6 +1562,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                  static_cast<float>(cfg_.num_layers > 0 ? cfg_.num_layers : 1);
             }
             ops::zero(dev, act.dxb.f32(), N * d);
+            ops::phase_start(dev, ops::TrainPhase::MoeBwd);
             ops::moe_backward(dev, act.saved_xb2[sl].f32(), L.router.w.f32(),
                               L.moe_gate.w.f32(), L.moe_up.w.f32(), L.moe_down.w.f32(),
                               L.sh_gate.w.defined() ? L.sh_gate.w.f32() : nullptr,
@@ -1575,8 +1580,9 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                               L.sh_gate.g.defined() ? L.sh_gate.g.f32() : nullptr,
                               L.sh_up.g.defined()   ? L.sh_up.g.f32()   : nullptr,
                               L.sh_down.g.defined() ? L.sh_down.g.f32() : nullptr,
-                              act.moe_dact.f32(),
-                              N, d, E, ne, K);
+                               act.moe_dact.f32(),
+                               N, d, E, ne, K);
+            ops::phase_stop(dev, ops::TrainPhase::MoeBwd);
         } else {
             ops::zero(dev, act.dact.f32(), N * F);
             ops::linear_backward(dev, act.saved_act[sl].f32(), L.w_down.w.f32(), act.dx.f32(),
@@ -1605,6 +1611,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
         ops::zero(dev, act.dk.f32(), N * kvd);
         ops::zero(dev, act.dv.f32(), N * kvd);
 
+        ops::phase_start(dev, ops::TrainPhase::AttnBwd);
         ops::attention_forward_ex(dev, act.saved_q[sl].f32(), act.saved_k[sl].f32(),
                                   act.saved_v[sl].f32(), act.att_out.f32(),
                                   act.attn_probs_tmp.f32(),
@@ -1615,6 +1622,7 @@ double Model::forward_backward(const i32* ids, const i32* targets, int B, int T,
                                    act.dattout.f32(),
                                    act.dq.f32(), act.dk.f32(), act.dv.f32(),
                                    B, T, H, KV, hd, scale, cfg_.sliding_window);
+        ops::phase_stop(dev, ops::TrainPhase::AttnBwd);
 
         ops::rope_backward_cached(dev, act.dq.f32(), act.dk.f32(), act.pos.i32p(), rope_freq_bwd,
                                   N, H, KV, hd, cfg_.rope_type);
