@@ -16,6 +16,26 @@ static constexpr int MAX_HD  = 128;
 static constexpr int DECODE_BLOCK = 128;
 static constexpr size_t DECODE_SHMEM_FLOATS = 40;
 
+// [OPT] Shared row-dot buffer for the split backward: the dq kernel computes
+// each (b,h,t) dot EXACTLY ONCE and the dkv kernel reads it. (Recomputing the
+// dot inside every j-tile block would redo it 16x — a traffic monster.)
+static float* g_attn_dots = nullptr;
+static size_t g_attn_dots_cap = 0;
+static void attn_dots_ensure(size_t n) {
+    if (n <= g_attn_dots_cap) return;
+    if (g_attn_dots) CU_CHECK2(cudaFree(g_attn_dots));
+    g_attn_dots = nullptr;
+    g_attn_dots_cap = 0;
+    size_t want = n + n / 8 + 1024;
+    CU_CHECK2(cudaMalloc(&g_attn_dots, sizeof(float) * want));
+    g_attn_dots_cap = want;
+}
+void attn_free_dots() {
+    if (g_attn_dots) CU_CHECK2(cudaFree(g_attn_dots));
+    g_attn_dots = nullptr;
+    g_attn_dots_cap = 0;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     #pragma unroll
     for (int o = WARP_A / 2; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
@@ -243,6 +263,7 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
 __global__ void k_attn_bwd_dq(const float* __restrict__ q, const float* __restrict__ k,
                               const float* __restrict__ v, const float* __restrict__ probs,
                               const float* __restrict__ dout, float* __restrict__ dq,
+                              float* __restrict__ dots,
                               int T, int H, int KV, int hd, float scale) {
     // Grid is (T, H, B): this block EXCLUSIVELY owns dq[t,h] -> no atomics.
     const int t = blockIdx.x;
@@ -271,6 +292,7 @@ __global__ void k_attn_bwd_dq(const float* __restrict__ q, const float* __restri
     #pragma unroll
     for (int o = WARP_A / 2; o > 0; o >>= 1)
         dot_pg += __shfl_xor_sync(0xffffffffu, dot_pg, o);
+    if (dots && lane == 0) dots[((size_t)b * H + h) * T + t] = dot_pg;
 
     float dqacc[MAX_HD];
     for (int c = 0; c < hd; ++c) dqacc[c] = 0.0f;
@@ -298,11 +320,13 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
                                const float* __restrict__ v, const float* __restrict__ probs,
                                const float* __restrict__ dout,
                                float* __restrict__ dk, float* __restrict__ dv,
+                               const float* __restrict__ dots,
                                int T, int H, int KV, int hd, float scale) {
     // Grid is (ceil(T/64), KV, B): this block EXCLUSIVELY owns the dk/dv rows
-    // of its 64-wide j-tile -> no atomics. Per (t,h) it recomputes the row dot
-    // (same formula as the dq kernel), accumulates this tile's dv/dk in shared
-    // memory, and commits once with a coalesced (+=) write (grad-accum kept).
+    // of its 64-wide j-tile -> no atomics. Per (t,h) it reads the row dot
+    // (computed exactly once by the dq kernel), accumulates this tile's dv/dk
+    // in shared memory, and commits once with a coalesced (+=) write
+    // (grad-accum kept).
     const int jt = blockIdx.x;
     const int kvh = blockIdx.y;
     const int b = blockIdx.z;
@@ -332,21 +356,11 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
             const float* pr = probs + ((size_t(b) * H + gh) * T + t) * T;
             const float* go = dout + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             const float* qh = q + size_t(b) * qs + (size_t(t) * H + gh) * hd;
-            const int len = t + 1;
             for (int c = lane; c < hd; c += WARP_A) s_go[c] = go[c];
             __syncwarp();
 
-            float dot_pg = 0.0f;
-            for (int j = lane; j < len; j += WARP_A) {
-                const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
-                float dpj = 0.0f;
-                #pragma unroll 4
-                for (int c = 0; c < hd; ++c) dpj += s_go[c] * vh[c];
-                dot_pg += pr[j] * dpj;
-            }
-            #pragma unroll
-            for (int o = WARP_A / 2; o > 0; o >>= 1)
-                dot_pg += __shfl_xor_sync(0xffffffffu, dot_pg, o);
+            // Row dot was computed exactly once by the dq kernel; read it.
+            const float dot_pg = dots ? dots[((size_t)b * H + gh) * T + t] : 0.0f;
 
             for (int jj = lane; jj < tile; jj += WARP_A) {
                 const int j = base + jj;
@@ -388,15 +402,18 @@ void attention_backward(const float* q, const float* k, const float* v,
     GAI_CHECK(probs != nullptr, "cuda attention_backward requires cached probs");
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_backward: H must be a multiple of KV");
+    // Row-dot buffer shared by both passes (computed once in dq, read in dkv).
+    attn_dots_ensure(size_t(B) * H * T);
     // dq pass: one block per (t,h), exclusive dq rows, no shared memory needed.
     dim3 grid_dq(T, H, B);
-    k_attn_bwd_dq<<<grid_dq, WARP_A>>>(q, k, v, probs, dout, dq, T, H, KV, hd, scale);
+    k_attn_bwd_dq<<<grid_dq, WARP_A>>>(q, k, v, probs, dout, dq, g_attn_dots, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
     // dk/dv pass: one block per (j-tile,kvh,b), exclusive tile rows.
+    // Stream order guarantees the dots written above are visible here.
     dim3 grid_dkv((T + KV_TILE - 1) / KV_TILE, KV, B);
     const size_t shmem = sizeof(float) * (size_t(2) * KV_TILE * hd + MAX_HD);
     GAI_CHECK(shmem <= 48 * 1024, "cuda attention_backward: shared memory over T4 limit");
-    k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, T, H, KV, hd, scale);
+    k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, g_attn_dots, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
 }
 

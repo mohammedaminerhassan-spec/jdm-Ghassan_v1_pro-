@@ -55,6 +55,7 @@ void reserve_workspaces(size_t gemm_bytes, size_t moe_bytes) {
 }
 
 void free_sampling_workspace();
+void attn_free_dots();
 void free_workspace() {
     if (g_ws) cudaFree(g_ws);
     g_ws = nullptr;
@@ -62,6 +63,7 @@ void free_workspace() {
     if (g_sce_acc) { cudaFree(g_sce_acc); g_sce_acc = nullptr; }
     free_sampling_workspace();
     moe_free_workspace();
+    attn_free_dots();
 }
 
 size_t pool_bytes() { return g_ws_bytes; }

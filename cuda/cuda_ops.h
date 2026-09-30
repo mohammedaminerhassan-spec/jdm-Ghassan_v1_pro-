@@ -154,6 +154,7 @@ double global_sq_norm_multi(const std::vector<std::pair<const float*, i64>>& par
 
 void  free_workspace();
 void  moe_free_workspace();
+void  attn_free_dots();
 void  reserve_workspaces(size_t gemm_bytes, size_t moe_bytes);
 void  moe_reserve_workspace(size_t bytes);
 
