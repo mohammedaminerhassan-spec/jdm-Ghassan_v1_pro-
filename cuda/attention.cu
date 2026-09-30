@@ -225,100 +225,153 @@ void attention_forward_ex(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
 }
 
-__global__ void k_attn_bwd(const float* __restrict__ q, const float* __restrict__ k,
-                           const float* __restrict__ v, const float* __restrict__ probs,
-                           const float* __restrict__ dout,
-                           float* __restrict__ dq, float* __restrict__ dk,
-                           float* __restrict__ dv,
-                           int T, int H, int KV, int hd, float scale) {
+// [OPT] Deterministic atomic-free attention backward (FlashAttention-style
+// split). The previous k_attn_bwd parallelized over query positions and let
+// every (t) block atomicAdd into the shared dk/dv rows: ~B*KV*T*T*hd contended
+// global atomics per layer (~seconds per training step on T4, plus
+// nondeterministic summation order). The two kernels below compute the
+// IDENTICAL per-element math with exclusive ownership and zero atomics:
+//   - k_attn_bwd_dq : one block per (t,h,b), exclusively owns dq[t,h]
+//                     (same formula/body as the old per-(t,h) path).
+//   - k_attn_bwd_dkv: one block per (64-wide j-tile,kvh,b), exclusively owns
+//                     its dk/dv tile rows; accumulates across t in shared
+//                     memory and commits once with a coalesced (+=) write.
+// Both ACCUMULATE (+=) to preserve gradient accumulation across microbatches.
+// Masked entries (probs==0 from causal/packing/window masking) contribute
+// exactly 0, matching the old kernel element-wise (ds==0 fast path kept).
+// Segment IDs need no explicit handling: packing already zeroed the probs.
+__global__ void k_attn_bwd_dq(const float* __restrict__ q, const float* __restrict__ k,
+                              const float* __restrict__ v, const float* __restrict__ probs,
+                              const float* __restrict__ dout, float* __restrict__ dq,
+                              int T, int H, int KV, int hd, float scale) {
+    // Grid is (T, H, B): this block EXCLUSIVELY owns dq[t,h] -> no atomics.
     const int t = blockIdx.x;
-    const int kvh = blockIdx.y;
+    const int h = blockIdx.y;
     const int b = blockIdx.z;
+    if (t >= T) return;
     const int group = H / KV;
+    const int kvh = h / group;
     const int lane = threadIdx.x;
 
     const size_t qs  = size_t(T) * H * hd;
     const size_t kvs = size_t(T) * KV * hd;
     const int len = t + 1;
 
-    extern __shared__ float shmem[];
-    float* s_dk  = shmem;
-    float* s_dv  = shmem + KV_TILE * hd;
-    float* s_dot = shmem + 2 * KV_TILE * hd;
+    const float* pr = probs + ((size_t(b) * H + h) * T + t) * T;
+    const float* go = dout + size_t(b) * qs + (size_t(t) * H + h) * hd;
+    const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
 
-    for (int h = 0; h < group; ++h) {
-        const int gh = kvh * group + h;
-        const float* pr = probs + ((size_t(b) * H + gh) * T + t) * T;
-        const float* go = dout + size_t(b) * qs + (size_t(t) * H + gh) * hd;
-        float dot_pg = 0.0f;
-        for (int j = lane; j < len; j += WARP_A) {
-            const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
-            float dpj = 0.0f;
-            #pragma unroll 4
-            for (int c = 0; c < hd; ++c) dpj += go[c] * vh[c];
-            dot_pg += pr[j] * dpj;
-        }
-        #pragma unroll
-        for (int o = WARP_A / 2; o > 0; o >>= 1)
-            dot_pg += __shfl_xor_sync(0xffffffffu, dot_pg, o);
-        if (lane == 0) s_dot[h] = dot_pg;
+    float dot_pg = 0.0f;
+    for (int j = lane; j < len; j += WARP_A) {
+        const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+        float dpj = 0.0f;
+        #pragma unroll 4
+        for (int c = 0; c < hd; ++c) dpj += go[c] * vh[c];
+        dot_pg += pr[j] * dpj;
     }
+    #pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        dot_pg += __shfl_xor_sync(0xffffffffu, dot_pg, o);
+
+    float dqacc[MAX_HD];
+    for (int c = 0; c < hd; ++c) dqacc[c] = 0.0f;
+    for (int j = lane; j < len; j += WARP_A) {
+        const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+        float dpj = 0.0f;
+        #pragma unroll 4
+        for (int c = 0; c < hd; ++c) dpj += go[c] * vh[c];
+        const float p = pr[j];
+        const float ds = p * (dpj - dot_pg) * scale;
+        if (ds != 0.0f) {
+            const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+            for (int c = 0; c < hd; ++c) dqacc[c] += ds * kh[c];
+        }
+    }
+
+    float* dqh = dq + size_t(b) * qs + (size_t(t) * H + h) * hd;
+    for (int c = 0; c < hd; ++c) {
+        const float s = warp_reduce_sum(dqacc[c]);
+        if (lane == 0) dqh[c] += s;
+    }
+}
+
+__global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restrict__ k,
+                               const float* __restrict__ v, const float* __restrict__ probs,
+                               const float* __restrict__ dout,
+                               float* __restrict__ dk, float* __restrict__ dv,
+                               int T, int H, int KV, int hd, float scale) {
+    // Grid is (ceil(T/64), KV, B): this block EXCLUSIVELY owns the dk/dv rows
+    // of its 64-wide j-tile -> no atomics. Per (t,h) it recomputes the row dot
+    // (same formula as the dq kernel), accumulates this tile's dv/dk in shared
+    // memory, and commits once with a coalesced (+=) write (grad-accum kept).
+    const int jt = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int b = blockIdx.z;
+    const int base = jt * KV_TILE;
+    if (base >= T) return;
+    const int tile = min(KV_TILE, T - base);
+    const int group = H / KV;
+    const int lane = threadIdx.x;
+
+    const size_t qs  = size_t(T) * H * hd;
+    const size_t kvs = size_t(T) * KV * hd;
+
+    extern __shared__ float sh[];
+    float* s_dv = sh;                          // [KV_TILE * hd]
+    float* s_dk = sh + (size_t)KV_TILE * hd;
+    for (int i = lane; i < KV_TILE * hd; i += WARP_A) { s_dv[i] = 0.0f; s_dk[i] = 0.0f; }
     __syncthreads();
 
-    for (int base = 0; base < len; base += KV_TILE) {
-        const int tile = min(KV_TILE, len - base);
-        for (int idx = lane; idx < tile * hd; idx += WARP_A) {
-            s_dk[idx] = 0.0f;
-            s_dv[idx] = 0.0f;
-        }
-        __syncthreads();
-
+    float go_reg[MAX_HD];
+    float vbuf[MAX_HD];
+    for (int t = base; t < T; ++t) {
         for (int h = 0; h < group; ++h) {
             const int gh = kvh * group + h;
             const float* pr = probs + ((size_t(b) * H + gh) * T + t) * T;
             const float* go = dout + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             const float* qh = q + size_t(b) * qs + (size_t(t) * H + gh) * hd;
-            const float dot_pg = s_dot[h];
+            const int len = t + 1;
+            // NOTE: full-row load (not strided): every lane reads go_reg[c] for
+            // all c below. A strided load here would leave holes.
+            for (int c = 0; c < hd; ++c) go_reg[c] = go[c];
 
-            float dqacc[MAX_HD];
-            for (int c = 0; c < hd; ++c) dqacc[c] = 0.0f;
-
-            for (int j = lane; j < tile; j += WARP_A) {
-                const int jj = base + j;
-                const float* vh = v + size_t(b) * kvs + (size_t(jj) * KV + kvh) * hd;
+            float dot_pg = 0.0f;
+            for (int j = lane; j < len; j += WARP_A) {
+                const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
                 float dpj = 0.0f;
                 #pragma unroll 4
-                for (int c = 0; c < hd; ++c) dpj += go[c] * vh[c];
-                const float p = pr[jj];
-                for (int c = 0; c < hd; ++c) s_dv[j * hd + c] += p * go[c];
+                for (int c = 0; c < hd; ++c) dpj += go_reg[c] * vh[c];
+                dot_pg += pr[j] * dpj;
+            }
+            #pragma unroll
+            for (int o = WARP_A / 2; o > 0; o >>= 1)
+                dot_pg += __shfl_xor_sync(0xffffffffu, dot_pg, o);
+
+            for (int jj = lane; jj < tile; jj += WARP_A) {
+                const int j = base + jj;
+                if (j > t) continue;  // causal: fwd wrote probs=0 here
+                const float p = pr[j];
+                const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+                for (int c = 0; c < hd; ++c) vbuf[c] = vh[c];
+                float dpj = 0.0f;
+                #pragma unroll 4
+                for (int c = 0; c < hd; ++c) dpj += go_reg[c] * vbuf[c];
+                for (int c = 0; c < hd; ++c) s_dv[(size_t)jj * hd + c] += p * go_reg[c];
                 const float ds = p * (dpj - dot_pg) * scale;
                 if (ds != 0.0f) {
-                    const float* kh = k + size_t(b) * kvs + (size_t(jj) * KV + kvh) * hd;
-                    for (int c = 0; c < hd; ++c) {
-                        dqacc[c] += ds * kh[c];
-                        s_dk[j * hd + c] += ds * qh[c];
-                    }
+                    const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
+                    for (int c = 0; c < hd; ++c) vbuf[c] = kh[c];
+                    for (int c = 0; c < hd; ++c) s_dk[(size_t)jj * hd + c] += ds * qh[c];
                 }
             }
-
-            float* dqh = dq + size_t(b) * qs + (size_t(t) * H + gh) * hd;
-            for (int c = 0; c < hd; ++c) {
-                const float s = warp_reduce_sum(dqacc[c]);
-                if (lane == 0) dqh[c] += s;
-            }
         }
-        __syncthreads();
-
-        for (int j = lane; j < tile; j += WARP_A) {
-            const int jj = base + j;
-            float* dvh = dv + size_t(b) * kvs + (size_t(jj) * KV + kvh) * hd;
-            float* dkh = dk + size_t(b) * kvs + (size_t(jj) * KV + kvh) * hd;
-            for (int c = 0; c < hd; ++c) {
-                atomicAdd(dvh + c, s_dv[j * hd + c]);
-                atomicAdd(dkh + c, s_dk[j * hd + c]);
-            }
-        }
-        __syncthreads();
+    }
+    __syncthreads();
+    for (int idx = lane; idx < tile * hd; idx += WARP_A) {
+        const int j = base + idx / hd;
+        const int c = idx % hd;
+        dv[size_t(b) * kvs + ((size_t)j * KV + kvh) * hd + c] += s_dv[idx];
+        dk[size_t(b) * kvs + ((size_t)j * KV + kvh) * hd + c] += s_dk[idx];
     }
 }
 
@@ -329,15 +382,20 @@ void attention_backward(const float* q, const float* k, const float* v,
     if (B <= 0 || T <= 0) return;
     GAI_CHECK(KV > 0 && KV <= 65535 && B <= 65535,
               "cuda attention_backward: grid dimensions out of range");
+    GAI_CHECK(H > 0 && H <= 65535,
+              "cuda attention_backward: head grid dimension out of range");
     GAI_CHECK(probs != nullptr, "cuda attention_backward requires cached probs");
     GAI_CHECK(hd <= MAX_HD, "cuda attention: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_backward: H must be a multiple of KV");
-    dim3 grid(T, KV, B);
-
-    const int group = H / KV;
-    const size_t shmem = sizeof(float) * (size_t(2) * KV_TILE * hd + group);
+    // dq pass: one block per (t,h), exclusive dq rows, no shared memory needed.
+    dim3 grid_dq(T, H, B);
+    k_attn_bwd_dq<<<grid_dq, WARP_A>>>(q, k, v, probs, dout, dq, T, H, KV, hd, scale);
+    CU_CHECK2(cudaGetLastError());
+    // dk/dv pass: one block per (j-tile,kvh,b), exclusive tile rows.
+    dim3 grid_dkv((T + KV_TILE - 1) / KV_TILE, KV, B);
+    const size_t shmem = sizeof(float) * size_t(2) * KV_TILE * hd;
     GAI_CHECK(shmem <= 48 * 1024, "cuda attention_backward: shared memory over T4 limit");
-    k_attn_bwd<<<grid, WARP_A, shmem>>>(q, k, v, probs, dout, dq, dk, dv, T, H, KV, hd, scale);
+    k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
 }
 
