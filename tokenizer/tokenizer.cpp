@@ -63,7 +63,7 @@ void Tokenizer::build(const std::vector<std::string>& vocab,
             token_ids_.erase(t);
         }
     }
-    cache_.clear();
+    { std::lock_guard<std::mutex> lk(*cache_mu_); cache_.clear(); }
 }
 
 void Tokenizer::finalize_index() {
@@ -126,10 +126,13 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
         out.push_back(whole->second);
         return;
     }
-    auto cit = cache_.find(piece);
-    if (cit != cache_.end()) {
-        out.insert(out.end(), cit->second.begin(), cit->second.end());
-        return;
+    {
+        std::lock_guard<std::mutex> lk(*cache_mu_);
+        auto cit = cache_.find(piece);
+        if (cit != cache_.end()) {
+            out.insert(out.end(), cit->second.begin(), cit->second.end());
+            return;
+        }
     }
 
     std::vector<Node> nodes;
@@ -179,14 +182,17 @@ void Tokenizer::bpe_chunk(const std::string& piece, std::vector<i32>& out) const
         if (nodes[static_cast<size_t>(i)].alive) ids.push_back(nodes[static_cast<size_t>(i)].id);
     }
 
-    if (cache_.size() >= cache_limit_) {
-        size_t n = 0;
-        for (auto it = cache_.begin(); it != cache_.end();) {
-            if ((n++ % 8) == 0) it = cache_.erase(it);
-            else ++it;
+    {
+        std::lock_guard<std::mutex> lk(*cache_mu_);
+        if (cache_.size() >= cache_limit_) {
+            size_t n = 0;
+            for (auto it = cache_.begin(); it != cache_.end();) {
+                if ((n++ % 8) == 0) it = cache_.erase(it);
+                else ++it;
+            }
         }
+        cache_.emplace(piece, ids);
     }
-    cache_.emplace(piece, ids);
     out.insert(out.end(), ids.begin(), ids.end());
 }
 
@@ -214,18 +220,29 @@ std::vector<i32> Tokenizer::encode_with_specials(const std::string& text) const 
         buf.clear();
     };
 
+    // NOTE: this deliberately treats embedded special-token spellings as
+    // control tokens. Callers must only pass trusted template-built text;
+    // raw user content must go through encode() so a literal "<|system|>"
+    // typed by a user can never inject a control token.
     while (i < text.size()) {
         bool matched = false;
         if (text[i] == '<') {
+            // Longest-match wins so overlapping spellings (if any are added
+            // in the future) resolve deterministically.
+            size_t best = specials.size();
+            size_t best_len = 0;
             for (size_t s = 0; s < specials.size(); ++s) {
                 const std::string& sp = specials[s];
-                if (text.compare(i, sp.size(), sp) == 0) {
-                    flush();
-                    out.push_back(static_cast<i32>(s));
-                    i += sp.size();
-                    matched = true;
-                    break;
+                if (sp.size() > best_len && text.compare(i, sp.size(), sp) == 0) {
+                    best = s;
+                    best_len = sp.size();
                 }
+            }
+            if (best != specials.size()) {
+                flush();
+                out.push_back(static_cast<i32>(best));
+                i += best_len;
+                matched = true;
             }
         }
         if (!matched) { buf.push_back(text[i]); ++i; }
@@ -354,6 +371,17 @@ bool Tokenizer::load(const std::string& path) {
     }
 
     if (vocab_.size() < static_cast<size_t>(special::COUNT) + 256) return false;
+    // [FIX P1-09] encode_with_specials() assumes id == index in
+    // special_token_strings() (it emits static_cast<i32>(s)). A malformed or
+    // incompatible .gtok with the right size but shuffled specials would
+    // otherwise remap BOS/EOS/role tokens silently. Verify the table.
+    {
+        const auto& specials = special_token_strings();
+        for (int s = 0; s < special::COUNT; ++s) {
+            if (vocab_[static_cast<size_t>(s)] != specials[static_cast<size_t>(s)])
+                return false;
+        }
+    }
     for (int b = 0; b < 256; ++b) {
         const std::string& t = vocab_[static_cast<size_t>(special::COUNT) + b];
         if (t.size() != 1 || static_cast<u8>(t[0]) != static_cast<u8>(b)) return false;
@@ -373,7 +401,7 @@ bool Tokenizer::load(const std::string& path) {
         if (it == token_ids_.end()) continue;
         merges_[(static_cast<u64>(l) << 32) | rr] = {static_cast<i32>(r), it->second};
     }
-    cache_.clear();
+    { std::lock_guard<std::mutex> lk(*cache_mu_); cache_.clear(); }
     return true;
 }
 

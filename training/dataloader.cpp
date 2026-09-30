@@ -49,7 +49,10 @@ bool valid_shard_size(const std::string& path, const ShardHeader& h) {
     std::error_code ec;
     const auto fsize = fs::file_size(path, ec);
     if (ec || fsize > std::numeric_limits<u64>::max()) return false;
-    return static_cast<u64>(fsize) >= need;
+    // [FIX P2-23] Require an exact size match. The GBIN format defines no
+    // trailing extension region, so extra bytes mean concatenation / stale
+    // write / corruption that `>=` would silently ignore.
+    return static_cast<u64>(fsize) == need;
 }
 
 bool valid_doc_offsets(const std::vector<u64>& offsets, u64 n_tokens) {
@@ -72,7 +75,14 @@ ShardWriter::~ShardWriter() {
     // [FIX LOW-4] Flush any pending data. close() is idempotent (no-op if already closed).
     // Without this, forgetting to call close() silently discards all added documents.
     if (!closed_) {
-        try { close(); } catch (...) {}  // never throw from destructor
+        // [FIX P2-25] Never throw from a destructor, but never swallow the
+        // failure silently either: a failed final write in a data-generation
+        // pipeline must leave a diagnostic.
+        try { close(); } catch (const std::exception& e) {
+            log_error(std::string("[shard] ShardWriter destructor: final close failed: ") + e.what());
+        } catch (...) {
+            log_error("[shard] ShardWriter destructor: final close failed with unknown exception");
+        }
     }
 }
 
@@ -84,6 +94,14 @@ void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector
     if (mask) {
         GAI_CHECK(mask->size() == tokens.size(),
                   strfmt("loss mask length %zu != token length %zu", mask->size(), tokens.size()));
+        // [FIX P2-02] Loss-mask bytes are binary (0/1). A stray value 2..255
+        // (memory garbage, script bug) would otherwise be treated as
+        // supervised by every `if (m)` consumer. Fail loud at write time.
+        for (size_t i = 0; i < mask->size(); ++i) {
+            GAI_CHECK((*mask)[i] <= 1,
+                      strfmt("loss mask must be 0/1, got %u at position %zu",
+                             (unsigned)(*mask)[i], i));
+        }
     }
     doc_offsets_.push_back(static_cast<u64>(tokens_.size()));
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -98,7 +116,6 @@ void ShardWriter::add_document(const std::vector<i32>& tokens, const std::vector
 
 void ShardWriter::close() {
     if (closed_) return;
-    closed_ = true;
 
     fs::path p(path_);
     if (p.has_parent_path()) fs::create_directories(p.parent_path());
@@ -128,7 +145,11 @@ void ShardWriter::close() {
         f.write(reinterpret_cast<const char*>(mask_.data()),
                 static_cast<std::streamsize>(mask_.size()));
     }
+    f.flush();
     GAI_CHECK(f.good(), "shard write failed: " + path_);
+    // [FIX P2-24] Mark closed only after the write fully succeeded, so a
+    // failed close() can be retried instead of being silently skipped.
+    closed_ = true;
 }
 
 bool Shard::load(const std::string& path) {
@@ -165,6 +186,11 @@ bool Shard::load(const std::string& path) {
         mask_.resize(static_cast<size_t>(h.n_tokens));
         if (h.n_tokens && !f.read(reinterpret_cast<char*>(mask_.data()),
                                   static_cast<std::streamsize>(mask_.size()))) return false;
+        // [FIX P2-02] Reject corrupted/non-binary masks at load time instead
+        // of letting `if (m)` silently supervise on garbage bytes.
+        for (size_t i = 0; i < mask_.size(); ++i) {
+            if (mask_[i] > 1) return false;
+        }
     }
     if (!valid_doc_offsets(doc_offsets_, h.n_tokens)) return false;
     header_ = h;

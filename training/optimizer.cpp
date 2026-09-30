@@ -186,7 +186,17 @@ void AdamW::save_state(std::ostream& os) const {
     }
 }
 
-bool AdamW::load_state(std::istream& is, int state_version) {
+namespace {
+// [FIX P0-02] float recipe comparison: configs are parsed deterministically
+// from YAML so identical recipes give bit-identical floats; a small epsilon
+// guards against float<->double round-trips in serialization paths.
+inline bool opt_f32_same(float a, float b) {
+    const double d = std::fabs(static_cast<double>(a) - static_cast<double>(b));
+    return d <= 1e-9 * (1.0 + std::fabs(static_cast<double>(a)));
+}
+}
+
+bool AdamW::load_state(std::istream& is, int state_version, bool exact) {
     u64 count = 0;
     if (!is.read(reinterpret_cast<char*>(&count), 8)) return false;
     if (count != m_.size()) return false;
@@ -200,6 +210,23 @@ bool AdamW::load_state(std::istream& is, int state_version) {
             !rd_f32(is, eps) || !rd_f32(is, wd) || !rd_f32(is, clip))
             return false;
 
+        if (exact) {
+            // [FIX P0-02] exact resume: every behavior-affecting field must
+            // match; otherwise the restored moments would be updated with a
+            // different rule (different wd/clip/beta/eps changes the
+            // trajectory even from identical weights+moments).
+            if (!opt_f32_same(b1, cfg_.beta1) || !opt_f32_same(b2, cfg_.beta2) ||
+                !opt_f32_same(eps, cfg_.eps) || !opt_f32_same(wd, cfg_.weight_decay) ||
+                !opt_f32_same(clip, cfg_.grad_clip)) {
+                log_error(strfmt("exact resume: adamw hyperparams differ from checkpoint "
+                                 "(ckpt beta1=%.6f beta2=%.6f eps=%.3e wd=%.4f clip=%.3f vs "
+                                 "cur beta1=%.6f beta2=%.6f eps=%.3e wd=%.4f clip=%.3f)",
+                                 b1, b2, (double)eps, (double)wd, (double)clip,
+                                 cfg_.beta1, cfg_.beta2, (double)cfg_.eps,
+                                 (double)cfg_.weight_decay, (double)cfg_.grad_clip));
+                return false;
+            }
+        }
         cfg_.beta1 = b1;
         cfg_.beta2 = b2;
         cfg_.eps   = eps;
@@ -231,6 +258,17 @@ bool AdamW::load_state(std::istream& is, int state_version) {
 
     AdamWConfig saved{};
     if (!is.read(reinterpret_cast<char*>(&saved), sizeof(AdamWConfig))) return false;
+    if (exact) {
+        // [FIX P0-02] legacy path: same exactness contract as current format.
+        if (!opt_f32_same(saved.beta1, cfg_.beta1) ||
+            !opt_f32_same(saved.beta2, cfg_.beta2) ||
+            !opt_f32_same(saved.eps, cfg_.eps) ||
+            !opt_f32_same(saved.weight_decay, cfg_.weight_decay) ||
+            !opt_f32_same(saved.grad_clip, cfg_.grad_clip)) {
+            log_error("exact resume: adamw hyperparams differ from legacy checkpoint");
+            return false;
+        }
+    }
     cfg_.beta1 = saved.beta1;
     cfg_.beta2 = saved.beta2;
     cfg_.eps   = saved.eps;
@@ -441,7 +479,9 @@ void Muon::save_state(std::ostream& os) const {
     u64 count = static_cast<u64>(m_.size());
     os.write(reinterpret_cast<const char*>(&count), 8);
     os.write(reinterpret_cast<const char*>(&t_), 8);
-    const u8 fmt = 1;
+    // [FIX P0-02] fmt=2 appends min_ns_dim (fmt=1 files remain loadable;
+    // exact resume on fmt=1 skips the min_ns_dim check with a warning).
+    const u8 fmt = 2;
     os.write(reinterpret_cast<const char*>(&fmt), 1);
     wr_f32(os, cfg_.lr);
     wr_f32(os, cfg_.vec_lr_ratio);
@@ -453,6 +493,8 @@ void Muon::save_state(std::ostream& os) const {
     {
         const i32 ns = static_cast<i32>(cfg_.ns_steps);
         os.write(reinterpret_cast<const char*>(&ns), 4);
+        const i32 min_ns = static_cast<i32>(cfg_.min_ns_dim);
+        os.write(reinterpret_cast<const char*>(&min_ns), 4);
     }
     auto& params = model_.parameters();
     for (size_t i = 0; i < m_.size(); ++i) {
@@ -490,25 +532,54 @@ static bool rd_muon_moments(std::istream& is, const std::vector<i64>& shape, Ten
     return true;
 }
 
-bool Muon::load_state(std::istream& is, int state_version) {
+bool Muon::load_state(std::istream& is, int state_version, bool exact) {
     if (state_version < OPT_STATE_CURRENT) return false;
     u64 count = 0;
     if (!is.read(reinterpret_cast<char*>(&count), 8)) return false;
     if (count != m_.size()) return false;
     if (!is.read(reinterpret_cast<char*>(&t_), 8)) return false;
     u8 fmt = 0;
-    if (!is.read(reinterpret_cast<char*>(&fmt), 1) || fmt != 1) return false;
+    if (!is.read(reinterpret_cast<char*>(&fmt), 1) || (fmt != 1 && fmt != 2)) return false;
     float lr = 0, vr = 0, b1 = 0, b2 = 0, eps = 0, wd = 0, clip = 0;
     i32 ns = 0;
     if (!rd_f32(is, lr) || !rd_f32(is, vr) || !rd_f32(is, b1) || !rd_f32(is, b2) ||
         !rd_f32(is, eps) || !rd_f32(is, wd) || !rd_f32(is, clip))
         return false;
     if (!is.read(reinterpret_cast<char*>(&ns), 4)) return false;
+    i32 saved_min_ns = 0;
+    if (fmt == 2) {
+        if (!is.read(reinterpret_cast<char*>(&saved_min_ns), 4)) return false;
+    }
 
+    if (exact) {
+        // [FIX P0-02] exact resume: Muon has the widest behavior surface
+        // (vec ratio, NS steps, NS gate). Any drift invalidates exactness.
+        if (!opt_f32_same(b1, cfg_.beta1) || !opt_f32_same(b2, cfg_.beta2) ||
+            !opt_f32_same(eps, cfg_.eps) || !opt_f32_same(wd, cfg_.weight_decay) ||
+            !opt_f32_same(clip, cfg_.grad_clip) || !opt_f32_same(vr, cfg_.vec_lr_ratio) ||
+            ns != static_cast<i32>(cfg_.ns_steps)) {
+            log_error(strfmt("exact resume: muon hyperparams differ from checkpoint "
+                             "(ckpt vec_ratio=%.4f ns=%d wd=%.4f clip=%.3f vs "
+                             "cur vec_ratio=%.4f ns=%d wd=%.4f clip=%.3f)",
+                             (double)vr, (int)ns, (double)wd, (double)clip,
+                             (double)cfg_.vec_lr_ratio, (int)cfg_.ns_steps,
+                             (double)cfg_.weight_decay, (double)cfg_.grad_clip));
+            return false;
+        }
+        if (fmt == 2 && saved_min_ns != static_cast<i32>(cfg_.min_ns_dim)) {
+            log_error(strfmt("exact resume: muon min_ns_dim differs (ckpt %d vs cur %d); "
+                             "the NS/vec branch assignment would change",
+                             (int)saved_min_ns, (int)cfg_.min_ns_dim));
+            return false;
+        }
+        if (fmt == 1 && cfg_.min_ns_dim != 0) {
+            log_warn("[ckpt] exact resume from pre-min_ns_dim checkpoint: cannot verify "
+                     "muon min_ns_dim; continuing (moments shapes validated per-tensor)");
+        }
+    }
     cfg_.beta1 = b1;
     cfg_.beta2 = b2;
     cfg_.eps = eps;
-    (void)wd;
     auto& params = model_.parameters();
     for (size_t i = 0; i < m_.size(); ++i) {
         u8 mask = 0;
@@ -618,7 +689,7 @@ void Lion::save_state(std::ostream& os) const {
     }
 }
 
-bool Lion::load_state(std::istream& is, int state_version) {
+bool Lion::load_state(std::istream& is, int state_version, bool exact) {
     u64 count = 0;
     if (!is.read(reinterpret_cast<char*>(&count), 8)) return false;
     if (count != m_.size()) return false;
@@ -631,6 +702,20 @@ bool Lion::load_state(std::istream& is, int state_version) {
         if (!rd_f32(is, lr) || !rd_f32(is, b1) || !rd_f32(is, b2) ||
             !rd_f32(is, wd) || !rd_f32(is, clip))
             return false;
+        if (exact) {
+            // [FIX P0-02] exact resume: Lion update depends on wd/clip/betas.
+            if (!opt_f32_same(b1, cfg_.beta1) || !opt_f32_same(b2, cfg_.beta2) ||
+                !opt_f32_same(wd, cfg_.weight_decay) ||
+                !opt_f32_same(clip, cfg_.grad_clip)) {
+                log_error(strfmt("exact resume: lion hyperparams differ from checkpoint "
+                                 "(ckpt beta1=%.6f beta2=%.6f wd=%.4f clip=%.3f vs "
+                                 "cur beta1=%.6f beta2=%.6f wd=%.4f clip=%.3f)",
+                                 b1, b2, (double)wd, (double)clip,
+                                 cfg_.beta1, cfg_.beta2,
+                                 (double)cfg_.weight_decay, (double)cfg_.grad_clip));
+                return false;
+            }
+        }
         cfg_.beta1 = b1;
         cfg_.beta2 = b2;
         for (size_t i = 0; i < m_.size(); ++i) {
@@ -654,6 +739,16 @@ bool Lion::load_state(std::istream& is, int state_version) {
 
     LionConfig saved{};
     if (!is.read(reinterpret_cast<char*>(&saved), sizeof(LionConfig))) return false;
+    if (exact) {
+        // [FIX P0-02] legacy path: same exactness contract.
+        if (!opt_f32_same(saved.beta1, cfg_.beta1) ||
+            !opt_f32_same(saved.beta2, cfg_.beta2) ||
+            !opt_f32_same(saved.weight_decay, cfg_.weight_decay) ||
+            !opt_f32_same(saved.grad_clip, cfg_.grad_clip)) {
+            log_error("exact resume: lion hyperparams differ from legacy checkpoint");
+            return false;
+        }
+    }
     cfg_.beta1 = saved.beta1;
     cfg_.beta2 = saved.beta2;
     for (size_t i = 0; i < m_.size(); ++i) {

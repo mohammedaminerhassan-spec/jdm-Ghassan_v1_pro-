@@ -103,6 +103,8 @@ int main() {
     }
 
     {
+        // [FIX P0-01] exact resume locks the original schedule total: extending
+        // max_steps under exact must be refused (it would reshape lr_at(N)).
         Model model(tiny_config(), Device::CPU);
         model.init_weights(1);
         model.enable_grad(true);
@@ -110,10 +112,29 @@ int main() {
         cfg.resume_mode = "exact";
         cfg.resume = "auto";
         cfg.max_steps = final_step + 2;
+        bool threw = false;
+        try {
+            Trainer trainer(model, cfg);
+            trainer.run();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw, "exact Lion resume refuses a changed max_steps (schedule reshape)");
+    }
+
+    {
+        // Exact resume with the IDENTICAL schedule still succeeds.
+        Model model(tiny_config(), Device::CPU);
+        model.init_weights(1);
+        model.enable_grad(true);
+        TrainerConfig cfg = lion_cfg(data_dir, ckpt_dir);
+        cfg.resume_mode = "exact";
+        cfg.resume = "auto";
+        cfg.max_steps = final_step;
         Trainer trainer(model, cfg);
         trainer.run();
-        CHECK(trainer.state().step == final_step + 2,
-              "exact Lion resume continued the schedule (P0-2 fixed)");
+        CHECK(trainer.state().step == final_step,
+              "exact Lion resume with identical schedule succeeds");
     }
 
     fs::remove_all(root, ec);

@@ -29,7 +29,12 @@ public:
     void   set_step_count(i64 t) { t_ = t; }
 
     void save_state(std::ostream& os) const;
-    bool load_state(std::istream& is, int state_version);
+    // [FIX P0-02] exact=true validates ALL behavior-affecting hyperparams
+    // saved in the checkpoint against the current cfg_ and returns false on
+    // any mismatch (exact resume must never silently continue with a
+    // different update rule). exact=false preserves the legacy migrate
+    // behavior (restore moments + beta/eps only, keep current wd/clip).
+    bool load_state(std::istream& is, int state_version, bool exact = false);
     size_t state_bytes() const;
     OptimizerStateSnapshot snapshot_state() const;
 
@@ -64,7 +69,8 @@ public:
     void   set_step_count(i64 t) { t_ = t; }
 
     void save_state(std::ostream& os) const;
-    bool load_state(std::istream& is, int state_version);
+    // [FIX P0-02] see AdamW::load_state.
+    bool load_state(std::istream& is, int state_version, bool exact = false);
     size_t state_bytes() const;
     OptimizerStateSnapshot snapshot_state() const;
 
@@ -124,7 +130,9 @@ public:
     void   set_step_count(i64 t) { t_ = t; }
 
     void save_state(std::ostream& os) const;
-    bool load_state(std::istream& is, int state_version);
+    // [FIX P0-02] see AdamW::load_state. Also validates vec_lr_ratio,
+    // ns_steps and min_ns_dim (the latter stored as fmt=2 trailer).
+    bool load_state(std::istream& is, int state_version, bool exact = false);
     size_t state_bytes() const;
     OptimizerStateSnapshot snapshot_state() const;
 

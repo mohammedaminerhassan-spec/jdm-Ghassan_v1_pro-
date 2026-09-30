@@ -1712,38 +1712,75 @@ void Model::save_raw(const std::string& path) const {
     GAI_CHECK(f.good(), "model write failed");
 }
 
+// [FIX P3-02] load_raw() used to return bare `false` for every failure
+// mode (truncation vs name/shape/dtype mismatch vs bad magic), which made
+// weight-import debugging a guessing game. Every rejection now logs the
+// tensor name and the exact reason; the bool contract is unchanged.
 bool Model::load_raw(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f.good()) return false;
+    if (!f.good()) { log_error("[raw] cannot open " + path); return false; }
     u32 magic = 0, n = 0;
-    if (!f.read(reinterpret_cast<char*>(&magic), 4)) return false;
-    if (magic != RAW_MAGIC) return false;
-    if (!f.read(reinterpret_cast<char*>(&n), 4)) return false;
+    if (!f.read(reinterpret_cast<char*>(&magic), 4)) { log_error("[raw] truncated magic: " + path); return false; }
+    if (magic != RAW_MAGIC) { log_error("[raw] bad magic in " + path); return false; }
+    if (!f.read(reinterpret_cast<char*>(&n), 4)) { log_error("[raw] truncated tensor count: " + path); return false; }
 
-    if (n != static_cast<u32>(params_.size())) return false;
+    if (n != static_cast<u32>(params_.size())) {
+        log_error(strfmt("[raw] tensor count %u != model %zu in %s", n, params_.size(), path.c_str()));
+        return false;
+    }
     for (u32 i = 0; i < n; ++i) {
         u32 len = 0;
-        if (!f.read(reinterpret_cast<char*>(&len), 4) || len == 0 || len > 512) return false;
+        if (!f.read(reinterpret_cast<char*>(&len), 4) || len == 0 || len > 512) {
+            log_error(strfmt("[raw] bad name length at tensor %u in %s", i, path.c_str()));
+            return false;
+        }
         std::string name(len, '\0');
-        if (!f.read(name.data(), static_cast<std::streamsize>(len))) return false;
+        if (!f.read(name.data(), static_cast<std::streamsize>(len))) {
+            log_error("[raw] truncated name at tensor " + std::to_string(i) + " in " + path);
+            return false;
+        }
         u64 ne = 0;
-        if (!f.read(reinterpret_cast<char*>(&ne), 8)) return false;
+        if (!f.read(reinterpret_cast<char*>(&ne), 8)) {
+            log_error("[raw] truncated numel for '" + name + "' in " + path);
+            return false;
+        }
         Parameter* p = find_parameter(name);
-        if (!p || static_cast<u64>(p->numel()) != ne) return false;
-        if (p->shape.empty()) return false;
+        if (!p) { log_error("[raw] unknown tensor '" + name + "' in " + path); return false; }
+        if (static_cast<u64>(p->numel()) != ne) {
+            log_error(strfmt("[raw] numel mismatch for '%s': file %llu vs model %lld in %s",
+                             name.c_str(), (unsigned long long)ne,
+                             (long long)p->numel(), path.c_str()));
+            return false;
+        }
+        if (p->shape.empty()) { log_error("[raw] empty shape for '" + name + "'"); return false; }
 
         u32 nd = 0;
-        if (!f.read(reinterpret_cast<char*>(&nd), 4)) return false;
-        if (nd != static_cast<u32>(p->shape.size())) return false;
+        if (!f.read(reinterpret_cast<char*>(&nd), 4)) {
+            log_error("[raw] truncated rank for '" + name + "'"); return false;
+        }
+        if (nd != static_cast<u32>(p->shape.size())) {
+            log_error(strfmt("[raw] rank mismatch for '%s': file %u vs model %zu",
+                             name.c_str(), nd, p->shape.size()));
+            return false;
+        }
         for (size_t k = 0; k < p->shape.size(); ++k) {
             i64 dd = 0;
-            if (!f.read(reinterpret_cast<char*>(&dd), 8)) return false;
-            if (dd != p->shape[k]) return false;
+            if (!f.read(reinterpret_cast<char*>(&dd), 8)) {
+                log_error("[raw] truncated dim for '" + name + "'"); return false;
+            }
+            if (dd != p->shape[k]) {
+                log_error(strfmt("[raw] shape mismatch for '%s' dim %zu: file %lld vs model %lld",
+                                 name.c_str(), k, (long long)dd, (long long)p->shape[k]));
+                return false;
+            }
         }
         Tensor cpu(p->shape, DType::F32, Device::CPU);
-        if (cpu.nbytes() == 0) return false;
+        if (cpu.nbytes() == 0) { log_error("[raw] zero-byte tensor '" + name + "'"); return false; }
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
-                    static_cast<std::streamsize>(cpu.nbytes()))) return false;
+                    static_cast<std::streamsize>(cpu.nbytes()))) {
+            log_error("[raw] truncated payload for '" + name + "' in " + path);
+            return false;
+        }
         p->w.copy_from(cpu);
     }
     if (fp16_weight_cache_) enable_fp16_weight_cache(true);

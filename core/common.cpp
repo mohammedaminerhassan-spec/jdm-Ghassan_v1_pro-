@@ -6,6 +6,8 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#include <atomic>
+#include <mutex>
 
 #ifdef GAI_OPENMP
 #include <omp.h>
@@ -13,14 +15,18 @@
 
 namespace gai {
 
-static LogLevel g_level = LogLevel::Info;
-static int      g_threads = 0;
+// [FIX P2-10] g_threads was a plain static int: concurrent set/num_threads
+// from workers is a data race (UB). Atomic with the same lazy-init
+// semantics; set once at startup in the normal path.
+static std::atomic<int> g_threads{0};
+static std::mutex       g_log_mu;
 
 void fail(const std::string& msg, const char* file, int line) {
     std::string full = std::string(file) + ":" + std::to_string(line) + ": " + msg;
     throw Error(full);
 }
 
+static LogLevel g_level = LogLevel::Info;
 void set_log_level(LogLevel lvl) { g_level = lvl; }
 LogLevel log_level() { return g_level; }
 
@@ -34,6 +40,9 @@ void log_raw(LogLevel lvl, const std::string& msg) {
         case LogLevel::ErrorL: tag = "[error] "; break;
         default: break;
     }
+    // Serialize whole lines so main + ckpt-writer threads cannot interleave
+    // mid-line (cosmetic, not corruption, but cheap to fix).
+    std::lock_guard<std::mutex> lk(g_log_mu);
     std::ostream& os = (lvl >= LogLevel::Warn) ? std::cerr : std::cout;
     os << tag << msg << std::endl;
 }
@@ -108,15 +117,18 @@ std::string fingerprint_hex(u64 fp) {
 }
 
 int num_threads() {
-    if (g_threads > 0) return g_threads;
+    int cur = g_threads.load(std::memory_order_relaxed);
+    if (cur > 0) return cur;
     unsigned hc = std::thread::hardware_concurrency();
-    g_threads = hc > 0 ? static_cast<int>(hc) : 1;
-    return g_threads;
+    int want = hc > 0 ? static_cast<int>(hc) : 1;
+    g_threads.compare_exchange_strong(cur, want, std::memory_order_relaxed);
+    return g_threads.load(std::memory_order_relaxed);
 }
 void set_num_threads(int n) {
-    g_threads = n > 0 ? n : 1;
+    int want = n > 0 ? n : 1;
+    g_threads.store(want, std::memory_order_relaxed);
 #ifdef GAI_OPENMP
-    omp_set_num_threads(g_threads);
+    omp_set_num_threads(want);
 #endif
 }
 

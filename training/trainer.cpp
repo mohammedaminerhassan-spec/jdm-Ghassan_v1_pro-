@@ -906,13 +906,30 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
 
                 if (peek_st.sched_total > 0) {
                     const float want_peak = effective_peak_lr(cfg_);
-                    const bool sched_same =
+                    const bool kind_peak_same =
                         peek_st.sched_kind == ((cfg_.scheduler == "wsd") ? 1 : 0) &&
                         std::fabs(peek_st.sched_peak - want_peak) <=
                             1e-6f * std::fabs(peek_st.sched_peak) + 1e-30f;
+                    // [FIX P0-01] exact resume must also lock warmup / min-ratio /
+                    // decay-frac, not just kind+peak: all of them reshape lr_at(N).
+                    const bool sched_same = kind_peak_same &&
+                        peek_st.sched_warmup == cfg_.warmup_steps &&
+                        std::fabs(peek_st.sched_min_ratio - cfg_.min_lr_ratio) <= 1e-9f &&
+                        std::fabs(peek_st.sched_decay_frac - cfg_.sched_decay_frac) <= 1e-9f;
                     if (!sched_same) {
                         const std::string why =
-                            "scheduler recipe differs (kind or peak lr) from the checkpoint";
+                            strfmt("scheduler recipe differs from the checkpoint "
+                                   "(kind/peak/warmup/min_ratio/decay_frac): "
+                                   "ckpt(kind=%d peak=%.6e warmup=%lld min=%.4f decay=%.4f) vs "
+                                   "cur(kind=%d peak=%.6e warmup=%lld min=%.4f decay=%.4f)",
+                                   peek_st.sched_kind, (double)peek_st.sched_peak,
+                                   (long long)peek_st.sched_warmup,
+                                   (double)peek_st.sched_min_ratio,
+                                   (double)peek_st.sched_decay_frac,
+                                   (cfg_.scheduler == "wsd") ? 1 : 0, (double)want_peak,
+                                   (long long)cfg_.warmup_steps,
+                                   (double)cfg_.min_lr_ratio,
+                                   (double)cfg_.sched_decay_frac);
                         if (exact)
                             GAI_FAIL("exact resume: " + why +
                                      ". Restore the original recipe, use resume_mode: migrate, "
@@ -939,7 +956,13 @@ Trainer::Trainer(Model& model, TrainerConfig cfg)
         if (ok) {
 
             if (moments_restored) {
-                opt_set_step(state_.step);
+                // [FIX P0-03] Do NOT overwrite the restored optimizer step counter
+                // with state_.step. state_.step counts attempted trainer steps
+                // (including skipped non-finite updates and all-masked steps),
+                // while optimizer t_ counts successfully applied updates and
+                // drives AdamW/Muon bias correction. load_state() already
+                // restored the exact t_; overwriting it with state_.step would
+                // silently change all future updates after any skipped step.
             } else {
                 opt_set_step(0);
                 log_warn(strfmt("[ckpt] moments NOT restored (kind switch/corrupt/legacy); "
@@ -1318,6 +1341,17 @@ void Trainer::run() {
                         world_sz));
     }
 
+    // [FIX P0-01] exact resume locks the original schedule total: a longer
+    // or shorter max_steps/epochs budget would silently reshape lr_at(N).
+    if (cfg_.resume_exact() && state_.sched_total > 0 && state_.sched_total != total_steps_) {
+        GAI_FAIL(strfmt("exact resume refused: checkpoint planned total %lld steps but this "
+                        "session budgets %lld (max_steps/epochs/data changed). The LR curve "
+                        "after step %lld would differ from the uninterrupted run. Restore "
+                        "the original total, or use resume_mode: migrate to accept a new "
+                        "schedule.",
+                        (long long)state_.sched_total, (long long)total_steps_,
+                        (long long)state_.step));
+    }
     if (state_.sched_total > 0 && state_.sched_total > total_steps_) {
         log_warn(strfmt("[sched] continuation: checkpoint planned %lld steps, this session "
                         "budgeted %lld — KEEPING the original %lld-step plan so the LR curve "
@@ -1348,19 +1382,42 @@ void Trainer::run() {
                     static_cast<long long>(total_steps_),
                     cfg_.min_lr_ratio * 100.0, cfg_.sched_decay_frac));
 
+    // [FIX P0-01] post-build barrier: exact resume must never continue with a
+    // reshaped curve (defense in depth; the peek check above should already
+    // have failed, but total_steps_ can also change via epochs/data size).
     if (state_.sched_total > 0 && state_.sched_total != total_steps_) {
-        log_warn(strfmt("[sched] RESUME MISMATCH: checkpoint planned total %lld but now %lld "
+        const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint planned total %lld but now %lld "
                         "(max_steps/epochs/data changed) — past LR curve reshaped; "
                         "keep the original schedule to stay bit-consistent",
-                        (long long)state_.sched_total, (long long)total_steps_));
+                        (long long)state_.sched_total, (long long)total_steps_);
+        if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
+        log_warn(why);
     }
     if (state_.sched_warmup > 0 && state_.sched_warmup != cfg_.warmup_steps) {
-        log_warn(strfmt("[sched] RESUME MISMATCH: checkpoint warmup %lld but now %lld",
-                        (long long)state_.sched_warmup, (long long)cfg_.warmup_steps));
+        const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint warmup %lld but now %lld",
+                        (long long)state_.sched_warmup, (long long)cfg_.warmup_steps);
+        if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
+        log_warn(why);
     }
     if (state_.sched_peak > 0.0f && std::fabs(state_.sched_peak - sched_peak) > 1e-9f) {
-        log_warn(strfmt("[sched] RESUME MISMATCH: checkpoint peak %.3e but now %.3e",
-                        (double)state_.sched_peak, (double)sched_peak));
+        const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint peak %.3e but now %.3e",
+                        (double)state_.sched_peak, (double)sched_peak);
+        if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
+        log_warn(why);
+    }
+    if (state_.sched_min_ratio > 0.0f &&
+        std::fabs(state_.sched_min_ratio - cfg_.min_lr_ratio) > 1e-9f) {
+        const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint min_ratio %.4f but now %.4f",
+                        (double)state_.sched_min_ratio, (double)cfg_.min_lr_ratio);
+        if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
+        log_warn(why);
+    }
+    if (state_.sched_decay_frac > 0.0f &&
+        std::fabs(state_.sched_decay_frac - cfg_.sched_decay_frac) > 1e-9f) {
+        const std::string why = strfmt("[sched] RESUME MISMATCH: checkpoint decay_frac %.4f but now %.4f",
+                        (double)state_.sched_decay_frac, (double)cfg_.sched_decay_frac);
+        if (cfg_.resume_exact()) GAI_FAIL("exact resume refused: " + why);
+        log_warn(why);
     }
     if (state_.step >= total_steps_)
         log_warn(strfmt("[sched] resumed at step %lld which already reaches the planned total %lld",
@@ -1698,6 +1755,16 @@ void Trainer::init_distributed() {
         return;
     }
 
+    // [FIX P2-13] The trainer's actual gradient path (sync_gradients via
+    // all_reduce_sum_nosync) has no compression transform; accepting
+    // ddp_grad_compression=true would silently train WITHOUT the requested
+    // semantics. Fail loud until the nosync path implements it.
+    if (cfg_.ddp_grad_compression) {
+        GAI_FAIL("training.ddp_grad_compression=true is not implemented in the "
+                 "trainer's no-sync reduction path (gradients would be reduced "
+                 "uncompressed while appearing configured). Set "
+                 "training.ddp_grad_compression=false (exact fp32 all-reduce).");
+    }
     DistributedContext::Config dcfg = distributed_config_from_env(num_gpus);
     dcfg.grad_compression = cfg_.ddp_grad_compression;
     if (dcfg.world_size <= 1) {

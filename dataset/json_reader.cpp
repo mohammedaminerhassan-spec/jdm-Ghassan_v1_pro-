@@ -65,13 +65,18 @@ static bool hex4(const char* p, const char* end, unsigned& out) {
     return true;
 }
 
+// [FIX P2-03] Overlong strings were silently truncated (tail dropped while
+// still returning true), biasing training against long documents without any
+// error. Now the parser still consumes the full input (keeps the cursor in
+// sync) but reports truncation as failure so the record is quarantined.
 static bool parse_string(Cur& c, std::string& out, size_t cap) {
     if (c.eof() || *c.p != '"') return false;
     ++c.p;
     out.clear();
+    bool truncated = false;
     while (!c.eof()) {
         char ch = *c.p++;
-        if (ch == '"') return true;
+        if (ch == '"') return !truncated;
         if (ch == '\\') {
             if (c.eof()) return false;
             char e = *c.p++;
@@ -104,6 +109,9 @@ static bool parse_string(Cur& c, std::string& out, size_t cap) {
                         std::string tmp;
                         utf8_emit(tmp, cp);
                         if (out.size() + tmp.size() <= cap) out += tmp;
+                        else truncated = true;
+                    } else {
+                        truncated = true;
                     }
                     break;
                 }
@@ -111,6 +119,7 @@ static bool parse_string(Cur& c, std::string& out, size_t cap) {
             }
         } else {
             if (out.size() < cap) out += ch;
+            else truncated = true;
         }
     }
     return false;
@@ -226,16 +235,22 @@ static bool as_str(const JVal* v, std::string& out) {
     return true;
 }
 
-static Role map_role(const std::string& r) {
+// [FIX P1-08] Unknown roles must NOT silently become User: a "tool" /
+// "function" / misspelled role would otherwise be trained with the wrong
+// conversational semantics (wrong chat template + wrong loss mask).
+// Returns false when the role string is present but unrecognized, so the
+// caller quarantines the message instead of mislabeling it.
+static bool map_role(const std::string& r, Role& out) {
     std::string l = r;
     for (char& ch : l) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    if (l == "system" || l == "developer") return Role::System;
+    if (l == "system" || l == "developer") { out = Role::System; return true; }
     if (l == "user" || l == "human" || l == "question" || l == "instruction" ||
-        l == "prompt" || l == "problem" || l == "query" || l == "input") return Role::User;
+        l == "prompt" || l == "problem" || l == "query" || l == "input") { out = Role::User; return true; }
     if (l == "assistant" || l == "gpt" || l == "ai" || l == "answer" ||
-        l == "response" || l == "output" || l == "completion") return Role::Assistant;
-
-    return Role::User;
+        l == "response" || l == "output" || l == "completion") { out = Role::Assistant; return true; }
+    // Explicit tool/function family: quarantine (reject) rather than
+    // mislabel as User. Tool outputs must never be trained as user turns.
+    return false;
 }
 
 static bool extract_message(const JVal& obj, Message& m) {
@@ -252,7 +267,13 @@ static bool extract_message(const JVal& obj, Message& m) {
     if (!as_str(text, body)) return false;
     std::string r;
     if (role && role->t == JVal::T::Str) r = role->s;
-    m.role = r.empty() ? Role::User : map_role(r);
+    if (r.empty()) {
+        m.role = Role::User;
+    } else {
+        Role mapped = Role::User;
+        if (!map_role(r, mapped)) return false;  // quarantine unknown role
+        m.role = mapped;
+    }
     m.content = std::move(body);
     return true;
 }

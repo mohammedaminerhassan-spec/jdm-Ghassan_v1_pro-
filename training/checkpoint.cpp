@@ -484,6 +484,22 @@ static bool read_moe_bias(std::istream& f, Model& model, bool present) {
     return true;
 }
 
+// [FIX] Trailing bytes after the optimizer payload mean concatenation /
+// partial-overwrite / recovery garbage. The structural checks above all
+// pass on such files, so gate the tail explicitly: exact refuses, migrate
+// warns. Call only at points where the full file was consumed.
+static bool check_no_trailing(std::istream& f, bool strict) {
+    if (f.peek() != std::char_traits<char>::eof()) {
+        if (strict) {
+            log_error("exact resume: checkpoint has trailing bytes after the "
+                      "optimizer state (concatenated/corrupt file)");
+            return false;
+        }
+        log_warn("[ckpt] checkpoint has trailing bytes after the optimizer state (ignored)");
+    }
+    return true;
+}
+
 bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainState& state,
                       bool* out_moments_restored, bool strict) {
     if (out_moments_restored) *out_moments_restored = false;
@@ -539,6 +555,25 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         Tensor cpu(pp->shape, DType::F32, Device::CPU);
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
+        // [FIX P1-10] Structural validation alone cannot catch a bit-flipped
+        // weight: the shapes/names match but training continues on garbage.
+        // Scan the freshly read payload (zero extra copies) before commit.
+        {
+            const float* d = cpu.f32();
+            const i64 ne = cpu.numel();
+            for (i64 j = 0; j < ne; ++j) {
+                if (!std::isfinite(d[static_cast<size_t>(j)])) {
+                    if (strict) {
+                        log_error("exact resume: checkpoint tensor '" + name +
+                                  "' contains non-finite payload (corrupt file)");
+                        return false;
+                    }
+                    log_warn("checkpoint tensor '" + name +
+                             "' contains non-finite payload (corrupt file?)");
+                    break;
+                }
+            }
+        }
         pp->w.copy_from(cpu);
         seen.insert(name);
     }
@@ -558,12 +593,14 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
     if (version == 3u) {
 
         if (has_opt && opt) {
-            if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+            // [FIX P0-02] forward strict (=exact) so hyperparam drift fails
+            // the load instead of silently continuing with a new update rule.
+            if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY, strict)) {
                 if (strict) { log_error("exact resume: legacy v3 optimizer state unreadable"); return false; }
                 log_warn("optimizer state could not be restored; continuing with fresh moments");
             } else if (out_moments_restored) *out_moments_restored = true;
         }
-        return true;
+        return check_no_trailing(f, strict);
     }
     u8 kind = OPT_ADAMW;
     if (has_opt && !rd(f, kind)) return false;
@@ -576,7 +613,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
             log_warn("checkpoint holds lion moments but trainer uses adamw; starting fresh moments");
             return true;
         }
-        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY, strict)) {
             if (strict) { log_error("exact resume: adamw state unreadable"); return false; }
             log_warn("optimizer state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
@@ -584,7 +621,7 @@ bool Checkpoint::load(const std::string& path, Model& model, AdamW* opt, TrainSt
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
     }
-    return true;
+    return check_no_trailing(f, strict);
 }
 
 bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainState& state,
@@ -643,6 +680,23 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         Tensor cpu(pp->shape, DType::F32, Device::CPU);
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
+        // [FIX P1-10] see AdamW path: finite-payload gate before commit.
+        {
+            const float* d = cpu.f32();
+            const i64 ne = cpu.numel();
+            for (i64 j = 0; j < ne; ++j) {
+                if (!std::isfinite(d[static_cast<size_t>(j)])) {
+                    if (strict) {
+                        log_error("exact resume: checkpoint tensor '" + name +
+                                  "' contains non-finite payload (corrupt file)");
+                        return false;
+                    }
+                    log_warn("checkpoint tensor '" + name +
+                             "' contains non-finite payload (corrupt file?)");
+                    break;
+                }
+            }
+        }
         pp->w.copy_from(cpu);
         seen_lion.insert(name);
     }
@@ -681,7 +735,8 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
             log_warn("checkpoint holds adamw moments but trainer uses lion; starting fresh moments");
             return true;
         }
-        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+        // [FIX P0-02] forward strict (=exact) for hyperparam validation.
+        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY, strict)) {
             if (strict) { log_error("exact resume: lion state unreadable"); return false; }
             log_warn("lion state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
@@ -689,7 +744,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Lion* opt, TrainSta
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
     }
-    return true;
+    return check_no_trailing(f, strict);
 }
 
 bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainState& state,
@@ -749,6 +804,23 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         Tensor cpu(pp->shape, DType::F32, Device::CPU);
         if (!f.read(reinterpret_cast<char*>(cpu.data_ptr()),
                     static_cast<std::streamsize>(cpu.nbytes()))) return false;
+        // [FIX P1-10] see AdamW path: finite-payload gate before commit.
+        {
+            const float* d = cpu.f32();
+            const i64 ne = cpu.numel();
+            for (i64 j = 0; j < ne; ++j) {
+                if (!std::isfinite(d[static_cast<size_t>(j)])) {
+                    if (strict) {
+                        log_error("exact resume: checkpoint tensor '" + name +
+                                  "' contains non-finite payload (corrupt file)");
+                        return false;
+                    }
+                    log_warn("checkpoint tensor '" + name +
+                             "' contains non-finite payload (corrupt file?)");
+                    break;
+                }
+            }
+        }
         pp->w.copy_from(cpu);
         seen_muon.insert(name);
     }
@@ -787,7 +859,8 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
             log_warn("checkpoint holds other-optimizer moments but trainer uses muon; starting fresh moments");
             return true;
         }
-        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY)) {
+        // [FIX P0-02] forward strict (=exact) for hyperparam validation.
+        if (!opt->load_state(f, version >= 7u ? OPT_STATE_CURRENT : OPT_STATE_LEGACY, strict)) {
             if (strict) { log_error("exact resume: muon state unreadable"); return false; }
             log_warn("muon state could not be restored; continuing with fresh moments");
         } else if (out_moments_restored) *out_moments_restored = true;
@@ -795,7 +868,7 @@ bool Checkpoint::load(const std::string& path, Model& model, Muon* opt, TrainSta
         log_error("exact resume: checkpoint carries optimizer state but no optimizer was supplied");
         return false;
     }
-    return true;
+    return check_no_trailing(f, strict);
 }
 
 bool Checkpoint::peek(const std::string& path, ModelConfig& cfg, TrainState& state) {

@@ -2,9 +2,11 @@
 
 #include "core/common.h"
 #include "tokenizer/normalizer.h"
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <mutex>
 
 namespace gai {
 
@@ -87,6 +89,11 @@ private:
     std::unordered_map<u64, std::pair<i32, i32>> merges_;
     Normalizer                                   norm_;
     mutable std::unordered_map<std::string, std::vector<i32>> cache_;
+    // [FIX P2-12] bpe_chunk() is const but mutates cache_. Without a mutex,
+    // sharing one Tokenizer across threads is a data race (UB/crash).
+    // Shared ownership keeps Tokenizer copyable/movable (BpeTrainer::train
+    // returns by value); copies share the lock, each keeps its own map.
+    mutable std::shared_ptr<std::mutex> cache_mu_ = std::make_shared<std::mutex>();
     mutable size_t cache_limit_ = 200000;
 };
 

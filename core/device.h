@@ -8,7 +8,9 @@
 
 namespace gai {
 
-const char* device_name(Device d);
+// NOTE: device_name() is declared in core/tensor.h (where Device lives) and
+// defined once in core/tensor.cpp. It is NOT redeclared here to avoid a
+// duplicate declaration across headers.
 bool        is_gpu(Device d);
 
 struct DeviceInfo {

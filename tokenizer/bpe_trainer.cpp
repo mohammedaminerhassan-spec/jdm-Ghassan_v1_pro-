@@ -161,7 +161,11 @@ Tokenizer BpeTrainer::train() {
         const std::string& sb = vocab[static_cast<size_t>(b)];
         std::string merged = sa + sb;
 
-        if (static_cast<int>(utf8_length(merged)) > cfg_.max_token_bytes) {
+        // [FIX P2-04] max_token_bytes is a BYTE limit (see BpeTrainerConfig),
+        // so it must be measured with merged.size(), not utf8_length()
+        // (codepoints). The old check let multi-byte (Arabic/emoji) tokens
+        // exceed the intended byte budget by 2-4x.
+        if (static_cast<int>(merged.size()) > cfg_.max_token_bytes) {
             pair_count.erase(pit);
             pair_words.erase(PairKey{top.pair});
             continue;
