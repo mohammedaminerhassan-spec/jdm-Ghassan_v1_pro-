@@ -259,7 +259,6 @@ __global__ void k_attn_bwd_dq(const float* __restrict__ q, const float* __restri
 
     const float* pr = probs + ((size_t(b) * H + h) * T + t) * T;
     const float* go = dout + size_t(b) * qs + (size_t(t) * H + h) * hd;
-    const float* qh = q + size_t(b) * qs + (size_t(t) * H + h) * hd;
 
     float dot_pg = 0.0f;
     for (int j = lane; j < len; j += WARP_A) {
@@ -319,10 +318,13 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
     extern __shared__ float sh[];
     float* s_dv = sh;                          // [KV_TILE * hd]
     float* s_dk = sh + (size_t)KV_TILE * hd;
+    float* s_go = sh + (size_t)2 * KV_TILE * hd;  // [MAX_HD] do-row cache
     for (int i = lane; i < KV_TILE * hd; i += WARP_A) { s_dv[i] = 0.0f; s_dk[i] = 0.0f; }
     __syncthreads();
 
-    float go_reg[MAX_HD];
+    // [FIX] Register budget: two [MAX_HD] register arrays (go_reg+vbuf = 256+
+    // registers) spill to local memory on sm_75. The do-row lives in shared
+    // (s_go) instead; only one [MAX_HD] register buffer remains (~140 regs).
     float vbuf[MAX_HD];
     for (int t = base; t < T; ++t) {
         for (int h = 0; h < group; ++h) {
@@ -331,16 +333,15 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
             const float* go = dout + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             const float* qh = q + size_t(b) * qs + (size_t(t) * H + gh) * hd;
             const int len = t + 1;
-            // NOTE: full-row load (not strided): every lane reads go_reg[c] for
-            // all c below. A strided load here would leave holes.
-            for (int c = 0; c < hd; ++c) go_reg[c] = go[c];
+            for (int c = lane; c < hd; c += WARP_A) s_go[c] = go[c];
+            __syncwarp();
 
             float dot_pg = 0.0f;
             for (int j = lane; j < len; j += WARP_A) {
                 const float* vh = v + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
                 float dpj = 0.0f;
                 #pragma unroll 4
-                for (int c = 0; c < hd; ++c) dpj += go_reg[c] * vh[c];
+                for (int c = 0; c < hd; ++c) dpj += s_go[c] * vh[c];
                 dot_pg += pr[j] * dpj;
             }
             #pragma unroll
@@ -355,8 +356,8 @@ __global__ void k_attn_bwd_dkv(const float* __restrict__ q, const float* __restr
                 for (int c = 0; c < hd; ++c) vbuf[c] = vh[c];
                 float dpj = 0.0f;
                 #pragma unroll 4
-                for (int c = 0; c < hd; ++c) dpj += go_reg[c] * vbuf[c];
-                for (int c = 0; c < hd; ++c) s_dv[(size_t)jj * hd + c] += p * go_reg[c];
+                for (int c = 0; c < hd; ++c) dpj += s_go[c] * vbuf[c];
+                for (int c = 0; c < hd; ++c) s_dv[(size_t)jj * hd + c] += p * s_go[c];
                 const float ds = p * (dpj - dot_pg) * scale;
                 if (ds != 0.0f) {
                     const float* kh = k + size_t(b) * kvs + (size_t(j) * KV + kvh) * hd;
@@ -393,7 +394,7 @@ void attention_backward(const float* q, const float* k, const float* v,
     CU_CHECK2(cudaGetLastError());
     // dk/dv pass: one block per (j-tile,kvh,b), exclusive tile rows.
     dim3 grid_dkv((T + KV_TILE - 1) / KV_TILE, KV, B);
-    const size_t shmem = sizeof(float) * size_t(2) * KV_TILE * hd;
+    const size_t shmem = sizeof(float) * (size_t(2) * KV_TILE * hd + MAX_HD);
     GAI_CHECK(shmem <= 48 * 1024, "cuda attention_backward: shared memory over T4 limit");
     k_attn_bwd_dkv<<<grid_dkv, WARP_A, shmem>>>(q, k, v, probs, dout, dk, dv, T, H, KV, hd, scale);
     CU_CHECK2(cudaGetLastError());
