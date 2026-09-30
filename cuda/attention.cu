@@ -1,7 +1,12 @@
 #include "cuda/cuda_ops.h"
+#include "core/ops.h"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cfloat>
+#include <cstdio>
+#include <vector>
 
 namespace gai {
 namespace cuda_ops {
@@ -223,26 +228,318 @@ __global__ void k_attn_fwd_swa(const float* __restrict__ q, const float* __restr
     }
 }
 
+// ---- GEMM-based attention path (training throughput) ----
+// The tiled kernels above parallelize over queries and re-read K/V once per
+// query row: O(B*H*T^2*hd) global traffic per layer (~70% of a T4 step for
+// T=1024). This path runs the identical math as strided/grouped cublas GEMMs
+// (tensor cores) plus three fused row-wise kernels:
+//
+//   fwd: S = Q*K^T (1 grouped call) -> fused softmax into probs ->
+//        O = P*V (1 grouped call, written directly interleaved)
+//   bwd: dP = dO*V^T (1 grouped call) -> fused dS in place ->
+//        dq = dS*K, dk = dS^T*Q, dv = P^T*dO (grouped; dk/dv via an expanded
+//        buffer plus a deterministic group-reduce, no atomics anywhere)
+//
+// Layouts are EXACTLY what the tiled path expects (interleaved [B,T,H,hd] for
+// Q/K/V/dO/dq, [B,T,KV,hd] for dk/dv, per-(b,h) T*T probs with the same
+// masking semantics), so callers, checkpoints and the CPU reference are
+// unaffected. cublas may tile differently than separate calls, so results can
+// differ in the last ulp; the parity tests accept tolerance-level
+// reassociation. NOTE: bf16 GEMMs are not implemented here (T4 has no BF16
+// tensor cores); if enabled the path falls back to fp32 with a loud warning.
+static __half* g_attn_mir = nullptr;  // fp16 mirror staging (reused per GEMM)
+static size_t  g_attn_mir_cap = 0;      // __half elements
+static float*  g_attn_exp = nullptr; // expanded dk/dv [B*H*T*hd]
+static size_t  g_attn_exp_cap = 0;
+static float*  g_attn_dsb = nullptr; // dS/dP [B*H*T*T]
+static size_t  g_attn_dsb_cap = 0;
+
+static void attn_pool_ensure(size_t mir_elems, size_t exp_elems, size_t ds_elems) {
+    if (mir_elems > g_attn_mir_cap) {
+        if (g_attn_mir) CU_CHECK2(cudaFree(g_attn_mir));
+        g_attn_mir = nullptr;
+        g_attn_mir_cap = 0;
+        size_t want = mir_elems + mir_elems / 8 + 1024;
+        CU_CHECK2(cudaMalloc(&g_attn_mir, sizeof(__half) * want));
+        g_attn_mir_cap = want;
+    }
+    if (exp_elems > g_attn_exp_cap) {
+        if (g_attn_exp) CU_CHECK2(cudaFree(g_attn_exp));
+        g_attn_exp = nullptr;
+        g_attn_exp_cap = 0;
+        size_t want = exp_elems + exp_elems / 8 + 1024;
+        CU_CHECK2(cudaMalloc(&g_attn_exp, sizeof(float) * want));
+        g_attn_exp_cap = want;
+    }
+    if (ds_elems > g_attn_dsb_cap) {
+        if (g_attn_dsb) CU_CHECK2(cudaFree(g_attn_dsb));
+        g_attn_dsb = nullptr;
+        g_attn_dsb_cap = 0;
+        size_t want = ds_elems + ds_elems / 8 + 1024;
+        CU_CHECK2(cudaMalloc(&g_attn_dsb, sizeof(float) * want));
+        g_attn_dsb_cap = want;
+    }
+}
+
+__global__ void k_attn_cvt_flat(const float* __restrict__ src, __half* __restrict__ dst, i64 n) {
+    i64 i = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+static void attn_cvt(const float* src, __half* dst, size_t n) {
+    if (n == 0) return;
+    unsigned g = (unsigned)((n + 255) / 256);
+    if (g < 1) g = 1;
+    k_attn_cvt_flat<<<g, 256>>>(src, dst, (i64)n);
+    CU_CHECK2(cudaGetLastError());
+}
+
+// Row-major grouped GEMM mirroring gemm()'s convention and precision rule:
+// each of the nB problems computes C[M*N] = A[M*K] * B[K*N] (op counts follow
+// the (ta,tb) flags exactly like gemm(); fp16 tensor path iff enabled and
+// M*N*K >= threshold, else fp32). ONE cublasGemmGroupedBatchedEx call
+// (group_count=1; uniform dims, varying pointers). A/Bfp stage through the
+// shared fp16 buffers when the fp16 route is taken.
+static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
+                        float alpha, const float* const* A, int ldaA, const float* Arange, size_t Aspan,
+                        const float* const* B, int ldaB, const float* Brange, size_t Bspan,
+                        float beta, float* const* C, int ldaC, int nB) {
+    if (nB <= 0 || M <= 0 || N <= 0) return;
+    if (K <= 0 || alpha == 0.0f) {
+        GAI_FAIL("attn_sbgemm: degenerate K<=0/alpha==0 path not implemented");
+    }
+    if (ops::gemm_bf16_enabled()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[attn] bf16 GEMM requested: attention GEMM path uses fp32 "
+                            "instead (T4 has no BF16 tensor cores)\n");
+        }
+    }
+    const i64 mnk = (i64)M * N * K;
+    const bool use_fp16 = fp16_gemm_enabled() && mnk >= ops::gemm_fp16_mnk_threshold();
+    cublasHandle_t h = reinterpret_cast<cublasHandle_t>(cuda::cublas_handle());
+    // Mirror gemm()'s transpose swap: col-major C^T[N*M] = B^T * A^T.
+    cublasOperation_t topA[1] = { tb ? CUBLAS_OP_T : CUBLAS_OP_N };
+    cublasOperation_t topB[1] = { ta ? CUBLAS_OP_T : CUBLAS_OP_N };
+    int marr[1] = { N }, narr[1] = { M }, karr[1] = { K };
+    int ldaArr[1] = { ldaB }, ldbArr[1] = { ldaA }, ldcArr[1] = { ldaC };
+    const void* alp[1] = { &alpha };
+    const void* bet[1] = { &beta };
+    size_t gs[1] = { (size_t)nB };
+    cublasStatus_t s;
+    if (use_fp16) {
+        // Mirror-convert the DENSE ranges once (flat: bitwise-identical to
+        // per-matrix conversion); per-batch fp16 pointers follow by offset.
+        attn_pool_ensure(Aspan + Bspan, 0, 0);
+        attn_cvt(Arange, g_attn_mir, Aspan);
+        attn_cvt(Brange, g_attn_mir + Aspan, Bspan);
+        std::vector<const void*> Ah(nB), Bh(nB);
+        std::vector<void*> Ch(nB);
+        for (int i = 0; i < nB; ++i) {
+            Ah[i] = g_attn_mir + (size_t)(A[i] - Arange);
+            Bh[i] = g_attn_mir + Aspan + (size_t)(B[i] - Brange);
+            Ch[i] = C[i];
+        }
+        cublasGemmAlgo_t algo[1] = { CUBLAS_GEMM_DEFAULT_TENSOR_OP };
+        s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
+                                       Ah.data(), CUDA_R_16F, ldaArr,
+                                       Bh.data(), CUDA_R_16F, ldbArr, bet,
+                                       Ch.data(), CUDA_R_32F, ldcArr,
+                                       CUBLAS_COMPUTE_32F, algo, 1, gs);
+    } else {
+        std::vector<const void*> Ap(nB), Bp(nB);
+        std::vector<void*> Cp(nB);
+        for (int i = 0; i < nB; ++i) { Ap[i] = A[i]; Bp[i] = B[i]; Cp[i] = C[i]; }
+        cublasGemmAlgo_t algo[1] = { CUBLAS_GEMM_DEFAULT };
+        s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
+                                       Ap.data(), CUDA_R_32F, ldaArr,
+                                       Bp.data(), CUDA_R_32F, ldbArr, bet,
+                                       Cp.data(), CUDA_R_32F, ldcArr,
+                                       CUBLAS_COMPUTE_32F, algo, 1, gs);
+    }
+    if (s != CUBLAS_STATUS_SUCCESS)
+        GAI_FAIL(strfmt("attn grouped GEMM failed: status=%d M=%d N=%d K=%d nB=%d fp16=%d",
+                        static_cast<int>(s), M, N, K, nB, use_fp16 ? 1 : 0));
+}
+
+// Fused causal/window/segment softmax: reads scores S, writes normalized
+// probs P in place. Row (b,h,t) covers j in [j0, t]; anything else is 0.
+// Same rules as k_attn_fwd_swa (j0 bound, seg_t<0 keeps all, div guard).
+__global__ void k_attn_softmax_fwd(float* __restrict__ P, const i32* __restrict__ seg,
+                                   int T, int H, float scale, int window) {
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    if (t >= T) return;
+    float* row = P + ((size_t(b) * H + h) * T + t) * T;
+    const i32 seg_t = seg ? seg[(size_t)b * T + t] : 0;
+    const int j0 = (window > 0 && t + 1 > window) ? t + 1 - window : 0;
+    __shared__ float sm[32];
+    const int lane = threadIdx.x;
+    const int nw = blockDim.x / WARP_A;
+    const int wid = lane / WARP_A;
+    const int wl = lane % WARP_A;
+    float mx = -FLT_MAX;
+    for (int j = j0 + lane; j <= t; j += blockDim.x) {
+        bool keep = !seg || seg_t < 0 || seg[(size_t)b * T + j] == seg_t;
+        float s = keep ? row[j] * scale : -FLT_MAX;
+        mx = fmaxf(mx, s);
+    }
+    float wmax = mx;
+    #pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        wmax = fmaxf(wmax, __shfl_xor_sync(0xffffffffu, wmax, o));
+    if (wl == 0) sm[wid] = wmax;
+    __syncthreads();
+    if (lane == 0) {
+        float m = sm[0];
+        for (int i = 1; i < nw; ++i) m = fmaxf(m, sm[i]);
+        sm[31] = m;
+    }
+    __syncthreads();
+    mx = sm[31];
+    float sum = 0.0f;
+    for (int j = j0 + lane; j <= t; j += blockDim.x) {
+        bool keep = !seg || seg_t < 0 || seg[(size_t)b * T + j] == seg_t;
+        float p = keep ? __expf(row[j] * scale - mx) : 0.0f;
+        row[j] = p;
+        sum += p;
+    }
+    float wsum = sum;
+    #pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        wsum += __shfl_xor_sync(0xffffffffu, wsum, o);
+    if (wl == 0) sm[wid] = wsum;
+    __syncthreads();
+    float tot = 0.0f;
+    if (lane == 0) {
+        for (int i = 0; i < nw; ++i) tot += sm[i];
+        sm[30] = tot;
+    }
+    __syncthreads();
+    tot = sm[30];
+    const float inv = (tot > 1e-30f) ? (1.0f / tot) : 0.0f;
+    for (int j = j0 + lane; j <= t; j += blockDim.x) row[j] *= inv;
+    for (int j = lane; j < j0; j += blockDim.x) row[j] = 0.0f;
+    for (int j = t + 1 + lane; j < T; j += blockDim.x) row[j] = 0.0f;
+}
+
+// Fused dS transform: ds[j] = P[j] * (dP[j] - dot) * scale, in place over dP.
+// Masked entries have P==0 and contribute exactly 0 (same as the old kernel's
+// ds==0 fast path, but written explicitly).
+__global__ void k_attn_ds(float* __restrict__ dP, const float* __restrict__ P,
+                          int T, int H, float scale) {
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    if (t >= T) return;
+    float* drow = dP + ((size_t(b) * H + h) * T + t) * T;
+    const float* prow = P + ((size_t(b) * H + h) * T + t) * T;
+    const int lane = threadIdx.x;
+    const int nw = blockDim.x / WARP_A;
+    const int wid = lane / WARP_A;
+    const int wl = lane % WARP_A;
+    __shared__ float sm[32];
+    float dot = 0.0f;
+    for (int j = lane; j < T; j += blockDim.x) dot += prow[j] * drow[j];
+    float wdot = dot;
+    #pragma unroll
+    for (int o = WARP_A / 2; o > 0; o >>= 1)
+        wdot += __shfl_xor_sync(0xffffffffu, wdot, o);
+    if (wl == 0) sm[wid] = wdot;
+    __syncthreads();
+    if (lane == 0) {
+        float d = sm[0];
+        for (int i = 1; i < nw; ++i) d += sm[i];
+        sm[31] = d;
+    }
+    __syncthreads();
+    dot = sm[31];
+    for (int j = lane; j < T; j += blockDim.x)
+        drow[j] = prow[j] * (drow[j] - dot) * scale;
+}
+
+// Deterministic GQA group reduce: small[(b,kvh),j,c] = sum over h in group of
+// big[(b,gh),j,c], h ascending. Replaces racy atomic accumulation.
+__global__ void k_attn_group_reduce(const float* __restrict__ big, float* __restrict__ small,
+                                    int T, int H, int KV, int hd) {
+    const int j = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int b = blockIdx.z;
+    if (j >= T) return;
+    const int group = H / KV;
+    const int lane = threadIdx.x;
+    float* srow = small + ((size_t(b) * T + j) * KV + kvh) * hd;
+    for (int c = lane; c < hd; c += blockDim.x) {
+        float a = 0.0f;
+        for (int h = 0; h < group; ++h) {
+            const int gh = kvh * group + h;
+            a += big[((size_t(b) * H + gh) * T + j) * hd + c];
+        }
+        srow[c] = a;
+    }
+}
+
 void attention_forward_ex(const float* q, const float* k, const float* v,
-                          float* out, float* probs,
-                          int B, int T, int H, int KV, int hd, float scale, int window,
-                          const i32* segment_ids) {
+                           float* out, float* probs,
+                           int B, int T, int H, int KV, int hd, float scale, int window,
+                           const i32* segment_ids) {
     if (B <= 0 || T <= 0) return;
     GAI_CHECK(H > 0 && H <= 65535 && B <= 65535,
               "cuda attention_ex: grid dimensions out of range");
     GAI_CHECK(hd <= MAX_HD, "cuda attention_ex: head_dim too large");
     GAI_CHECK(H % KV == 0, "cuda attention_ex: H must be a multiple of KV");
-    dim3 grid(T, H, B);
-    if (window <= 0) {
-        size_t sh = sizeof(float) * (size_t(hd) + size_t(KV_TILE) * hd * 2 + KV_TILE + size_t(hd));
-        GAI_CHECK(sh <= 48 * 1024, "cuda attention_forward_ex: shared memory over T4 limit");
-        k_attn_fwd<<<grid, WARP_A, sh>>>(q, k, v, out, probs, segment_ids,
-                                         T, H, KV, hd, scale);
-    } else {
-        k_attn_fwd_swa<<<grid, WARP_A>>>(q, k, v, out, probs, segment_ids,
-                                         T, H, KV, hd, scale, window);
+    const int group = H / KV;
+    const int BH = B * H;
+    // Scores buffer: write into probs, or scratch when probs==nullptr
+    // (inference prefill path, which needs no T*T traffic afterwards).
+    float* S = probs;
+    if (!S) {
+        attn_pool_ensure(0, 0, (size_t)BH * T * T);
+        S = g_attn_dsb;
     }
-    CU_CHECK2(cudaGetLastError());
+    // S = Q * K^T, one grouped call over all (b,h).
+    {
+        std::vector<const float*> Aq(BH), Bq(BH);
+        std::vector<float*> Cs(BH);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const int i = b * H + h;
+                const int kvh = h / group;
+                Aq[i] = q + ((size_t)b * T * H + h) * hd;
+                Bq[i] = k + ((size_t)b * T * KV + kvh) * hd;
+                Cs[i] = S + (size_t)i * T * T;
+            }
+        }
+        attn_sbgemm(false, true, T, T, hd, 1.0f,
+                    Aq.data(), H * hd, q, (size_t)B * T * H * hd,
+                    Bq.data(), KV * hd, k, (size_t)B * T * KV * hd,
+                    0.0f, Cs.data(), T, BH);
+    }
+    // Fused softmax (masks + guard), in place over S.
+    {
+        dim3 grid(T, H, B);
+        k_attn_softmax_fwd<<<grid, 256>>>(S, segment_ids, T, H, scale, window);
+        CU_CHECK2(cudaGetLastError());
+    }
+    // O = P * V, written directly interleaved; one grouped call.
+    {
+        std::vector<const float*> Ap(BH), Bp(BH);
+        std::vector<float*> Co(BH);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const int i = b * H + h;
+                const int kvh = h / group;
+                Ap[i] = S + (size_t)i * T * T;
+                Bp[i] = v + ((size_t)b * T * KV + kvh) * hd;
+                Co[i] = out + ((size_t)b * T * H + h) * hd;
+            }
+        }
+        attn_sbgemm(false, false, T, hd, T, 1.0f,
+                    Ap.data(), T, S, (size_t)BH * T * T,
+                    Bp.data(), KV * hd, v, (size_t)B * T * KV * hd,
+                    0.0f, Co.data(), H * hd, BH);
+    }
 }
 
 // [OPT] Deterministic atomic-free attention backward (FlashAttention-style
@@ -503,8 +800,95 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
                            float* dq, float* dk, float* dv,
                            int B, int T, int H, int KV, int hd, float scale, int window) {
 
+    // Masked (zero) probs already encode causal/window/segment masking, exactly
+    // like the previous kernel path, so window needs no explicit handling.
     (void)window;
-    attention_backward(q, k, v, probs, dout, dq, dk, dv, B, T, H, KV, hd, scale);
+    if (B <= 0 || T <= 0) return;
+    GAI_CHECK(H > 0 && H <= 65535 && B <= 65535,
+              "cuda attention_bwd_ex: grid dimensions out of range");
+    GAI_CHECK(hd <= MAX_HD, "cuda attention_bwd_ex: head_dim too large");
+    GAI_CHECK(H % KV == 0, "cuda attention_bwd_ex: H must be a multiple of KV");
+    GAI_CHECK(probs != nullptr, "cuda attention_bwd_ex requires cached probs");
+    const int group = H / KV;
+    const int BH = B * H;
+    // dS/dP staging (transient).
+    attn_pool_ensure(0, (size_t)BH * T * hd, (size_t)BH * T * T);
+    float* dS = g_attn_dsb;
+    float* dE = g_attn_exp;  // expanded per-h dk/dv, then group-reduced
+    // dP = dO * V^T into dS.
+    {
+        std::vector<const float*> Ad(BH), Bd(BH);
+        std::vector<float*> Cd(BH);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const int i = b * H + h;
+                const int kvh = h / group;
+                Ad[i] = dout + ((size_t)b * T * H + h) * hd;
+                Bd[i] = v + ((size_t)b * T * KV + kvh) * hd;
+                Cd[i] = dS + (size_t)i * T * T;
+            }
+        }
+        attn_sbgemm(false, true, T, T, hd, 1.0f,
+                    Ad.data(), H * hd, dout, (size_t)B * T * H * hd,
+                    Bd.data(), KV * hd, v, (size_t)B * T * KV * hd,
+                    0.0f, Cd.data(), T, BH);
+    }
+    // dS = P * (dP - rowdot) * scale, in place over dS.
+    {
+        dim3 grid(T, H, B);
+        k_attn_ds<<<grid, 256>>>(dS, probs, T, H, scale);
+        CU_CHECK2(cudaGetLastError());
+    }
+    // dq = dS * K, written directly interleaved.
+    {
+        std::vector<const float*> As(BH), Bs(BH);
+        std::vector<float*> Cq(BH);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const int i = b * H + h;
+                const int kvh = h / group;
+                As[i] = dS + (size_t)i * T * T;
+                Bs[i] = k + ((size_t)b * T * KV + kvh) * hd;
+                Cq[i] = dq + ((size_t)b * T * H + h) * hd;
+            }
+        }
+        attn_sbgemm(false, false, T, hd, T, 1.0f,
+                    As.data(), T, dS, (size_t)BH * T * T,
+                    Bs.data(), KV * hd, k, (size_t)B * T * KV * hd,
+                    0.0f, Cq.data(), H * hd, BH);
+    }
+    // dk = dS^T * Q and dv = P^T * dO, per-h expanded, then group-reduced.
+    {
+        std::vector<const float*> Ak(BH), Bk(BH), Av(BH), Bv(BH);
+        std::vector<float*> Ck(BH), Cv(BH);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const int i = b * H + h;
+                const int kvh = h / group;
+                Ak[i] = dS + (size_t)i * T * T;
+                Bk[i] = q + ((size_t)b * T * H + h) * hd;
+                Ck[i] = dE + (size_t)i * T * hd;
+                Av[i] = probs + (size_t)i * T * T;
+                Bv[i] = dout + ((size_t)b * T * H + h) * hd;
+                Cv[i] = dE + (size_t)BH * T * hd + (size_t)i * T * hd;
+            }
+        }
+        // dk-expanded = dS^T * Q  (ta=true: A=dS transposed in the swap sense)
+        attn_sbgemm(true, false, T, hd, T, 1.0f,
+                    Ak.data(), T, dS, (size_t)BH * T * T,
+                    Bk.data(), H * hd, q, (size_t)B * T * H * hd,
+                    0.0f, Ck.data(), hd, BH);
+        // dv-expanded = P^T * dO
+        attn_sbgemm(true, false, T, hd, T, 1.0f,
+                    Av.data(), T, probs, (size_t)BH * T * T,
+                    Bv.data(), H * hd, dout, (size_t)B * T * H * hd,
+                    0.0f, Cv.data(), hd, BH);
+        dim3 grid(T, KV, B);
+        k_attn_group_reduce<<<grid, 256>>>(dE, dk, T, H, KV, hd);
+        CU_CHECK2(cudaGetLastError());
+        k_attn_group_reduce<<<grid, 256>>>(dE + (size_t)BH * T * hd, dv, T, H, KV, hd);
+        CU_CHECK2(cudaGetLastError());
+    }
 }
 
 __global__ void k_attn_decode_ex(const float* __restrict__ q, const float* __restrict__ kc,
