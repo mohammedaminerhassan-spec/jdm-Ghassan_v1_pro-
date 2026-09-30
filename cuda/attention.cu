@@ -331,14 +331,16 @@ static void attn_sbgemm(bool ta, bool tb, int M, int N, int K,
     if (use_fp16) {
         // Mirror-convert the DENSE ranges once (flat: bitwise-identical to
         // per-matrix conversion); per-batch fp16 pointers follow by offset.
+        // NOTE: Ah carries the B operand (gemm transpose swap), so Brange is
+        // converted first. Swapping these corrupts shapes under GQA strides.
         attn_pool_ensure(Aspan + Bspan, 0, 0);
-        attn_cvt(Arange, g_attn_mir, Aspan);
-        attn_cvt(Brange, g_attn_mir + Aspan, Bspan);
+        attn_cvt(Brange, g_attn_mir, Bspan);
+        attn_cvt(Arange, g_attn_mir + Bspan, Aspan);
         std::vector<const void*> Ah(nB), Bh(nB);
         std::vector<void*> Ch(nB);
         for (int i = 0; i < nB; ++i) {
-            Ah[i] = g_attn_mir + (size_t)(A[i] - Arange);
-            Bh[i] = g_attn_mir + Aspan + (size_t)(B[i] - Brange);
+            Ah[i] = g_attn_mir + (size_t)(B[i] - Brange);
+            Bh[i] = g_attn_mir + Bspan + (size_t)(A[i] - Arange);
             Ch[i] = C[i];
         }
         s = cublasGemmGroupedBatchedEx(h, topA, topB, marr, narr, karr, alp,
@@ -863,7 +865,6 @@ void attention_backward_ex(const float* q, const float* k, const float* v,
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < H; ++h) {
                 const int i = b * H + h;
-                const int kvh = h / group;
                 Ak[i] = dS + (size_t)i * T * T;
                 Bk[i] = q + ((size_t)b * T * H + h) * hd;
                 Ck[i] = dE + (size_t)i * T * hd;
