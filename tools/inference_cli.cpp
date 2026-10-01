@@ -340,7 +340,7 @@ static int cmd_generate(const Args& args) {
     } else {
         std::vector<Message> msgs;
 
-        std::string persona = args.str("persona", "darija");
+        std::string persona = args.str("persona", "en");
         std::string sys = args.str("system", "");
         if (sys.empty()) {
             sys = ChatTemplate::system_for_persona(persona, ChatTemplate::detect_script(prompt));

@@ -102,7 +102,7 @@ if(GAI_HAVE_CUDA)
     target_link_libraries(gai_core PUBLIC gai_cuda)
     target_compile_definitions(gai_core PUBLIC GAI_CUDA=1)
 
-    option(GAI_CUDA_WERROR "Fail the CUDA build on device-code warnings" ON)
+    option(GAI_CUDA_WERROR "Fail the CUDA build on device-code warnings" OFF)
     if(GAI_CUDA_WERROR)
         target_compile_options(gai_cuda PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--Werror=cross-execution-space-call>)

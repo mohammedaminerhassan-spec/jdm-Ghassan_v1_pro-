@@ -11,7 +11,7 @@ namespace gai {
 struct ChatOptions {
     std::string      system;
 
-    std::string      persona = "darija";
+    std::string      persona = "en";
     GenerationConfig gen;
     bool             adaptive_dialog = true;
     bool             stream = true;

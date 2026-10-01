@@ -237,7 +237,7 @@ static int cmd_synth_en(const Args& args) {
 }
 
 static int cmd_synth(const Args& args) {
-    const std::string lang = args.str("lang", "darija");
+    const std::string lang = args.str("lang", "en");
     if (lang != "darija" && lang != "en")
         GAI_FAIL("--lang must be 'darija' or 'en' (got '" + lang + "')");
     if (lang == "en") return cmd_synth_en(args);
@@ -300,7 +300,7 @@ struct ShardBuild {
     bool do_dedup = true;
     bool style_filter = true;
 
-    std::string style_mode = "darija";
+    std::string style_mode = "en";
     std::string domain;
     std::string outdir;
 
@@ -1351,7 +1351,7 @@ static int cmd_build(const Args& args) {
     const bool do_dedup     = !args.flag("no-dedup");
     const bool style_filter_in = !args.flag("keep-robotic");
 
-    std::string style_mode = args.str("style-mode", "darija");
+    std::string style_mode = args.str("style-mode", "en");
     for (char& ch : style_mode) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
     if (style_mode != "darija" && style_mode != "en" && style_mode != "off")
         GAI_FAIL("unknown --style-mode '" + style_mode + "' (darija|en|off)");
