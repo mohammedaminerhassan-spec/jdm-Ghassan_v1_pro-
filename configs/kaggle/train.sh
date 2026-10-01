@@ -16,7 +16,7 @@ EXPORT_MARGIN_SEC=900
 
 GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro_${EXPORT_PROFILE}.gguf"
 
-while [[ $
+while [[ $# -gt 0 ]]; do
     case "$1" in
         --pro)               CONFIG_FULL="${REPO_DIR}/configs/pro_1b_single.yaml"; GGUF_OUT="${REPO_DIR}/artifacts/ghassan-v1-pro-1b_${EXPORT_PROFILE}.gguf"; shift ;;
         --pilot-only)        MODE="pilot";   shift ;;

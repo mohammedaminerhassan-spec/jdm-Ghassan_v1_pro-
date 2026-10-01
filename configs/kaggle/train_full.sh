@@ -14,7 +14,7 @@ PILOT_STEPS=100
 EXPORT_MARGIN_SEC=900
 PT_FRACTION=55
 
-while [[ $
+while [[ $# -gt 0 ]]; do
     case "$1" in
         --pilot-only)      MODE="pilot";   shift ;;
         --time-budget-min) TIME_BUDGET_MIN="$2"; shift 2 ;;

@@ -48,7 +48,7 @@ SKIP_PREFLIGHT=0
 
 KEEP_PT_CKPTS="${KEEP_PT_CKPTS:-0}"
 
-while [[ $
+while [[ $# -gt 0 ]]; do
     case "$1" in
         --pilot-only) MODE="pilot"; shift ;;
         --preflight) MODE="preflight"; shift ;;

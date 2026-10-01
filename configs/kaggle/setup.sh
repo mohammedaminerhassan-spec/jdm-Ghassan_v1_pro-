@@ -13,7 +13,7 @@ REQUIRE_GPU=0
 REQUIRE_NCCL=0
 WITH_PARQUET=OFF
 
-while [[ $
+while [[ $# -gt 0 ]]; do
     case "$1" in
         --clean)       DO_CLEAN=1;      shift ;;
         --run-tests)   SKIP_TESTS=0;    shift ;;
