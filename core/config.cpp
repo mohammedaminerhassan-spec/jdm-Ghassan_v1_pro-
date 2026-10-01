@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -110,6 +111,7 @@ Config Config::from_string(const std::string& text) {
 
         std::string key = trim(body.substr(0, colon));
         std::string val = trim(body.substr(colon + 1));
+        GAI_CHECK(!key.empty(), strfmt("config:%d: empty key (want 'key: value')", lineno));
 
         if (val == "|" || val == ">" || val == "|-" || val == ">-" ||
             val == "|+" || val == ">+") {
@@ -127,11 +129,15 @@ Config Config::from_string(const std::string& text) {
         full += key;
 
         if (val.empty()) {
+            GAI_CHECK(cfg.kv_.find(full) == cfg.kv_.end(),
+                      strfmt("config:%d: duplicate key '%s'", lineno, full.c_str()));
             stack.emplace_back(indent, key);
             list_key    = full;
             list_indent = indent;
             cfg.kv_[full] = "";
         } else if (val.front() == '[' && val.back() == ']') {
+            GAI_CHECK(cfg.kv_.find(full) == cfg.kv_.end(),
+                      strfmt("config:%d: duplicate key '%s'", lineno, full.c_str()));
             std::string inner = val.substr(1, val.size() - 2);
             std::string joined;
             std::stringstream ss(inner);
@@ -145,10 +151,11 @@ Config Config::from_string(const std::string& text) {
             cfg.kv_[full] = joined;
             list_key.clear();
         } else {
+            GAI_CHECK(cfg.kv_.find(full) == cfg.kv_.end(),
+                      strfmt("config:%d: duplicate key '%s'", lineno, full.c_str()));
             cfg.kv_[full] = strip_quotes(val);
             list_key.clear();
         }
-        (void)list_indent;
     }
     return cfg;
 }

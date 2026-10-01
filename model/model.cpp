@@ -166,7 +166,9 @@ void Model::update_moe_bias(int layer, const float* frac_host, int ne) {
     ensure_moe_bias();
     if (layer < 0 || static_cast<size_t>(layer) >= moe_bias_.size()) return;
 
-    const float target = static_cast<float>(cfg_.moe_top_k) / static_cast<float>(ne);
+    // frac = count/(N*K) has mean 1/ne (not K/ne): uniform routing gives each
+    // expert 1/ne of all routed slots. Using K/ne would push every bias to +cap.
+    const float target = 1.0f / static_cast<float>(ne);
     auto& b = moe_bias_[static_cast<size_t>(layer)];
     for (int e = 0; e < ne && e < static_cast<int>(b.size()); ++e) {
         float err = frac_host[e] - target;

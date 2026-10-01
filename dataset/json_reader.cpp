@@ -288,7 +288,13 @@ static bool object_to_doc(const JVal& obj, const JsonReaderOptions& opts, JsonDo
             d.is_chat = true;
             for (const auto& el : arr->a) {
                 if (el.t == JVal::T::Str) {
-                    if (!el.s.empty()) d.messages.push_back({Role::User, el.s});
+                    // Alternate User/Assistant so ["q","a"] trains the answer
+                    // with mask=1. All-User (old code) trains answers with
+                    // mask=0, i.e. the model never learns them.
+                    if (!el.s.empty()) {
+                        Role r = (d.messages.size() % 2 == 0) ? Role::User : Role::Assistant;
+                        d.messages.push_back({r, el.s});
+                    }
                 } else if (el.t == JVal::T::Obj) {
                     Message m;
                     if (extract_message(el, m) && !m.content.empty())

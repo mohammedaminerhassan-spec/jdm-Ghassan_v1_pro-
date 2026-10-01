@@ -104,7 +104,9 @@ Tokenizer BpeTrainer::train() {
     for (const auto& [chunk, freq] : counts_) {
         if (freq < static_cast<u64>(cfg_.min_frequency)) continue;
 
-        if (utf8_length(chunk) < 2) continue;
+        // Symbols are bytes (see w.syms below), so a single-codepoint Arabic
+        // char (2 bytes) still yields a usable pair. Gate on byte length.
+        if (chunk.size() < 2) continue;
         Word w;
         w.freq = freq;
         w.syms.reserve(chunk.size());

@@ -598,7 +598,9 @@ bool DataLoader::next(Batch& out) {
     }
     out.ids.assign(static_cast<size_t>(B) * T, 0);
     out.targets.assign(static_cast<size_t>(B) * T, -100);
-    out.segment_ids.assign(static_cast<size_t>(B) * T, -1);
+    // Tail padding must be attention-neutral: segment 0 (not -1) so the
+    // forward path never sees an invalid segment id on short rows.
+    out.segment_ids.assign(static_cast<size_t>(B) * T, 0);
     out.tokens_supervised = 0;
 
     for (int b = 0; b < B; ++b) {

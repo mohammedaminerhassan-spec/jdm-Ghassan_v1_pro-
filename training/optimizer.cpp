@@ -448,7 +448,7 @@ double Muon::step(float lr, float grad_scale) {
         } else {
 
             ops::lion_step(dev, p->w.f32(), p->g.f32(), m_[i].f32(),
-                           p->numel(), vec_lr, cfg_.beta1, 0.99f, wd, effective_scale);
+                           p->numel(), vec_lr, cfg_.beta1, cfg_.beta2, wd, effective_scale);
         }
     }
     return gnorm;

@@ -491,20 +491,12 @@ QualityVerdict quality_check_english(const std::string& text, const QualityConfi
 
     if (c.min_words == 2 && c.min_letter_ratio == 0.45) c = english_quality_config();
     QualityVerdict v = quality_check(text, c);
-    if (!v.accept) {
-
-        std::string t = text;
-        size_t a = t.find_first_not_of(" \t\n\r");
-        size_t b = t.find_last_not_of(" \t\n\r");
-        std::string s = (a == std::string::npos) ? "" : t.substr(a, b - a + 1);
-        if ((s.size() == 1 || s.size() == 2) && !s.empty()) {
-            v.accept = true; v.reason.clear(); return v;
-        }
-        if (!s.empty() && s.size() <= 4 && (s[0] >= 'A' && s[0] <= 'Z')) {
-            v.accept = true; v.reason.clear(); return v;
-        }
-        return v;
-    }
+    // NOTE: no short-string bypass here. The old code accepted any 1-2 byte
+    // string ("!!", "12") and any <=4-byte capitalized string ("OK") without
+    // quality checks, which pollutes the corpus with noise tokens.
+    // Short conversational replies ("yes", "ok") already pass quality_check
+    // via min_words; anything rejected here is rejected for a real reason.
+    if (!v.accept) return v;
     if (has_hard_disclosure_en(text)) {
         v.accept = false; v.reason = "ai_disclosure_hard"; return v;
     }

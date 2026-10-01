@@ -19,10 +19,14 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
     const i64 full = n / Q8_BLOCK;
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q8_BLOCK;
+        bool bad = false;
         float amax = 0.0f;
-        for (int i = 0; i < Q8_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-
-        if (!std::isfinite(amax)) {
+        for (int i = 0; i < Q8_BLOCK; ++i) {
+            if (!std::isfinite(x[i])) { bad = true; break; }
+            const float a = std::fabs(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (bad) {
             out[b].scale = 0.0f;
             std::memset(out[b].q, 0, sizeof(out[b].q));
             continue;
@@ -38,10 +42,14 @@ void quantize_q8_0(const float* src, void* dst, i64 n) {
     const i64 rem = n % Q8_BLOCK;
     if (rem > 0) {
         const float* x = src + full * Q8_BLOCK;
+        bool bad = false;
         float amax = 0.0f;
-        for (i64 i = 0; i < rem; ++i) amax = std::max(amax, std::fabs(x[i]));
-
-        if (!std::isfinite(amax)) {
+        for (i64 i = 0; i < rem; ++i) {
+            if (!std::isfinite(x[i])) { bad = true; break; }
+            const float a = std::fabs(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (bad) {
             out[full].scale = 0.0f;
             std::memset(out[full].q, 0, sizeof(out[full].q));
             return;
@@ -81,10 +89,14 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
     const i64 full = n / Q4_BLOCK;
     for (i64 b = 0; b < full; ++b) {
         const float* x = src + b * Q4_BLOCK;
+        bool bad = false;
         float amax = 0.0f;
-        for (int i = 0; i < Q4_BLOCK; ++i) amax = std::max(amax, std::fabs(x[i]));
-
-        if (!std::isfinite(amax)) {
+        for (int i = 0; i < Q4_BLOCK; ++i) {
+            if (!std::isfinite(x[i])) { bad = true; break; }
+            const float a = std::fabs(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (bad) {
             out[b].scale = fp32_to_fp16(0.0f);
 
             std::memset(out[b].q, 0x88, sizeof(out[b].q));
@@ -102,9 +114,14 @@ void quantize_q4_0(const float* src, void* dst, i64 n) {
     const i64 rem = n % Q4_BLOCK;
     if (rem > 0) {
         const float* x = src + full * Q4_BLOCK;
+        bool bad = false;
         float amax = 0.0f;
-        for (i64 i = 0; i < rem; ++i) amax = std::max(amax, std::fabs(x[i]));
-        if (!std::isfinite(amax)) {
+        for (i64 i = 0; i < rem; ++i) {
+            if (!std::isfinite(x[i])) { bad = true; break; }
+            const float a = std::fabs(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (bad) {
             out[full].scale = fp32_to_fp16(0.0f);
             std::memset(out[full].q, 0x88, sizeof(out[full].q));
             return;
@@ -290,6 +307,7 @@ QuantError measure_error(const Tensor& original, DType target) {
     const float* a = original.f32();
     const float* b = r.f32();
     double se = 0.0, sa = 0.0, dot = 0.0, na = 0.0, nb = 0.0;
+    i64 nfinite = 0;
     for (i64 i = 0; i < e.numel; ++i) {
 
         if (!std::isfinite(static_cast<double>(a[i])) ||
@@ -297,6 +315,7 @@ QuantError measure_error(const Tensor& original, DType target) {
             e.max_abs = std::numeric_limits<double>::infinity();
             continue;
         }
+        ++nfinite;
         double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
         se += d * d;
         sa += static_cast<double>(a[i]) * static_cast<double>(a[i]);
@@ -305,8 +324,9 @@ QuantError measure_error(const Tensor& original, DType target) {
         nb += static_cast<double>(b[i]) * static_cast<double>(b[i]);
         e.max_abs = std::max(e.max_abs, std::fabs(d));
     }
-    e.rmse = std::sqrt(se / static_cast<double>(e.numel));
-    double rms_a = std::sqrt(sa / static_cast<double>(e.numel));
+    const double denom = static_cast<double>(nfinite > 0 ? nfinite : 1);
+    e.rmse = std::sqrt(se / denom);
+    double rms_a = std::sqrt(sa / denom);
     e.rel_rmse = rms_a > 0 ? e.rmse / rms_a : 0.0;
     e.cosine = (na > 0 && nb > 0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0;
     return e;

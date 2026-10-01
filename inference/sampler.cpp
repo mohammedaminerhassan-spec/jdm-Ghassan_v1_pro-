@@ -205,6 +205,9 @@ i32 Sampler::sample_candidates(const float* vals, const i32* ids, int K) {
 
 i32 Sampler::draw_from_scratch() {
     GAI_CHECK(!scratch_.empty(), "sampler: empty candidate set");
+    // sample_candidates() can reach here with temperature<=0 (greedy).
+    // Fall back to argmax instead of 1/0 -> inf -> garbage.
+    if (!(cfg_.temperature > 0.0f)) return scratch_[0].second;
 
     const float inv_t = 1.0f / cfg_.temperature;
 

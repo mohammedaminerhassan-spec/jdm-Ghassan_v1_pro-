@@ -114,7 +114,9 @@ size_t tree_size_bytes_excluding(const std::string& path,
         if (id.hi || id.lo) {
             if (!seen.insert(id).second) continue;
         }
-        total += static_cast<size_t>(it->file_size(ec));
+        const auto fsz = it->file_size(ec);
+        if (ec) continue;
+        total += static_cast<size_t>(fsz);
         ++count;
     }
     if (unique_files) *unique_files = count;
@@ -128,7 +130,13 @@ size_t free_disk_bytes(const std::string& path) {
 #ifdef _WIN32
         const DWORD attr = GetFileAttributesA(p.c_str());
         const bool exists = (attr != INVALID_FILE_ATTRIBUTES);
-        if (exists && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+        // A file path has the disk space of its parent dir: walk up.
+        if (exists && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            const size_t slash = p.find_last_of("/\\");
+            if (slash == std::string::npos) return 0;
+            p = (slash == 0) ? "/" : p.substr(0, slash);
+            continue;
+        }
         if (exists) {
             ULARGE_INTEGER avail{};
             if (GetDiskFreeSpaceExA(p.c_str(), &avail, nullptr, nullptr))
@@ -138,7 +146,12 @@ size_t free_disk_bytes(const std::string& path) {
 #else
 
         struct stat st {};
-        if (::stat(p.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return 0;
+        if (::stat(p.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) {
+            const size_t slash2 = p.find_last_of("/");
+            if (slash2 == std::string::npos) return 0;
+            p = (slash2 == 0) ? "/" : p.substr(0, slash2);
+            continue;
+        }
         struct statvfs vfs {};
         if (::statvfs(p.c_str(), &vfs) == 0)
             return static_cast<size_t>(vfs.f_bavail) * static_cast<size_t>(vfs.f_frsize);

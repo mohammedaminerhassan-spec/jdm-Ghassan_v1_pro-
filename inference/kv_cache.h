@@ -43,6 +43,9 @@ public:
     void reset() {
         len_ = 0;
         start_ = 0;
+        // NOTE: pinned_ is intentionally retained: Generator sets a fixed
+        // 8-token system prefix once and reuses the cache across turns.
+        // Call set_pinned_prefix(0) explicitly for a fully fresh cache.
     }
     int  length() const { return len_; }
     int  capacity() const { return max_len_; }
@@ -50,6 +53,7 @@ public:
     int  ring_start() const { return start_; }
     void set_pinned_prefix(int n) {
         GAI_CHECK(n >= 0 && n <= max_len_, "KVCache::set_pinned_prefix out of range");
+        GAI_CHECK(n < max_len_, "KVCache::set_pinned_prefix must leave >=1 rolling slot");
         pinned_ = n;
     }
     void set_length(int n) {

@@ -139,8 +139,10 @@ void GGUFWriter::set_max_seq_len(uint32_t ctx) {
 void GGUFWriter::set_rope_theta(float theta) {
     add_custom_metadata("ghassan.rope.freq_base", theta);
 }
-void GGUFWriter::set_rope_scaling(const std::map<std::string, std::string>&) {
-
+void GGUFWriter::set_rope_scaling(const std::map<std::string, std::string>& kv) {
+    // Persist scaling entries instead of silently dropping them; readers
+    // that ignore unknown ghassan.* keys are unaffected.
+    for (const auto& [k, v] : kv) add_custom_metadata("ghassan.rope." + k, v);
 }
 void GGUFWriter::set_rms_eps(float eps) {
     add_custom_metadata("ghassan.attention.layer_norm_rms_epsilon", eps);
@@ -1311,11 +1313,12 @@ void export_model_gguf(const std::string& path, Model& model,
         w.set_tokenizer_scores(scores);
         std::vector<int32_t> types;
         types.reserve(static_cast<size_t>(tok.vocab_size()));
+        // GGUF spec: 0=normal,1=unknown,2=control,3=user-defined,4=unused,5=byte
         for (int i = 0; i < tok.vocab_size(); ++i) {
-            int32_t t = 1;
-            if (i == special::UNK) t = 2;
-            else if (i < special::COUNT) t = 3;
-            else if (i < special::COUNT + 256) t = 6;
+            int32_t t = 0;
+            if (i == special::UNK) t = 1;
+            else if (i < special::COUNT) t = 2;
+            else if (i < special::COUNT + 256) t = 5;
             types.push_back(t);
         }
         w.set_tokenizer_token_types(types);

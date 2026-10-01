@@ -26,12 +26,13 @@ void fail(const std::string& msg, const char* file, int line) {
     throw Error(full);
 }
 
-static LogLevel g_level = LogLevel::Info;
-void set_log_level(LogLevel lvl) { g_level = lvl; }
-LogLevel log_level() { return g_level; }
+static std::atomic<LogLevel> g_level{LogLevel::Info};
+void set_log_level(LogLevel lvl) { g_level.store(lvl, std::memory_order_relaxed); }
+LogLevel log_level() { return g_level.load(std::memory_order_relaxed); }
 
 void log_raw(LogLevel lvl, const std::string& msg) {
-    if (lvl < g_level) return;
+    if (lvl >= LogLevel::Silent) return;
+    if (lvl < g_level.load(std::memory_order_relaxed)) return;
     const char* tag = "";
     switch (lvl) {
         case LogLevel::Debug:  tag = "[debug] "; break;
@@ -121,7 +122,12 @@ int num_threads() {
     if (cur > 0) return cur;
     unsigned hc = std::thread::hardware_concurrency();
     int want = hc > 0 ? static_cast<int>(hc) : 1;
-    g_threads.compare_exchange_strong(cur, want, std::memory_order_relaxed);
+    if (g_threads.compare_exchange_strong(cur, want, std::memory_order_relaxed)) {
+#ifdef GAI_OPENMP
+        omp_set_num_threads(want);
+#endif
+        return want;
+    }
     return g_threads.load(std::memory_order_relaxed);
 }
 void set_num_threads(int n) {

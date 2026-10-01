@@ -19,10 +19,12 @@
 #define GAI_DISPATCH_RET(dev, call) \
     do { if ((dev) == Device::CUDA) { return cuda_ops::call; } return cpu::call; } while (0)
 #else
+// CPU-only build: fail loudly on CUDA tensors instead of silently running on
+// CPU (which hides missing-CUDA bugs and produces wrong perf numbers).
 #define GAI_DISPATCH(dev, call) \
-    do { (void)(dev); cpu::call; } while (0)
+    do { GAI_CHECK((dev) == Device::CPU, "CUDA tensor on CPU-only build"); cpu::call; } while (0)
 #define GAI_DISPATCH_RET(dev, call) \
-    do { (void)(dev); return cpu::call; } while (0)
+    do { GAI_CHECK((dev) == Device::CPU, "CUDA tensor on CPU-only build"); return cpu::call; } while (0)
 #endif
 
 namespace gai {
